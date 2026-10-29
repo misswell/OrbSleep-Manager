@@ -167,5 +167,5 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。
 - 独立 `docker run` 容器的自动迁移。
-- 应用签名、公证、自动更新、菜单栏常驻。
+- 自动更新、菜单栏常驻；直接分发构建已用 Developer ID 签名并完成 Apple 公证（v0.1.5）。
 - GUI 未做屏幕截图验证（当前会话无屏幕录制权限）；已通过编译、真实协议往返与应用运行/连接验证。

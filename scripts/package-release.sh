@@ -40,19 +40,25 @@ xcodebuild -project app/OrbSleepManager.xcodeproj -scheme OrbSleepManager \
   CODE_SIGNING_ALLOWED=NO ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO build >/dev/null
 cp -R "$WORK/app-build/Release/OrbSleepManager.app" "$STAGE/OrbSleepManager.app"
 
-IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
+IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)}"
 SIGNED_NOTE="UNSIGNED (ad-hoc)"
 if [ -n "$IDENTITY" ]; then
   echo "==> signing with $IDENTITY"
-  codesign --force --deep --options runtime --timestamp \
+  codesign --force --options runtime --timestamp \
     --entitlements app/OrbSleepManager.entitlements --sign "$IDENTITY" \
     "$STAGE/OrbSleepManager.app"
+  for tool in orbsleepd orbsleepctl; do
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$STAGE/bin/$tool"
+  done
   SIGNED_NOTE="Developer ID: $IDENTITY"
 else
   echo "==> WARNING: no Developer ID Application identity; ad-hoc signing only"
-  codesign --force --deep --options runtime \
+  codesign --force --options runtime \
     --entitlements app/OrbSleepManager.entitlements --sign - \
     "$STAGE/OrbSleepManager.app"
+  for tool in orbsleepd orbsleepctl; do
+    codesign --force --options runtime --sign - "$STAGE/bin/$tool"
+  done
 fi
 codesign --verify --deep --strict --verbose=1 "$STAGE/OrbSleepManager.app"
 
@@ -75,10 +81,25 @@ If Gatekeeper blocks an unsigned/ad-hoc build, right-click the app and choose Op
 README
 chmod 644 "$STAGE/README.txt"
 
+NOTARY_ARGS=()
+if [ -n "$IDENTITY" ] && [ -n "${APP_STORE_CONNECT_KEY_ID:-}" ] && [ -n "${APP_STORE_CONNECT_ISSUER_ID:-}" ] && [ -f "${APP_STORE_CONNECT_PRIVATE_KEY_PATH:-}" ]; then
+  echo "==> notarizing app"
+  ditto -c -k --keepParent "$STAGE/OrbSleepManager.app" "$WORK/notary.zip"
+  xcrun notarytool submit "$WORK/notary.zip" \
+    --key "$APP_STORE_CONNECT_PRIVATE_KEY_PATH" --key-id "$APP_STORE_CONNECT_KEY_ID" \
+    --issuer "$APP_STORE_CONNECT_ISSUER_ID" --wait
+  xcrun stapler staple "$STAGE/OrbSleepManager.app"
+  xcrun stapler validate "$STAGE/OrbSleepManager.app"
+  NOTARY_ARGS=(--key "$APP_STORE_CONNECT_PRIVATE_KEY_PATH" --key-id "$APP_STORE_CONNECT_KEY_ID" --issuer "$APP_STORE_CONNECT_ISSUER_ID")
+else
+  echo "==> notarization skipped (Developer ID identity or APP_STORE_CONNECT credentials missing)"
+fi
+
 echo "==> packaging zip"
 ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$DIST/$NAME.zip"
 
 echo "==> packaging dmg"
+[ -d "$STAGE/OrbSleepManager.app" ] || { echo "Missing staged app at $STAGE/OrbSleepManager.app" >&2; exit 1; }
 rm -rf "$WORK/dmg"
 mkdir -p "$WORK/dmg"
 cp -R "$STAGE/OrbSleepManager.app" "$WORK/dmg/"
@@ -87,20 +108,18 @@ cp "$STAGE/README.txt" "$WORK/dmg/"
 ln -s /Applications "$WORK/dmg/Applications"
 hdiutil create -quiet -volname "OrbSleep Manager $VERSION" -srcfolder "$WORK/dmg" \
   -ov -format UDZO "$DIST/$NAME.dmg"
+[ -f "$DIST/$NAME.dmg" ] || { echo "DMG was not created: $DIST/$NAME.dmg" >&2; exit 1; }
 
-if [ -n "$IDENTITY" ] && [ -n "${APP_STORE_CONNECT_KEY_ID:-}" ] && [ -n "${APP_STORE_CONNECT_ISSUER_ID:-}" ] && [ -f "${APP_STORE_CONNECT_PRIVATE_KEY_PATH:-}" ]; then
-  echo "==> notarizing"
-  ditto -c -k --keepParent "$STAGE/OrbSleepManager.app" "$WORK/notary.zip"
-  xcrun notarytool submit "$WORK/notary.zip" \
-    --key "$APP_STORE_CONNECT_PRIVATE_KEY_PATH" --key-id "$APP_STORE_CONNECT_KEY_ID" \
-    --issuer "$APP_STORE_CONNECT_ISSUER_ID" --wait
-  xcrun stapler staple "$STAGE/OrbSleepManager.app"
-  # Rebuild the zip/dmg after stapling.
-  rm -f "$DIST/$NAME.zip"
-  ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$DIST/$NAME.zip"
-  xcrun stapler staple "$DIST/$NAME.dmg" || true
-else
-  echo "==> notarization skipped (Developer ID identity or APP_STORE_CONNECT credentials missing)"
+if [ ${#NOTARY_ARGS[@]} -gt 0 ]; then
+  echo "==> notarizing dmg"
+  xcrun notarytool submit "$DIST/$NAME.dmg" "${NOTARY_ARGS[@]}" --wait
+  xcrun stapler staple "$DIST/$NAME.dmg"
+  xcrun stapler validate "$DIST/$NAME.dmg"
+fi
+
+echo "==> assessing Gatekeeper"
+if [ -n "$IDENTITY" ]; then
+  spctl --assess --type execute --verbose=2 "$STAGE/OrbSleepManager.app" || true
 fi
 
 echo "==> checksums"

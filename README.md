@@ -54,9 +54,9 @@ make release   # 或 ./scripts/package-release.sh
 
 产物在 `dist/`：通用（arm64 + x86_64）的 `OrbSleepManager.app`、`orbsleepd`、`orbsleepctl`，以及 DMG、ZIP 和 `SHA256SUMS`。
 
-- 检测到 `Developer ID Application` 证书时会带安全时间戳签名；配置 `APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_PRIVATE_KEY_PATH` 后会自动公证并 staple。
+- 检测到 `Developer ID Application` 证书时会带安全时间戳签名（app 与 `orbsleepd`/`orbsleepctl` 都签名）；配置 `APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_PRIVATE_KEY_PATH` 后会自动公证 app 与 DMG 并 staple。
 - 没有 Developer ID 证书时只做 ad-hoc 签名，`README.txt` 和产物会明确标记 **UNSIGNED**，首次启动需右键打开。
-- 未公证的构建不应作为稳定版公开发布。
+- Releases 中的正式构建使用 Developer ID 签名并已公证。
 
 ## 安全边界
 
@@ -92,4 +92,4 @@ python3 scripts/phase0.py
 
 ## 状态
 
-阶段 0–4 的主体实现已落地并验证；阶段 5（特权端口助手、签名公证、自动升级）与阶段 6（UDP/IPv6、多文件 Compose）尚未实现，界面与文档中已明确标注。
+阶段 0–4 的主体实现已落地并验证；阶段 5 的直接分发签名与公证已完成（Developer ID），自动升级、特权端口助手仍待实现；阶段 6（UDP/IPv6、多文件 Compose）尚未实现。
