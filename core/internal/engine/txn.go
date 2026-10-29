@@ -22,6 +22,7 @@ type txnPayload struct {
 type detachPayload struct {
 	OperationID      string        `json:"operationId"`
 	Service          model.Service `json:"service"`
+	WorkingDir       string        `json:"workingDir"`
 	ManagedContent   []byte        `json:"managedContent"`
 	ExpectedRestored []byte        `json:"expectedRestored"`
 	Phase            string        `json:"phase"`

@@ -730,9 +730,11 @@ func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) err
 func (e *Engine) gatewayRoute(ctx context.Context, svcID, name string, b model.Binding, s model.Settings) (gateway.Route, error) {
 	targetHost := "127.0.0.1"
 	if s.ProxyDialMode == "container_ip" {
-		if ip := e.proxyContainerIP(ctx); ip != "" {
-			targetHost = ip
+		ip := e.proxyContainerIP(ctx)
+		if ip == "" {
+			return gateway.Route{}, fmt.Errorf("container_ip 模式无法解析代理容器 IP（代理不可用）")
 		}
+		targetHost = ip
 	}
 	return gateway.Route{
 		Key:        fmt.Sprintf("%s|%s|%d", svcID, b.HostIP, b.HostPort),

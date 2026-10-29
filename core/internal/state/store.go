@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -99,9 +100,18 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
-	// Older databases predate operation_id.
-	_, _ = s.db.Exec(`ALTER TABLE transactions ADD COLUMN operation_id TEXT NOT NULL DEFAULT ''`)
+	// Older databases predate operation_id. Only the expected duplicate-column
+	// error may be ignored; anything else (read-only DB, I/O error) must abort.
+	if _, err := s.db.Exec(`ALTER TABLE transactions ADD COLUMN operation_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumn(err) {
+			return fmt.Errorf("migrate transactions.operation_id: %w", err)
+		}
+	}
 	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column name")
 }
 
 // UpsertService inserts or replaces a managed service.

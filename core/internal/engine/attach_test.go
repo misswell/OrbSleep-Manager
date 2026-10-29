@@ -113,12 +113,13 @@ func (f *fakeDocker) client(t *testing.T) *dockerx.Client {
 // --- fake docker CLI ---
 
 type fakeCLI struct {
-	configFn   func(file string) (map[string]any, error)
-	docker     *fakeDocker
-	upErr      error
-	proxyUpErr error
-	upFn       func(file string) error
-	upCalls    int
+	configFn    func(file string) (map[string]any, error)
+	docker      *fakeDocker
+	upErr       error
+	proxyUpErr  error
+	upFn        func(file string) error
+	upCalls     int
+	lastWorkdir string
 }
 
 func (f *fakeCLI) ComposeConfig(ctx context.Context, project, file, workdir string) (map[string]any, error) {
@@ -126,6 +127,7 @@ func (f *fakeCLI) ComposeConfig(ctx context.Context, project, file, workdir stri
 }
 func (f *fakeCLI) UpService(ctx context.Context, project, file, workdir, service string) error {
 	f.upCalls++
+	f.lastWorkdir = workdir
 	if f.upErr != nil {
 		return f.upErr
 	}
@@ -920,5 +922,96 @@ func TestProxySetupAbortsWhenBackupCannotBeWritten(t *testing.T) {
 	}
 	if _, err := os.Stat(e.proxyComposePath()); !os.IsNotExist(err) {
 		t.Fatalf("proxy compose must not be created after backup failure: %v", err)
+	}
+}
+
+func TestGatewayRouteContainerIPFailsWhenProxyUnavailable(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	s := e.settings.Get()
+	s.ProxyDialMode = "container_ip"
+	b := model.Binding{HostIP: "127.0.0.1", HostPort: freePort(t), ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}
+	if _, err := e.gatewayRoute(context.Background(), "svc-x", "demo-web-1", b, s); err == nil {
+		t.Fatal("container_ip without a proxy container must return an error")
+	}
+}
+
+func TestRestoreMissingSharedComposeRemovesOtherManagedPorts(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	aPort, bPort := freePort(t), freePort(t)
+	aProxy, bProxy := freePort(t), freePort(t)
+	aBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, ProxyPort: aProxy, Protocol: "tcp"}}
+	bBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: bPort, ContainerPort: 80, ProxyPort: bProxy, Protocol: "tcp"}}
+	backup := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n", aPort, bPort))
+	backupDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(backupDir, "docker-compose.yml"), backup, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta, _ := json.Marshal(map[string]any{"composeFile": composeFile, "workingDir": dir})
+	if err := os.WriteFile(filepath.Join(backupDir, "metadata.json"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := model.Service{ID: "svc-web", ContainerID: "abc123", ContainerName: "demo-web-1",
+		ComposeProject: "shared", ComposeService: "web", ComposeFile: composeFile,
+		Status: "managed_running", Bindings: aBindings, StartTimeoutSecs: 1}
+	other := model.Service{ID: "svc-api", ContainerID: "def456", ContainerName: "shared-api-1",
+		ComposeProject: "shared", ComposeService: "api", ComposeFile: composeFile,
+		Status: "managed_running", Bindings: bBindings, StartTimeoutSecs: 1}
+	for _, s := range []model.Service{svc, other} {
+		if err := e.store.UpsertService(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.store.SetMeta("serviceBackup:svc-web", backupDir); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	admin.cfg = proxy.Config{Services: []proxy.ServiceConfig{{Name: svc.ContainerName, Ports: []string{fmt.Sprintf("%d:80", aProxy)}}}}
+	admin.mu.Unlock()
+	docker.setPorts([]model.PortBinding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, Protocol: "tcp"}}, false)
+
+	holder := &portHolder{}
+	holderReady := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", aPort))
+			if err == nil {
+				holder.set(ln)
+				close(holderReady)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(holderReady)
+	}()
+	t.Cleanup(holder.close)
+
+	if err := e.restoreService(context.Background(), logger, svc); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	<-holderReady
+	raw, err := os.ReadFile(composeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), fmt.Sprintf("%d:80", aPort)) {
+		t.Fatalf("this service's port was not restored:\n%s", raw)
+	}
+	if strings.Contains(string(raw), fmt.Sprintf("%d:80", bPort)) {
+		t.Fatalf("other managed service's port was reintroduced:\n%s", raw)
+	}
+	if _, ok, _ := e.store.GetService(svc.ID); ok {
+		t.Fatal("restored service record must be deleted")
+	}
+	if _, ok, _ := e.store.GetService(other.ID); !ok {
+		t.Fatal("other managed service record must be kept")
 	}
 }

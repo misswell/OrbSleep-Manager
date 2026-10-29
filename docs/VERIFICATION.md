@@ -139,6 +139,17 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 
 真实 OrbStack 验收（2026-10-29）：`phase0.py` 全流程通过；手工模拟 `compose_write_pending` 崩溃（文件已替换、`ManagedContent` 未写、`SIGKILL`）后重启，Compose/原端口/事务/操作记录全部恢复；手工模拟 `detach` 崩溃（Compose 已恢复、记录未删）后重启，自动回退托管、网关与原端口 HTTP 200。`go test -race ./...` 通过。
 
+## 第四轮复审加固（0.1.4）
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| 共享 Compose 文件导致已提交事务被误判 | `txnAllCommitted` 按 ComposeFile 分组，只比较最后一项的完成内容；新增两个服务共享文件、全部 committed 但终态未写的恢复测试，验证补记 `committed` 而不回滚 |
+| detach 恢复丢失工作目录 | `detachPayload` 新增 `WorkingDir`，创建事务时从备份元数据读取；恢复时使用该目录。新增不同工作目录的恢复测试 |
+| 共享 Compose 缺失时整文件恢复引入其他端口 | 新增 `rebuildMissingCompose`：从备份重建并移除其他仍托管服务的旧端口，再补回本服务端口；新增共享文件缺失恢复测试 |
+| `ExpectedRestored` 为空时覆盖外部修改 | 缺少预期快照且当前文件不等于托管内容时拒绝自动覆盖并标记 `rollback_failed`；新增不覆盖测试 |
+| detach 回滚仍使用取消上下文 / container_ip 静默回退 | `revertManaged` 的网关恢复改用独立 30 秒上下文；`container_ip` 无法解析代理 IP 时返回错误，不回退 loopback；新增路由错误测试 |
+| SQLite `ALTER TABLE` 忽略所有错误 | 仅忽略 duplicate column，其他迁移错误直接返回；新增二次打开与错误识别测试 |
+
 ## 未验证 / 未实现
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。

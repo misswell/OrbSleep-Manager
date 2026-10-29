@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -79,5 +80,31 @@ func TestServicesAndOperations(t *testing.T) {
 	}
 	if list, _ := st.ListServices(); len(list) != 0 {
 		t.Fatalf("services after delete = %d", len(list))
+	}
+}
+
+func TestOpenTwiceIgnoresDuplicateColumnMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.sqlite")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("second open must ignore duplicate column: %v", err)
+	}
+	second.Close()
+}
+
+func TestDuplicateColumnDetection(t *testing.T) {
+	if !isDuplicateColumn(errors.New("SQL logic error: duplicate column name: operation_id")) {
+		t.Fatal("duplicate column error must be recognized")
+	}
+	if isDuplicateColumn(errors.New("attempt to write a readonly database")) {
+		t.Fatal("unrelated migration errors must not be ignored")
 	}
 }

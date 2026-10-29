@@ -92,13 +92,31 @@ func declFromNode(n *yaml.Node) (*PortDecl, error) {
 // RemoveBindings removes the given host bindings from a service's ports list.
 // It returns the new file content and the declarations that were removed.
 func RemoveBindings(content []byte, service string, remove []model.PortBinding) ([]byte, []PortDecl, error) {
+	return removeBindings(content, service, remove, true)
+}
+
+// RemoveBindingsLenient removes any matching declarations but tolerates a
+// missing service, a missing ports key, or a partial match. It is used when
+// reconstructing a deleted shared Compose file from one service's backup: the
+// backup may or may not still contain another managed service's ports.
+func RemoveBindingsLenient(content []byte, service string, remove []model.PortBinding) ([]byte, []PortDecl, error) {
+	return removeBindings(content, service, remove, false)
+}
+
+func removeBindings(content []byte, service string, remove []model.PortBinding, strict bool) ([]byte, []PortDecl, error) {
 	doc, _, svc, err := findService(content, service)
 	if err != nil {
+		if !strict && errors.Is(err, ErrServiceNotFound) {
+			return content, nil, nil
+		}
 		return nil, nil, err
 	}
 	portsKey := mappingKeyNode(svc, "ports")
 	portsNode := mappingValue(svc, "ports")
 	if portsNode == nil {
+		if !strict {
+			return content, nil, nil
+		}
 		return nil, nil, ErrServiceNotFound
 	}
 	if portsNode.Kind == yaml.AliasNode || portsNode.Style&yaml.FlowStyle != 0 {
@@ -134,7 +152,7 @@ func RemoveBindings(content []byte, service string, remove []model.PortBinding) 
 			del[line-1] = true
 		}
 	}
-	if len(removed) != len(remove) {
+	if len(removed) != len(remove) && strict {
 		return nil, nil, fmt.Errorf("Compose 文件中的端口声明与容器实际映射不一致（找到 %d，需要移除 %d）；请重新扫描", len(removed), len(remove))
 	}
 	if remaining == 0 {
@@ -149,8 +167,10 @@ func RemoveBindings(content []byte, service string, remove []model.PortBinding) 
 		}
 	}
 	out := []byte(strings.Join(kept, "\n"))
-	if err := ValidateRemoval(content, out, service, remove); err != nil {
-		return nil, nil, err
+	if strict {
+		if err := ValidateRemoval(content, out, service, remove); err != nil {
+			return nil, nil, err
+		}
 	}
 	_ = doc
 	return out, removed, nil

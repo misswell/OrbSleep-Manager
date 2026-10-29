@@ -289,8 +289,9 @@ func TestRecoverInterruptedDetachRevertsToManaged(t *testing.T) {
 		t.Fatal(err)
 	}
 	docker.setPorts(snap.removals, true)
+	workDir := t.TempDir()
 	txnID, err := e.startTxn("op-detach", "detach", detachPayload{
-		OperationID: "op-detach", Service: svc, ManagedContent: managed, ExpectedRestored: original, Phase: "compose_restored",
+		OperationID: "op-detach", Service: svc, WorkingDir: workDir, ManagedContent: managed, ExpectedRestored: original, Phase: "compose_restored",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -309,6 +310,9 @@ func TestRecoverInterruptedDetachRevertsToManaged(t *testing.T) {
 	}
 	if _, ok, _ := e.store.GetService(svc.ID); !ok {
 		t.Fatal("managed record must be kept")
+	}
+	if cli.lastWorkdir != workDir {
+		t.Fatalf("recovery used workdir %q, want %q", cli.lastWorkdir, workDir)
 	}
 }
 
@@ -487,5 +491,78 @@ func TestDeferredRecoveryWorksAfterReconcileRebuildsGateway(t *testing.T) {
 	raw, _ := os.ReadFile(snap.composeFile)
 	if string(raw) != string(snap.content) {
 		t.Fatalf("compose not restored:\n%s", raw)
+	}
+}
+
+func TestRecoveryMarksCommittedSharedComposeItems(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+
+	file := filepath.Join(t.TempDir(), "docker-compose.yml")
+	intermediate := []byte("services:\n  web:\n    image: nginx:alpine\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:19002:80\"\n")
+	final := []byte("services:\n  web:\n    image: nginx:alpine\n  api:\n    image: nginx:alpine\n")
+	if err := os.WriteFile(file, final, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := model.Service{ComposeFile: file, Status: "managed_running", StartTimeoutSecs: 1}
+	web := base
+	web.ID, web.ContainerName, web.ComposeProject, web.ComposeService = "svc-web", "shared-web-1", "shared", "web"
+	api := base
+	api.ID, api.ContainerName, api.ComposeProject, api.ComposeService = "svc-api", "shared-api-1", "shared", "api"
+	for _, svc := range []model.Service{web, api} {
+		if err := e.store.UpsertService(svc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload := txnPayload{OperationID: "op-shared", Items: []txnItem{
+		{ContainerName: web.ContainerName, ComposeFile: file, ComposeService: "web", ServiceID: web.ID,
+			ManagedContent: intermediate, Phase: "committed_item"},
+		{ContainerName: api.ContainerName, ComposeFile: file, ComposeService: "api", ServiceID: api.ID,
+			ManagedContent: final, Phase: "committed_item"},
+	}}
+	txnID, err := e.startTxn("op-shared", "attach", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.InsertOperation(model.Operation{ID: "op-shared", Kind: "attach", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	got, _, _ := e.store.GetTransaction(txnID)
+	if got.Status != "committed" {
+		t.Fatalf("status = %s error=%s; shared compose items must be treated as committed", got.Status, got.Error)
+	}
+	raw, _ := os.ReadFile(file)
+	if string(raw) != string(final) {
+		t.Fatalf("committed shared file was modified:\n%s", raw)
+	}
+}
+
+func TestDetachRecoveryWithoutExpectedSnapshotDoesNotOverwrite(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+	external := []byte("services:\n  web:\n    image: nginx:alpine\n    environment:\n      USER_EDIT: \"1\"\n")
+	if err := os.WriteFile(snap.composeFile, external, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	txnID, err := e.startTxn("op-detach", "detach", detachPayload{
+		OperationID: "op-detach", Service: svc, ManagedContent: managed, Phase: "compose_restored",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	got, _, _ := e.store.GetTransaction(txnID)
+	if got.Status != "rollback_failed" {
+		t.Fatalf("status = %s, want rollback_failed", got.Status)
+	}
+	raw, _ := os.ReadFile(snap.composeFile)
+	if string(raw) != string(external) {
+		t.Fatalf("external edit was overwritten:\n%s", raw)
 	}
 }

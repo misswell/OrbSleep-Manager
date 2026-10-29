@@ -266,7 +266,11 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 			fail("缺少托管 Compose 快照")
 			return
 		}
-		if len(p.ExpectedRestored) > 0 && !bytes.Equal(current, p.ExpectedRestored) {
+		if len(p.ExpectedRestored) == 0 {
+			fail("缺少预期恢复快照，无法区分中断状态与外部修改，未覆盖")
+			return
+		}
+		if !bytes.Equal(current, p.ExpectedRestored) {
 			fail("Compose 文件在恢复操作中断后被外部修改，未覆盖")
 			return
 		}
@@ -278,8 +282,12 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 			fail("恢复托管 Compose 失败: " + werr.Error())
 			return
 		}
+		workDir := p.WorkingDir
+		if workDir == "" {
+			workDir = filepath.Dir(p.Service.ComposeFile)
+		}
 		upctx, upcancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		uperr := cli.UpService(upctx, p.Service.ComposeProject, p.Service.ComposeFile, filepath.Dir(p.Service.ComposeFile), p.Service.ComposeService)
+		uperr := cli.UpService(upctx, p.Service.ComposeProject, p.Service.ComposeFile, workDir, p.Service.ComposeService)
 		upcancel()
 		if uperr != nil {
 			fail("重建托管容器失败: " + uperr.Error())
@@ -413,6 +421,10 @@ func (e *Engine) txnAllCommitted(ctx context.Context, payload txnPayload) bool {
 		return false
 	}
 	_ = ctx
+	// Items may share one Compose file. Each item stores the file content at its
+	// own commit point, so only the last item per file is the final expectation;
+	// comparing every intermediate snapshot would force a false rollback.
+	expectedByFile := map[string][]byte{}
 	for _, it := range payload.Items {
 		if it.ServiceID == "" || it.Phase != "committed_item" {
 			return false
@@ -420,11 +432,18 @@ func (e *Engine) txnAllCommitted(ctx context.Context, payload txnPayload) bool {
 		if _, ok, err := e.store.GetService(it.ServiceID); err != nil || !ok {
 			return false
 		}
-		if len(it.ManagedContent) > 0 {
-			raw, err := os.ReadFile(it.ComposeFile)
-			if err != nil || !bytes.Equal(raw, it.ManagedContent) {
-				return false
-			}
+		expected := it.ManagedContent
+		if len(expected) == 0 {
+			expected = it.PendingContent
+		}
+		if len(expected) > 0 {
+			expectedByFile[it.ComposeFile] = expected
+		}
+	}
+	for file, expected := range expectedByFile {
+		raw, err := os.ReadFile(file)
+		if err != nil || !bytes.Equal(raw, expected) {
+			return false
 		}
 	}
 	return true

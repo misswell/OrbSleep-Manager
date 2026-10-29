@@ -176,7 +176,18 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 		logger.finish("failed", "读取 Compose 文件失败，已中止: "+readErr.Error())
 		return
 	}
-	payload := detachPayload{OperationID: op.ID, Service: svc, ManagedContent: managedContent, Phase: "prepared"}
+	workDir := filepath.Dir(svc.ComposeFile)
+	if backupDir, ok := e.store.GetMeta("serviceBackup:" + svc.ID); ok {
+		var meta struct {
+			WorkingDir string `json:"workingDir"`
+		}
+		if raw, merr := os.ReadFile(filepath.Join(backupDir, "metadata.json")); merr == nil {
+			if json.Unmarshal(raw, &meta) == nil && meta.WorkingDir != "" {
+				workDir = meta.WorkingDir
+			}
+		}
+	}
+	payload := detachPayload{OperationID: op.ID, Service: svc, WorkingDir: workDir, ManagedContent: managedContent, Phase: "prepared"}
 	if expected, _, aerr := compose.AddBindings(managedContent, svc.ComposeService, bindingsFor(svc)); aerr == nil {
 		payload.ExpectedRestored = expected
 	}
@@ -212,6 +223,38 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 	e.finishTxnAtomic(txnID, op.ID, "committed", nil, "committed")
 	logger.finish("succeeded", "")
 	e.triggerReconcile()
+}
+
+// rebuildMissingCompose reconstructs a deleted Compose file from this service's
+// pre-attach backup while removing ports of other services that are still
+// managed. Restoring the raw backup would otherwise re-publish their old ports
+// and conflict with their gateway listeners.
+func (e *Engine) rebuildMissingCompose(svc model.Service, backupFile string) ([]byte, error) {
+	content, err := os.ReadFile(backupFile)
+	if err != nil {
+		return nil, err
+	}
+	services, err := e.store.ListServices()
+	if err != nil {
+		return nil, err
+	}
+	for _, other := range services {
+		if other.ID == svc.ID || other.ComposeFile != svc.ComposeFile {
+			continue
+		}
+		out, _, rerr := compose.RemoveBindingsLenient(content, other.ComposeService, bindingsFor(other))
+		if rerr != nil {
+			return nil, fmt.Errorf("移除共享服务 %s 的旧端口失败: %w", other.ContainerName, rerr)
+		}
+		content = out
+	}
+	// Ensure this service's own ports are present (the backup may have been
+	// taken before the container was last edited).
+	out, _, aerr := compose.AddBindings(content, svc.ComposeService, bindingsFor(svc))
+	if aerr != nil {
+		return nil, fmt.Errorf("补回本服务端口失败: %w", aerr)
+	}
+	return out, nil
 }
 
 // restoreService restores the original host port mapping. The proxy target is
@@ -289,9 +332,11 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 			errs = append(errs, "重建容器失败: "+uerr.Error())
 		}
 		cancel()
-		if gerr := e.ensureGatewayForService(ctx, svc.ID); gerr != nil {
+		rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if gerr := e.ensureGatewayForService(rctx, svc.ID); gerr != nil {
 			errs = append(errs, "重新监听端口失败: "+gerr.Error())
 		}
+		rcancel()
 		pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
 		if perr := e.putProxyConfigVerified(pctx, admin, origCfg); perr != nil {
 			errs = append(errs, "恢复代理配置失败: "+perr.Error())
@@ -322,10 +367,18 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 		if backupFile == "" {
 			return failWithRevert(fmt.Errorf("Compose 文件不可读且没有备份: %w", readErr))
 		}
-		if err := compose.RestoreFile(composeFile, backupFile); err != nil {
-			return failWithRevert(fmt.Errorf("从备份恢复 Compose 文件失败: %w", err))
+		rebuilt, rerr := e.rebuildMissingCompose(svc, backupFile)
+		if rerr != nil {
+			return failWithRevert(fmt.Errorf("Compose 文件缺失且无法安全重建: %w", rerr))
 		}
-		logger.add("warn", "Compose 文件缺失，已从备份恢复")
+		mode := os.FileMode(0o644)
+		if st, statErr := os.Stat(backupFile); statErr == nil {
+			mode = st.Mode()
+		}
+		if err := compose.WriteAtomic(composeFile, rebuilt, mode); err != nil {
+			return failWithRevert(fmt.Errorf("重建 Compose 文件失败: %w", err))
+		}
+		logger.add("warn", "Compose 文件缺失，已按共享服务当前状态重建")
 	} else {
 		out, added, err := compose.AddBindings(current, svc.ComposeService, removals)
 		if err != nil {

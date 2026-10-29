@@ -28,7 +28,9 @@ make phase0         # 需要 OrbStack；会创建/清理测试 Compose 项目
 - 共享 Compose 文件：接入时用 `fileStates` 串联修改；恢复时用 `compose.AddBindings` 只加回本服务端口，禁止整体还原备份（会破坏其他托管服务）。
 - 代理配置快照必须用 `Config.Clone()`；`Remove`/`Upsert` 不得原地复用切片。回滚后要逐服务比对基线。
 - 接入必须在修改前持久化 `transactions`（基线 + 每项备份 + 阶段）；改 Compose 前必须写入 `compose_write_pending` 和预期新内容。启动恢复先于 API。备份清理必须保留 `failed`/`rollback_failed`/`running` 操作的证据，并先清备份后清历史。
-- `restore/remove` 必须持久化 `detach` 事务；恢复前释放对应网关监听，失败回退托管；不得覆盖外部修改的 Compose。
+- `restore/remove` 必须持久化 `detach` 事务（含真实 `WorkingDir`）；恢复前释放对应网关监听，失败回退托管；不得覆盖外部修改的 Compose；缺少预期恢复快照时不得覆盖。
+- 共享 Compose 文件缺失时，必须按其他托管服务的当前状态重建并移除其旧端口，禁止直接用单个服务备份整文件覆盖。
+- 事务完成判断必须按 ComposeFile 分组，只校验每个文件的最终内容。
 - 回滚不得复用已取消的业务上下文；依赖不可用时事务保持 `running`，不得标记终态。关闭超时不得关闭仍可能被事务使用的资源。
 - 长事务必须通过 `beginOperation` 注册；关闭时先取消并等待回滚，禁止先关数据库。
 - 守护进程首次 reconcile 必须在 API 就绪前同步完成（保证重启后端口立刻恢复）。
