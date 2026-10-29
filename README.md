@@ -46,6 +46,18 @@ make app          # xcodegen + xcodebuild
 open app/build/Debug/OrbSleepManager.app
 ```
 
+## 打包发行
+
+```sh
+make release   # 或 ./scripts/package-release.sh
+```
+
+产物在 `dist/`：通用（arm64 + x86_64）的 `OrbSleepManager.app`、`orbsleepd`、`orbsleepctl`，以及 DMG、ZIP 和 `SHA256SUMS`。
+
+- 检测到 `Developer ID Application` 证书时会带安全时间戳签名；配置 `APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_PRIVATE_KEY_PATH` 后会自动公证并 staple。
+- 没有 Developer ID 证书时只做 ad-hoc 签名，`README.txt` 和产物会明确标记 **UNSIGNED**，首次启动需右键打开。
+- 未公证的构建不应作为稳定版公开发布。
+
 ## 安全边界
 
 - 只读取当前 Docker Context，**不会**切换你的全局 Context。

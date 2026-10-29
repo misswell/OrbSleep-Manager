@@ -1,0 +1,109 @@
+#!/bin/bash
+# Build a macOS release bundle (universal app + daemon/CLI + DMG/ZIP).
+#
+# Signing:
+#   - If a "Developer ID Application" identity is present, it is used with a
+#     secure timestamp, and notarization runs when APP_STORE_CONNECT_* are set.
+#   - Otherwise the app is ad-hoc signed and the artifact is marked UNSIGNED.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+VERSION="$(awk '/MARKETING_VERSION:/ {print $2; exit}' app/project.yml)"
+BUILD_NUMBER="$(awk '/CURRENT_PROJECT_VERSION:/ {print $2; exit}' app/project.yml)"
+DIST="$ROOT/dist"
+NAME="OrbSleepManager-$VERSION-macos-universal"
+STAGE="$DIST/$NAME"
+WORK="$(mktemp -d /tmp/orbsleep-release.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "==> version $VERSION ($BUILD_NUMBER)"
+rm -rf "$STAGE" "$DIST/$NAME.zip" "$DIST/$NAME.dmg" "$DIST/SHA256SUMS"
+mkdir -p "$STAGE/bin" "$WORK/bin"
+
+echo "==> building universal daemon/CLI"
+for arch in arm64 amd64; do
+  (cd core && CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+    go build -trimpath -ldflags='-s -w' -o "$WORK/bin/orbsleepd-$arch" ./cmd/orbsleepd)
+  (cd core && CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+    go build -trimpath -ldflags='-s -w' -o "$WORK/bin/orbsleepctl-$arch" ./cmd/orbsleepctl)
+done
+lipo -create "$WORK/bin/orbsleepd-arm64" "$WORK/bin/orbsleepd-amd64" -output "$STAGE/bin/orbsleepd"
+lipo -create "$WORK/bin/orbsleepctl-arm64" "$WORK/bin/orbsleepctl-amd64" -output "$STAGE/bin/orbsleepctl"
+chmod 755 "$STAGE/bin/orbsleepd" "$STAGE/bin/orbsleepctl"
+
+echo "==> building Release app"
+rm -rf "$WORK/DerivedData" "$WORK/app-build"
+(cd app && xcodegen generate >/dev/null)
+xcodebuild -project app/OrbSleepManager.xcodeproj -scheme OrbSleepManager \
+  -configuration Release -destination 'platform=macOS' \
+  -derivedDataPath "$WORK/DerivedData" SYMROOT="$WORK/app-build" \
+  CODE_SIGNING_ALLOWED=NO ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO build >/dev/null
+cp -R "$WORK/app-build/Release/OrbSleepManager.app" "$STAGE/OrbSleepManager.app"
+
+IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
+SIGNED_NOTE="UNSIGNED (ad-hoc)"
+if [ -n "$IDENTITY" ]; then
+  echo "==> signing with $IDENTITY"
+  codesign --force --deep --options runtime --timestamp \
+    --entitlements app/OrbSleepManager.entitlements --sign "$IDENTITY" \
+    "$STAGE/OrbSleepManager.app"
+  SIGNED_NOTE="Developer ID: $IDENTITY"
+else
+  echo "==> WARNING: no Developer ID Application identity; ad-hoc signing only"
+  codesign --force --deep --options runtime \
+    --entitlements app/OrbSleepManager.entitlements --sign - \
+    "$STAGE/OrbSleepManager.app"
+fi
+codesign --verify --deep --strict --verbose=1 "$STAGE/OrbSleepManager.app"
+
+cat > "$STAGE/README.txt" <<README
+OrbSleep Manager $VERSION ($BUILD_NUMBER)
+=========================================
+
+Install:
+  1. Drag OrbSleepManager.app into /Applications.
+  2. Install the daemon and CLI:
+       sudo install -m 755 bin/orbsleepd /usr/local/bin/
+       sudo install -m 755 bin/orbsleepctl /usr/local/bin/
+       orbsleepctl install-agent
+  3. Run orbsleepctl doctor, then open OrbSleep Manager.
+
+Requires macOS 14+ and OrbStack (or Docker Desktop) with a local Unix socket.
+
+This build is $SIGNED_NOTE.
+If Gatekeeper blocks an unsigned/ad-hoc build, right-click the app and choose Open.
+README
+chmod 644 "$STAGE/README.txt"
+
+echo "==> packaging zip"
+ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$DIST/$NAME.zip"
+
+echo "==> packaging dmg"
+rm -rf "$WORK/dmg"
+mkdir -p "$WORK/dmg"
+cp -R "$STAGE/OrbSleepManager.app" "$WORK/dmg/"
+cp -R "$STAGE/bin" "$WORK/dmg/"
+cp "$STAGE/README.txt" "$WORK/dmg/"
+ln -s /Applications "$WORK/dmg/Applications"
+hdiutil create -quiet -volname "OrbSleep Manager $VERSION" -srcfolder "$WORK/dmg" \
+  -ov -format UDZO "$DIST/$NAME.dmg"
+
+if [ -n "$IDENTITY" ] && [ -n "${APP_STORE_CONNECT_KEY_ID:-}" ] && [ -n "${APP_STORE_CONNECT_ISSUER_ID:-}" ] && [ -f "${APP_STORE_CONNECT_PRIVATE_KEY_PATH:-}" ]; then
+  echo "==> notarizing"
+  ditto -c -k --keepParent "$STAGE/OrbSleepManager.app" "$WORK/notary.zip"
+  xcrun notarytool submit "$WORK/notary.zip" \
+    --key "$APP_STORE_CONNECT_PRIVATE_KEY_PATH" --key-id "$APP_STORE_CONNECT_KEY_ID" \
+    --issuer "$APP_STORE_CONNECT_ISSUER_ID" --wait
+  xcrun stapler staple "$STAGE/OrbSleepManager.app"
+  # Rebuild the zip/dmg after stapling.
+  rm -f "$DIST/$NAME.zip"
+  ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$DIST/$NAME.zip"
+  xcrun stapler staple "$DIST/$NAME.dmg" || true
+else
+  echo "==> notarization skipped (Developer ID identity or APP_STORE_CONNECT credentials missing)"
+fi
+
+echo "==> checksums"
+(cd "$DIST" && shasum -a 256 "$NAME.zip" "$NAME.dmg" > SHA256SUMS)
+cat "$DIST/SHA256SUMS"
+echo "Done: $DIST"

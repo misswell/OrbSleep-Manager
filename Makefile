@@ -2,7 +2,7 @@ SHELL := /bin/bash
 BIN := $(CURDIR)/bin
 APP := $(CURDIR)/app
 
-.PHONY: all build build-core test vet app phase0 clean install-agent uninstall-agent
+.PHONY: all build build-core test vet app phase0 release clean install-agent uninstall-agent
 
 all: build
 
@@ -27,6 +27,9 @@ app:
 
 phase0: build-core
 	python3 scripts/phase0.py
+
+release:
+	./scripts/package-release.sh
 
 install-agent: build-core
 	"$(BIN)/orbsleepctl" install-agent --binary "$(BIN)/orbsleepd"

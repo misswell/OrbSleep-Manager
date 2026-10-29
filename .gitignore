@@ -10,3 +10,5 @@ app/*.xcworkspace/
 __pycache__/
 *.pyc
 /tmp/
+
+dist/
