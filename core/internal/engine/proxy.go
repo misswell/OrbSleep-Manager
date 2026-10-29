@@ -317,13 +317,28 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 		return
 	}
 	if hadCompose {
-		_ = os.WriteFile(filepath.Join(snapDir, "docker-compose.yml"), oldCompose, 0o600)
+		if err := compose.WriteAtomic(filepath.Join(snapDir, "docker-compose.yml"), oldCompose, 0o600); err != nil {
+			logger.finish("failed", "备份旧代理 Compose 失败，已中止（未做任何修改）: "+err.Error())
+			return
+		}
 	}
-	if settingsJSON, jerr := json.MarshalIndent(old, "", "  "); jerr == nil {
-		_ = os.WriteFile(filepath.Join(snapDir, "settings.json"), settingsJSON, 0o600)
+	settingsJSON, jerr := json.MarshalIndent(old, "", "  ")
+	if jerr != nil {
+		logger.finish("failed", "序列化旧设置失败，已中止: "+jerr.Error())
+		return
 	}
-	if raw, jerr := json.MarshalIndent(next, "", "  "); jerr == nil {
-		_ = os.WriteFile(filepath.Join(snapDir, "new-settings.json"), raw, 0o600)
+	if err := compose.WriteAtomic(filepath.Join(snapDir, "settings.json"), settingsJSON, 0o600); err != nil {
+		logger.finish("failed", "备份旧设置失败，已中止（未做任何修改）: "+err.Error())
+		return
+	}
+	raw, jerr := json.MarshalIndent(next, "", "  ")
+	if jerr != nil {
+		logger.finish("failed", "序列化新设置失败，已中止: "+jerr.Error())
+		return
+	}
+	if err := compose.WriteAtomic(filepath.Join(snapDir, "new-settings.json"), raw, 0o600); err != nil {
+		logger.finish("failed", "备份新设置失败，已中止（未做任何修改）: "+err.Error())
+		return
 	}
 
 	restore := func(reason error) {

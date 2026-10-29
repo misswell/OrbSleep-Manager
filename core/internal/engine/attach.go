@@ -156,17 +156,24 @@ func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSna
 			logger.add("error", err.Error())
 			if len(applied) > 0 {
 				logger.add("warn", "回滚此前已完成的接入")
-				if rbErr := e.rollbackApplied(ctx, logger, applied, baseCfg); rbErr != nil {
+				if rbErr := e.rollbackApplied(logger, applied, baseCfg); rbErr != nil {
+					var deferred *rollbackDeferredError
+					if errors.As(rbErr, &deferred) {
+						logger.add("warn", "回滚暂未执行，事务保留以便后续自动恢复: "+deferred.Error())
+						logger.finish("failed", "接入失败且回滚未执行（事务保留，等待自动恢复）: "+err.Error())
+						e.setLastError("接入失败，回滚待自动恢复: " + err.Error())
+						return
+					}
 					logger.add("error", rbErr.Error())
 					rbFailed = true
 				}
 			}
 			if rbFailed {
-				e.finishTxn(txnID, "rollback_failed", err, "rollback_failed")
+				e.finishTxnAtomic(txnID, op.ID, "rollback_failed", err, "rollback_failed")
 				logger.finish("rollback_failed", err.Error())
 				e.setLastError("接入失败且回滚不完整: " + err.Error())
 			} else {
-				e.finishTxn(txnID, "rolled_back", err, "rolled_back")
+				e.finishTxnAtomic(txnID, op.ID, "rolled_back", err, "rolled_back")
 				logger.finish("rolled_back", err.Error())
 				e.setLastError("接入失败，已回滚: " + err.Error())
 			}
@@ -180,7 +187,7 @@ func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSna
 	}
 	logger.setAffected(ids)
 	logger.add("info", "接入完成；此后原端口由 macOS 端口网关监听，GUI 关闭后仍然有效")
-	e.finishTxn(txnID, "committed", nil, "committed")
+	e.finishTxnAtomic(txnID, op.ID, "committed", nil, "committed")
 	logger.finish("succeeded", "")
 	if err := e.syncProxyConfig(ctx, true); err != nil {
 		logger.add("warn", "同步代理配置失败: "+err.Error())
@@ -337,6 +344,15 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	if err != nil {
 		return fail(fmt.Errorf("读取 Compose 文件属性失败: %w", err))
 	}
+	// Write-ahead: persist the exact bytes about to be written before touching
+	// the file. If the process dies after the atomic rename but before the
+	// post-write transaction update, recovery can still recognise the file.
+	if err := e.updateTxn(txnID, "compose_write_pending", func(p *txnPayload) {
+		p.Items[idx].PendingContent = append([]byte(nil), out...)
+		p.Items[idx].Phase = "compose_write_pending"
+	}); err != nil {
+		return fail(fmt.Errorf("写入事务日志失败: %w", err))
+	}
 	if err := compose.WriteAtomic(snap.composeFile, out, info.Mode()); err != nil {
 		return fail(fmt.Errorf("写入 Compose 文件失败: %w", err))
 	}
@@ -465,17 +481,30 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 // rollbackApplied reverts previously successful items of a failed plan. It only
 // deletes a managed record after the original Compose port mapping has been
 // restored, the container is running and the original ports are published.
-func (e *Engine) rollbackApplied(ctx context.Context, logger *opLogger, applied []appliedItem, base proxy.Config) error {
+// rollbackDeferredError means a rollback could not even start because a
+// dependency was unavailable. The transaction must stay "running" so startup
+// recovery can retry it later.
+type rollbackDeferredError struct{ Cause error }
+
+func (d *rollbackDeferredError) Error() string {
+	return "回滚依赖不可用: " + d.Cause.Error()
+}
+func (d *rollbackDeferredError) Unwrap() error { return d.Cause }
+
+func (e *Engine) rollbackApplied(logger *opLogger, applied []appliedItem, base proxy.Config) error {
+	// Rollback must never inherit a cancelled business context (e.g. shutdown).
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
 	cli, err := e.cliRunner()
 	if err != nil {
-		return fmt.Errorf("回滚未执行：docker CLI 不可用: %w（未修改任何状态，请人工恢复；备份位于 %s）", err, logger.snapshot().BackupDir)
+		return &rollbackDeferredError{Cause: fmt.Errorf("docker CLI 不可用: %w", err)}
 	}
 	admin, err := e.adminClient()
 	if err != nil {
-		return fmt.Errorf("回滚未执行：代理管理接口不可用: %w（未修改任何状态，请人工恢复；备份位于 %s）", err, logger.snapshot().BackupDir)
+		return &rollbackDeferredError{Cause: fmt.Errorf("代理管理接口不可用: %w", err)}
 	}
 	if _, err := admin.GetConfig(ctx); err != nil {
-		return fmt.Errorf("回滚未执行：无法读取代理配置: %w（未修改任何状态，请人工恢复；备份位于 %s）", err, logger.snapshot().BackupDir)
+		return &rollbackDeferredError{Cause: fmt.Errorf("无法读取代理配置: %w", err)}
 	}
 	var errs []string
 	rolledBack := map[string]bool{}
@@ -522,8 +551,11 @@ func (e *Engine) rollbackApplied(ctx context.Context, logger *opLogger, applied 
 			}
 			continue
 		}
-		if err := e.store.DeleteService(ai.serviceID); err != nil {
+		if err := deleteServiceRecord(e, ai.serviceID); err != nil {
 			errs = append(errs, name+": 删除托管记录失败: "+err.Error())
+			if rerr := e.revertToManaged(ai); rerr != nil {
+				errs = append(errs, name+": 回退到托管状态失败: "+rerr.Error())
+			}
 			continue
 		}
 		_ = e.store.DeleteMeta("serviceBackup:" + ai.serviceID)

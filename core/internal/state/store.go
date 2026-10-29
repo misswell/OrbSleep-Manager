@@ -83,6 +83,7 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS transactions (
 			id TEXT PRIMARY KEY,
 			kind TEXT NOT NULL DEFAULT '',
+			operation_id TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT '',
 			phase TEXT NOT NULL DEFAULT '',
 			started_at TEXT NOT NULL DEFAULT '',
@@ -98,6 +99,8 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	// Older databases predate operation_id.
+	_, _ = s.db.Exec(`ALTER TABLE transactions ADD COLUMN operation_id TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
@@ -203,21 +206,52 @@ func (s *Store) UpdateOperation(op model.Operation) error {
 	return err
 }
 
+// ListRunningOperations returns operations that never reached a terminal state.
+func (s *Store) ListRunningOperations() ([]model.Operation, error) {
+	rows, err := s.db.Query(`SELECT id, kind, status, started_at, finished_at, error, backup_dir, affected, log
+		FROM operations WHERE status='running' ORDER BY started_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Operation
+	for rows.Next() {
+		op, err := scanOperation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	return out, rows.Err()
+}
+
 // GetOperation returns one operation.
-func (s *Store) GetOperation(id string) (model.Operation, bool, error) {
-	row := s.db.QueryRow(`SELECT id, kind, status, started_at, finished_at, error, backup_dir, affected, log FROM operations WHERE id=?`, id)
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanOperation(row rowScanner) (model.Operation, error) {
 	var op model.Operation
 	var affected, logJSON string
 	if err := row.Scan(&op.ID, &op.Kind, &op.Status, &op.StartedAt, &op.FinishedAt, &op.Error, &op.BackupDir, &affected, &logJSON); err != nil {
+		return op, err
+	}
+	_ = json.Unmarshal([]byte(affected), &op.AffectedServiceIDs)
+	_ = json.Unmarshal([]byte(logJSON), &op.Log)
+	if op.Log == nil {
+		op.Log = []model.LogEntry{}
+	}
+	return op, nil
+}
+
+func (s *Store) GetOperation(id string) (model.Operation, bool, error) {
+	row := s.db.QueryRow(`SELECT id, kind, status, started_at, finished_at, error, backup_dir, affected, log FROM operations WHERE id=?`, id)
+	op, err := scanOperation(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return model.Operation{}, false, nil
 		}
 		return model.Operation{}, false, err
-	}
-	json.Unmarshal([]byte(affected), &op.AffectedServiceIDs)
-	json.Unmarshal([]byte(logJSON), &op.Log)
-	if op.Log == nil {
-		op.Log = []model.LogEntry{}
 	}
 	return op, true, nil
 }
@@ -258,31 +292,32 @@ func (s *Store) PruneOperations(cutoff time.Time) error {
 
 // Transaction is a durable record of an in-flight or recovered operation.
 type Transaction struct {
-	ID        string
-	Kind      string
-	Status    string // running | committed | rolled_back | rollback_failed
-	Phase     string
-	StartedAt string
-	UpdatedAt string
-	Error     string
-	Data      string
+	ID          string
+	Kind        string
+	OperationID string
+	Status      string // running | committed | rolled_back | rollback_failed
+	Phase       string
+	StartedAt   string
+	UpdatedAt   string
+	Error       string
+	Data        string
 }
 
 // SaveTransaction inserts or updates a transaction record.
 func (s *Store) SaveTransaction(t Transaction) error {
-	_, err := s.db.Exec(`INSERT INTO transactions (id, kind, status, phase, started_at, updated_at, error, data)
-		VALUES (?,?,?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET status=excluded.status, phase=excluded.phase,
-		 updated_at=excluded.updated_at, error=excluded.error, data=excluded.data`,
-		t.ID, t.Kind, t.Status, t.Phase, t.StartedAt, t.UpdatedAt, t.Error, t.Data)
+	_, err := s.db.Exec(`INSERT INTO transactions (id, kind, operation_id, status, phase, started_at, updated_at, error, data)
+		VALUES (?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET operation_id=excluded.operation_id, status=excluded.status,
+		 phase=excluded.phase, updated_at=excluded.updated_at, error=excluded.error, data=excluded.data`,
+		t.ID, t.Kind, t.OperationID, t.Status, t.Phase, t.StartedAt, t.UpdatedAt, t.Error, t.Data)
 	return err
 }
 
 // GetTransaction returns one transaction record.
 func (s *Store) GetTransaction(id string) (Transaction, bool, error) {
-	row := s.db.QueryRow(`SELECT id, kind, status, phase, started_at, updated_at, error, data FROM transactions WHERE id=?`, id)
+	row := s.db.QueryRow(`SELECT id, kind, operation_id, status, phase, started_at, updated_at, error, data FROM transactions WHERE id=?`, id)
 	var t Transaction
-	if err := row.Scan(&t.ID, &t.Kind, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
+	if err := row.Scan(&t.ID, &t.Kind, &t.OperationID, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
 		if err == sql.ErrNoRows {
 			return Transaction{}, false, nil
 		}
@@ -293,7 +328,7 @@ func (s *Store) GetTransaction(id string) (Transaction, bool, error) {
 
 // ListRunningTransactions returns transactions that were not finished.
 func (s *Store) ListRunningTransactions() ([]Transaction, error) {
-	rows, err := s.db.Query(`SELECT id, kind, status, phase, started_at, updated_at, error, data
+	rows, err := s.db.Query(`SELECT id, kind, operation_id, status, phase, started_at, updated_at, error, data
 		FROM transactions WHERE status='running' ORDER BY started_at`)
 	if err != nil {
 		return nil, err
@@ -302,7 +337,7 @@ func (s *Store) ListRunningTransactions() ([]Transaction, error) {
 	var out []Transaction
 	for rows.Next() {
 		var t Transaction
-		if err := rows.Scan(&t.ID, &t.Kind, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
+		if err := rows.Scan(&t.ID, &t.Kind, &t.OperationID, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -315,6 +350,47 @@ func (s *Store) FinishTransaction(id, status, errMsg, phase string) error {
 	_, err := s.db.Exec(`UPDATE transactions SET status=?, phase=?, updated_at=?, error=? WHERE id=?`,
 		status, phase, time.Now().UTC().Format(time.RFC3339), errMsg, id)
 	return err
+}
+
+// ListTransactions returns all transaction records (for orphan reconciliation).
+func (s *Store) ListTransactions() ([]Transaction, error) {
+	rows, err := s.db.Query(`SELECT id, kind, operation_id, status, phase, started_at, updated_at, error, data
+		FROM transactions ORDER BY started_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Transaction
+	for rows.Next() {
+		var t Transaction
+		if err := rows.Scan(&t.ID, &t.Kind, &t.OperationID, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// FinishTransactionWithOperation commits the transaction terminal state and the
+// operation terminal state atomically.
+func (s *Store) FinishTransactionWithOperation(txnID, opID, txnStatus, phase, txnErr, opStatus, opErr string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.Exec(`UPDATE transactions SET status=?, phase=?, updated_at=?, error=? WHERE id=?`,
+		txnStatus, phase, now, txnErr, txnID); err != nil {
+		return err
+	}
+	if opID != "" {
+		if _, err := tx.Exec(`UPDATE operations SET status=?, finished_at=?, error=? WHERE id=?`,
+			opStatus, now, opErr, opID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // PruneTransactions deletes old terminal transactions.

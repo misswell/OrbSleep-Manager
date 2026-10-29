@@ -123,6 +123,7 @@ func (e *Engine) Start() {
 	// Roll back transactions interrupted by a crash before restoring listeners
 	// and accepting new work.
 	e.RecoverTransactions()
+	e.ReconcileOrphanOperations()
 	// Restore host port listeners before the API accepts requests, so a daemon
 	// restart does not leave a window where managed services are unreachable.
 	e.reconcile()
@@ -138,7 +139,11 @@ func (e *Engine) Close() {
 		// Cancel in-flight transactions and wait for their rollback to finish
 		// before closing the database, logger and gateway.
 		if !e.waitTransactions(10 * time.Minute) {
-			e.logger.Printf("warn", "取消后仍有事务未退出；备份与事务日志已持久化，将在下次启动恢复")
+			// Keep SQLite, logging and listeners open: a still-running goroutine
+			// must not observe closed dependencies. The process exits shortly
+			// after Close(), and the durable transaction journal covers recovery.
+			e.logger.Printf("error", "取消后仍有事务未退出；跳过资源关闭，事务将在下次启动恢复")
+			return
 		}
 		close(e.stopCh)
 		writeDone := make(chan struct{})
@@ -150,7 +155,8 @@ func (e *Engine) Close() {
 		select {
 		case <-writeDone:
 		case <-time.After(30 * time.Second):
-			e.logger.Printf("warn", "写锁等待超时，强制关闭；未完成事务将在下次启动恢复")
+			e.logger.Printf("error", "写锁等待超时；跳过资源关闭，避免关闭仍在使用中的依赖")
+			return
 		}
 		e.gw.StopAll()
 		e.wg.Wait()

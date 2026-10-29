@@ -18,6 +18,15 @@ type txnPayload struct {
 	Items       []txnItem    `json:"items"`
 }
 
+// detachPayload is the durable state for restore/remove transactions.
+type detachPayload struct {
+	OperationID      string        `json:"operationId"`
+	Service          model.Service `json:"service"`
+	ManagedContent   []byte        `json:"managedContent"`
+	ExpectedRestored []byte        `json:"expectedRestored"`
+	Phase            string        `json:"phase"`
+}
+
 type txnItem struct {
 	ContainerID    string               `json:"containerId"`
 	ContainerName  string               `json:"containerName"`
@@ -30,6 +39,7 @@ type txnItem struct {
 	ProxyMappings  []model.ProxyMapping `json:"proxyMappings"`
 	Bindings       []model.Binding      `json:"bindings"`
 	BackupPath     string               `json:"backupPath"`
+	PendingContent []byte               `json:"pendingContent"`
 	ManagedContent []byte               `json:"managedContent"`
 	ServiceID      string               `json:"serviceId"`
 	Phase          string               `json:"phase"`
@@ -60,14 +70,14 @@ func (p txnPayload) snapshot(i int) *planSnapshot {
 	}
 }
 
-func (e *Engine) startTxn(opID, kind string, payload txnPayload) (string, error) {
+func (e *Engine) startTxn(opID, kind string, payload any) (string, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	txn := state.Transaction{
-		ID: newID("txn"), Kind: kind, Status: "running", Phase: "planned",
+		ID: newID("txn"), Kind: kind, OperationID: opID, Status: "running", Phase: "planned",
 		StartedAt: now, UpdatedAt: now, Data: string(raw),
 	}
 	if err := e.store.SaveTransaction(txn); err != nil {
@@ -119,4 +129,28 @@ func (e *Engine) finishTxn(id, status string, cause error, phase string) {
 		phase = status
 	}
 	_ = e.store.FinishTransaction(id, status, msg, phase)
+}
+
+// finishTxnAtomic commits the transaction and operation terminal states in one
+// SQLite transaction, closing the window where one says committed and the other
+// still says running.
+func (e *Engine) finishTxnAtomic(id, opID, status string, cause error, phase string) {
+	msg := ""
+	if cause != nil {
+		msg = cause.Error()
+	}
+	if phase == "" {
+		phase = status
+	}
+	opStatus := status
+	if status == "committed" {
+		opStatus = "succeeded"
+	}
+	if err := e.store.FinishTransactionWithOperation(id, opID, status, phase, msg, opStatus, msg); err != nil {
+		e.logger.Printf("warn", "原子提交事务终态失败，退回分步提交: %v", err)
+		e.finishTxn(id, status, cause, phase)
+		if opID != "" {
+			e.updateOriginalOperation(opID, opStatus, msg, "")
+		}
+	}
 }

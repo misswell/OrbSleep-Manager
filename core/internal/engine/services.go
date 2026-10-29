@@ -171,11 +171,28 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 	defer e.writeMu.Unlock()
 	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("开始恢复 %s 的原始端口映射", svc.ContainerName))
+	managedContent, readErr := os.ReadFile(svc.ComposeFile)
+	if readErr != nil {
+		logger.finish("failed", "读取 Compose 文件失败，已中止: "+readErr.Error())
+		return
+	}
+	payload := detachPayload{OperationID: op.ID, Service: svc, ManagedContent: managedContent, Phase: "prepared"}
+	if expected, _, aerr := compose.AddBindings(managedContent, svc.ComposeService, bindingsFor(svc)); aerr == nil {
+		payload.ExpectedRestored = expected
+	}
+	txnID, txnErr := e.startTxn(op.ID, "detach", payload)
+	if txnErr != nil {
+		logger.finish("failed", "无法写入事务日志，已中止（未做修改）: "+txnErr.Error())
+		return
+	}
 	if err := e.restoreService(ctx, logger, svc); err != nil {
 		status := "failed"
 		var ae *attachError
 		if errors.As(err, &ae) && ae.RollbackFailed {
 			status = "rollback_failed"
+			e.finishTxnAtomic(txnID, op.ID, "rollback_failed", err, "rollback_failed")
+		} else {
+			e.finishTxnAtomic(txnID, op.ID, "rolled_back", err, "rolled_back")
 		}
 		logger.finish(status, err.Error())
 		e.setLastError("恢复失败: " + err.Error())
@@ -192,6 +209,7 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 	if err := e.syncProxyConfig(ctx, true); err != nil {
 		logger.add("warn", "同步代理配置失败: "+err.Error())
 	}
+	e.finishTxnAtomic(txnID, op.ID, "committed", nil, "committed")
 	logger.finish("succeeded", "")
 	e.triggerReconcile()
 }

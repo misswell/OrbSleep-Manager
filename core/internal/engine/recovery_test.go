@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +10,7 @@ import (
 
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
+	"orbsleep/internal/state"
 )
 
 func TestRecoverInterruptedAttachTransaction(t *testing.T) {
@@ -220,5 +223,269 @@ func TestRecoveryMarksCommittedTransaction(t *testing.T) {
 	raw, _ := os.ReadFile(snap.composeFile)
 	if string(raw) != string(managed) {
 		t.Fatalf("committed compose file must be kept:\n%s", raw)
+	}
+}
+
+func TestRecoveryAfterComposeWriteBeforeTxnUpdate(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+
+	hostPort := freePort(t)
+	bindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}
+	snap := makeSnapshot(t, hostPort, bindings)
+	original := append([]byte(nil), snap.content...)
+	managed := []byte("services:\n  web:\n    image: nginx:alpine\n")
+	// Simulate: atomic rename finished, but ManagedContent was not persisted.
+	if err := os.WriteFile(snap.composeFile, managed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	docker.setPorts(snap.removals, false)
+	backupDir := t.TempDir()
+	backupPath := filepath.Join(backupDir, "docker-compose.yml")
+	if err := os.WriteFile(backupPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	admin.cfg = proxy.Config{Services: []proxy.ServiceConfig{{Name: snap.containerName, Ports: []string{"20012:80"}}}}
+	admin.mu.Unlock()
+
+	txnID, err := e.startTxn("op-crashed", "attach", txnFromPlan("op-crashed", proxy.Config{}, []planSnapshot{*snap}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.updateTxn(txnID, "compose_write_pending", func(p *txnPayload) {
+		p.Items[0].BackupPath = backupPath
+		p.Items[0].PendingContent = managed
+		p.Items[0].Phase = "compose_write_pending"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	got, _, _ := e.store.GetTransaction(txnID)
+	if got.Status != "rolled_back" {
+		t.Fatalf("status = %s error=%s", got.Status, got.Error)
+	}
+	raw, _ := os.ReadFile(snap.composeFile)
+	if string(raw) != string(original) {
+		t.Fatalf("compose was not restored:\n%s", raw)
+	}
+	if cfg := admin.config(); len(cfg.Services) != 0 {
+		t.Fatalf("proxy target not removed: %+v", cfg.Services)
+	}
+}
+
+func TestRecoverInterruptedDetachRevertsToManaged(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+
+	// Simulate detach having restored the original Compose before crashing.
+	original := []byte("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:12345:80\"\n")
+	if err := os.WriteFile(snap.composeFile, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	docker.setPorts(snap.removals, true)
+	txnID, err := e.startTxn("op-detach", "detach", detachPayload{
+		OperationID: "op-detach", Service: svc, ManagedContent: managed, ExpectedRestored: original, Phase: "compose_restored",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	got, _, _ := e.store.GetTransaction(txnID)
+	if got.Status != "rolled_back" {
+		t.Fatalf("status = %s error=%s", got.Status, got.Error)
+	}
+	raw, _ := os.ReadFile(snap.composeFile)
+	if string(raw) != string(managed) {
+		t.Fatalf("compose was not reverted to managed:\n%s", raw)
+	}
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("gateway listener missing: %v", e.gw.RouteKeys())
+	}
+	if _, ok, _ := e.store.GetService(svc.ID); !ok {
+		t.Fatal("managed record must be kept")
+	}
+}
+
+func TestRecoverCompletedDetachMarksCommitted(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+	svc, snap, _, _ := managedServiceFixture(t, e, admin, docker, e.cli)
+	if err := e.store.DeleteService(svc.ID); err != nil {
+		t.Fatal(err)
+	}
+	txnID, err := e.startTxn("op-detach", "detach", detachPayload{
+		OperationID: "op-detach", Service: svc, ManagedContent: snap.content, Phase: "verify",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	got, _, _ := e.store.GetTransaction(txnID)
+	if got.Status != "committed" {
+		t.Fatalf("status = %s error=%s", got.Status, got.Error)
+	}
+}
+
+func TestReconcileOrphanOperations(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	orphan := model.Operation{ID: "op-orphan", Kind: "proxy_setup", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339)}
+	if err := e.store.InsertOperation(orphan); err != nil {
+		t.Fatal(err)
+	}
+	committed := model.Operation{ID: "op-committed", Kind: "attach", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339)}
+	if err := e.store.InsertOperation(committed); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.SaveTransaction(state.Transaction{
+		ID: "txn-committed", Kind: "attach", OperationID: committed.ID, Status: "committed",
+		Phase: "committed", StartedAt: time.Now().UTC().Format(time.RFC3339), Data: "{}",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.ReconcileOrphanOperations()
+
+	got, _, _ := e.store.GetOperation(orphan.ID)
+	if got.Status != "failed" {
+		t.Fatalf("orphan status = %s", got.Status)
+	}
+	got, _, _ = e.store.GetOperation(committed.ID)
+	if got.Status != "succeeded" {
+		t.Fatalf("committed op status = %s", got.Status)
+	}
+}
+
+func TestFinishTxnAtomicUpdatesBothRecords(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	op := model.Operation{ID: "op-atomic", Kind: "attach", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339)}
+	if err := e.store.InsertOperation(op); err != nil {
+		t.Fatal(err)
+	}
+	txnID, err := e.startTxn(op.ID, "attach", txnPayload{OperationID: op.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.finishTxnAtomic(txnID, op.ID, "committed", nil, "committed")
+	txn, _, _ := e.store.GetTransaction(txnID)
+	if txn.Status != "committed" {
+		t.Fatalf("txn status = %s", txn.Status)
+	}
+	got, _, _ := e.store.GetOperation(op.ID)
+	if got.Status != "succeeded" {
+		t.Fatalf("op status = %s", got.Status)
+	}
+}
+
+func TestRecoveryRevertsToManagedWhenOriginalRestoreFails(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+
+	// Crash state: Compose is managed and a gateway listener exists.
+	backupDir := t.TempDir()
+	backupPath := filepath.Join(backupDir, "docker-compose.yml")
+	if err := os.WriteFile(backupPath, snap.content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cli.upFn = func(file string) error {
+		raw, _ := os.ReadFile(file)
+		if bytes.Contains(raw, []byte("ports:")) {
+			return errors.New("simulated original restore failure")
+		}
+		return nil
+	}
+	txnID, err := e.startTxn("op-crashed", "attach", txnFromPlan("op-crashed", proxy.Config{}, []planSnapshot{*snap}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.updateTxn(txnID, "compose_updated", func(p *txnPayload) {
+		p.Items[0].BackupPath = backupPath
+		p.Items[0].ServiceID = svc.ID
+		p.Items[0].ManagedContent = managed
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	got, _, _ := e.store.GetTransaction(txnID)
+
+	raw, _ := os.ReadFile(snap.composeFile)
+	if string(raw) != string(managed) {
+		t.Fatalf("service was not reverted to managed:\n%s", raw)
+	}
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("gateway listener missing after revert: %v", e.gw.RouteKeys())
+	}
+	if _, ok, _ := e.store.GetService(svc.ID); !ok {
+		t.Fatal("managed record must be kept")
+	}
+	if got.Status != "rollback_failed" {
+		t.Fatalf("status = %s, want rollback_failed", got.Status)
+	}
+}
+
+func TestDeferredRecoveryWorksAfterReconcileRebuildsGateway(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+	backupDir, _ := e.store.GetMeta("serviceBackup:" + svc.ID)
+	backupPath := filepath.Join(backupDir, "docker-compose.yml")
+
+	txnID, err := e.startTxn("op-crashed", "attach", txnFromPlan("op-crashed", proxy.Config{}, []planSnapshot{*snap}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.updateTxn(txnID, "compose_updated", func(p *txnPayload) {
+		p.Items[0].BackupPath = backupPath
+		p.Items[0].ServiceID = svc.ID
+		p.Items[0].ManagedContent = managed
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// First recovery attempt cannot reach the proxy: transaction stays running
+	// and the reconcile-created gateway listener remains.
+	s := e.settings.Get()
+	s.AdminPort = freePort(t)
+	if err := e.settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	if got, _, _ := e.store.GetTransaction(txnID); got.Status != "running" {
+		t.Fatalf("first recovery should leave the transaction running, got %s", got.Status)
+	}
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("expected existing gateway listener, got %v", e.gw.RouteKeys())
+	}
+	// Proxy is reachable again: the second attempt must release the gateway
+	// before restoring the original Compose file.
+	s.AdminPort = admin.port()
+	if err := e.settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	if got, _, _ := e.store.GetTransaction(txnID); got.Status != "rolled_back" {
+		t.Fatalf("second recovery status = %s error=%s", got.Status, got.Error)
+	}
+	if len(e.gw.RouteKeys()) != 0 {
+		t.Fatalf("gateway listener must be released before restore: %v", e.gw.RouteKeys())
+	}
+	raw, _ := os.ReadFile(snap.composeFile)
+	if string(raw) != string(snap.content) {
+		t.Fatalf("compose not restored:\n%s", raw)
 	}
 }

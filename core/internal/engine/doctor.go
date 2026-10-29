@@ -161,6 +161,9 @@ func (e *Engine) CleanupOldOperations() {
 		days = 14
 	}
 	cutoff := time.Now().AddDate(0, 0, -days)
+	// Backups must be pruned while the operation records still exist: cleanup
+	// consults their final status. Prune history afterwards.
+	e.cleanupOldBackups(cutoff)
 	if err := e.store.PruneOperations(cutoff); err != nil {
 		e.logger.Printf("warn", "清理操作历史失败: %v", err)
 	}
@@ -170,7 +173,6 @@ func (e *Engine) CleanupOldOperations() {
 	if err := e.logger.CleanupOlderThan(days); err != nil {
 		e.logger.Printf("warn", "清理日志文件失败: %v", err)
 	}
-	e.cleanupOldBackups(cutoff)
 }
 
 // cleanupOldBackups removes old operation backup directories but never touches
@@ -185,21 +187,39 @@ func (e *Engine) cleanupOldBackups(cutoff time.Time) {
 		if !entry.IsDir() || entry.Name() == "services" {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil || info.ModTime().After(cutoff) {
+		path := filepath.Join(root, entry.Name())
+		if entry.Name() == "proxy" {
+			// Proxy install snapshots live in backups/proxy/<operationID>.
+			children, cerr := os.ReadDir(path)
+			if cerr != nil {
+				continue
+			}
+			for _, child := range children {
+				if child.IsDir() {
+					e.pruneBackupEntry(filepath.Join(path, child.Name()), child.Name(), cutoff)
+				}
+			}
 			continue
 		}
-		op, ok, err := e.store.GetOperation(entry.Name())
-		if err != nil || !ok {
-			// Unknown directory: keep it. It may be the only recovery evidence.
-			continue
-		}
-		if !backupPrunable(op) {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
-			e.logger.Printf("warn", "清理旧备份失败 %s: %v", entry.Name(), err)
-		}
+		e.pruneBackupEntry(path, entry.Name(), cutoff)
+	}
+}
+
+func (e *Engine) pruneBackupEntry(path, opID string, cutoff time.Time) {
+	info, err := os.Stat(path)
+	if err != nil || info.ModTime().After(cutoff) {
+		return
+	}
+	op, ok, err := e.store.GetOperation(opID)
+	if err != nil || !ok {
+		// Unknown directory: keep it. It may be the only recovery evidence.
+		return
+	}
+	if !backupPrunable(op) {
+		return
+	}
+	if err := os.RemoveAll(path); err != nil {
+		e.logger.Printf("warn", "清理旧备份失败 %s: %v", filepath.Base(path), err)
 	}
 }
 

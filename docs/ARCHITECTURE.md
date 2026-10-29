@@ -107,8 +107,10 @@ GUI 与守护进程使用 Unix Socket（`~/Library/Application Support/OrbSleep/
 - `start` / `stop` / `updatePolicy` 与接入、恢复、代理安装共用同一把写锁，事务期间返回冲突而不是交错执行。
 - 代理端口设置在安装后锁定；重新安装必须成功启动、管理接口可达且配置同步成功后才提交新设置，失败自动回滚到旧设置与旧代理。
 - 代理配置快照使用深拷贝（`Config.Clone`），`Remove` 总是分配新切片，避免工作副本污染基线。
-- 接入事务在校验基线后、任何修改前写入 SQLite `transactions` 表，并按 `prepared → proxy_updated → compose_updated → container_recreated → gateway_ready → verified → committed_item` 持久化阶段；每项备份路径在修改前登记。
-- 守护进程启动时在开放 API 前扫描 `running` 事务：若全部项目已 `committed_item` 则补记完成，否则按备份回滚 Compose、重建容器、验证原端口、删除托管记录并清理代理目标。代理/Docker 不可用时保留事务，后续 reconcile 重试。
+- 接入事务在校验基线后、任何修改前写入 SQLite `transactions` 表，并按 `prepared → proxy_updated → compose_write_pending → compose_updated → container_recreated → gateway_ready → verified → committed_item` 持久化阶段；每项备份路径在修改前登记。`compose_write_pending` 会在原子替换 Compose 之前持久化完整的新文件内容（write-ahead），因此“文件已换、事务未更新”的崩溃窗口也能被识别并回滚。
+- 守护进程启动时在开放 API 前扫描 `running` 事务：若全部项目已 `committed_item` 则补记完成，否则按备份回滚 Compose、重建容器、验证原端口、删除托管记录并清理代理目标。恢复每个服务前先释放该服务的网关监听，避免与 reconcile 已重建的监听抢端口；恢复失败时回退到一致的托管状态并重建监听。代理/Docker 不可用时保留事务，后续 reconcile 重试。
+- `restore/remove` 同样有持久化事务（`detach`）：记录服务、托管 Compose、预期恢复后的 Compose 和阶段。启动恢复会先释放网关，再决定继续完成还是回退到托管状态；外部修改的 Compose 不会被覆盖。
+- 事务终态与操作终态在同一个 SQLite 事务中提交；启动时还会修正孤立的 `running` 操作记录（有已提交事务则补记成功，无事务则标记失败）。
 - 长事务通过 `beginOperation` 注册：关闭时先拒绝新操作、取消运行中的事务，并等待其回滚完成（最多 10 分钟）后才关闭日志、数据库和网关；未完成阶段仍由事务日志兜底。
 - 代理容器可通过 `proxy.stop` 停止并移除（保留设置和配置）；停止后端口设置可编辑，重新 `proxy.setup` 生效。
 
@@ -119,7 +121,7 @@ GUI 与守护进程使用 Unix Socket（`~/Library/Application Support/OrbSleep/
 - 不把 Docker API 暴露到网络；不执行 `prune`；不删除卷。
 - 数据目录 0700、数据库与日志 0600、launchd 任务 Umask 077；日志/操作历史按保留天数定期清理，服务恢复备份不会被清理。
 - 低端口助手、IPv6 网关尚未实现：低端口与 IPv6 绑定在分类阶段直接排除，`container_ip` 只有逐端口探测通过后才允许启用。
-- 旧版本中 `enableLowPortHelper=true` 会在启动时自动迁移为 `false`；失败或 `rollback_failed` 操作的备份不会被保留期清理，直到用户主动处理。
+- 旧版本中 `enableLowPortHelper=true` 会在启动时自动迁移为 `false`；失败或 `rollback_failed` 操作的备份不会被保留期清理，直到用户主动处理。备份清理先于操作/事务历史清理执行，并覆盖 `backups/proxy/<opID>` 嵌套目录。
 - 接入前后核对挂载、网络、环境变量、健康检查、重启策略（通过有效配置比较与容器 Inspect 展示）。
 
 ## 11. 未实现

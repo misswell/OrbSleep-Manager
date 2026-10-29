@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -116,6 +117,7 @@ type fakeCLI struct {
 	docker     *fakeDocker
 	upErr      error
 	proxyUpErr error
+	upFn       func(file string) error
 	upCalls    int
 }
 
@@ -126,6 +128,11 @@ func (f *fakeCLI) UpService(ctx context.Context, project, file, workdir, service
 	f.upCalls++
 	if f.upErr != nil {
 		return f.upErr
+	}
+	if f.upFn != nil {
+		if err := f.upFn(file); err != nil {
+			return err
+		}
 	}
 	raw, err := os.ReadFile(file)
 	if err != nil {
@@ -183,6 +190,29 @@ type fakeAdmin struct {
 	getFn  func(call int) error
 	putFn  func(call int) error
 	server *httptest.Server
+}
+
+type portHolder struct {
+	mu sync.Mutex
+	ln net.Listener
+}
+
+func (h *portHolder) set(ln net.Listener) { h.mu.Lock(); h.ln = ln; h.mu.Unlock() }
+func (h *portHolder) close() {
+	h.mu.Lock()
+	if h.ln != nil {
+		_ = h.ln.Close()
+	}
+	h.mu.Unlock()
+}
+
+func (a *fakeAdmin) port() int {
+	u, err := url.Parse(a.server.URL)
+	if err != nil {
+		return 0
+	}
+	p, _ := strconv.Atoi(u.Port())
+	return p
 }
 
 func newFakeAdmin(t *testing.T) *fakeAdmin {
@@ -431,7 +461,7 @@ func TestRollbackKeepsRecordWhenContainerCannotBeRestored(t *testing.T) {
 		t.Fatal(err)
 	}
 	ai := appliedItem{snap: snap, serviceID: svc.ID, backupPath: backup, managedContent: managed}
-	err := e.rollbackApplied(context.Background(), logger, []appliedItem{ai}, proxy.Config{})
+	err := e.rollbackApplied(logger, []appliedItem{ai}, proxy.Config{})
 	if err == nil {
 		t.Fatal("expected rollback to report failure")
 	}
@@ -738,14 +768,14 @@ func TestRestoreRevertsWhenDeletingManagedRecordFails(t *testing.T) {
 	// Once the gateway releases the port, occupy it with a real listener so the
 	// connectivity probe succeeds. The delete hook closes it just before the
 	// revert, allowing the gateway to bind again.
-	var holder net.Listener
+	holder := &portHolder{}
 	holderReady := make(chan struct{})
 	go func() {
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
 			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
 			if err == nil {
-				holder = ln
+				holder.set(ln)
 				close(holderReady)
 				return
 			}
@@ -756,16 +786,12 @@ func TestRestoreRevertsWhenDeletingManagedRecordFails(t *testing.T) {
 
 	originalDelete := deleteServiceRecord
 	deleteServiceRecord = func(e *Engine, id string) error {
-		if holder != nil {
-			_ = holder.Close()
-		}
+		holder.close()
 		return errors.New("simulated sqlite failure")
 	}
 	t.Cleanup(func() {
 		deleteServiceRecord = originalDelete
-		if holder != nil {
-			_ = holder.Close()
-		}
+		holder.close()
 	})
 
 	err := e.restoreService(context.Background(), logger, svc)
@@ -785,5 +811,114 @@ func TestRestoreRevertsWhenDeletingManagedRecordFails(t *testing.T) {
 	}
 	if len(e.gw.RouteKeys()) != 1 {
 		t.Fatalf("gateway listener was not restored: %v", e.gw.RouteKeys())
+	}
+}
+
+func TestRollbackDeferredWhenDependencyUnavailable(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	// Point the admin port at a closed port after setup.
+	s := e.settings.Get()
+	s.AdminPort = freePort(t)
+	if err := e.settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	hostPort := freePort(t)
+	bindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}
+	snap := makeSnapshot(t, hostPort, bindings)
+	ai := appliedItem{snap: snap, serviceID: "svc-x", managedContent: []byte("managed")}
+	err := e.rollbackApplied(logger, []appliedItem{ai}, proxy.Config{})
+	if err == nil {
+		t.Fatal("expected deferred rollback error")
+	}
+	var deferred *rollbackDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("expected rollbackDeferredError, got %T %v", err, err)
+	}
+}
+
+func TestRollbackAppliedRevertsWhenRecordDeletionFails(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+	hostPort := svc.Bindings[0].HostPort
+
+	holder := &portHolder{}
+	holderReady := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
+			if err == nil {
+				holder.set(ln)
+				close(holderReady)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(holderReady)
+	}()
+	originalDelete := deleteServiceRecord
+	deleteServiceRecord = func(e *Engine, id string) error {
+		holder.close()
+		return errors.New("simulated sqlite failure")
+	}
+	t.Cleanup(func() {
+		deleteServiceRecord = originalDelete
+		holder.close()
+	})
+
+	backupDir, _ := e.store.GetMeta("serviceBackup:" + svc.ID)
+	ai := appliedItem{
+		snap:           snap,
+		serviceID:      svc.ID,
+		backupPath:     filepath.Join(backupDir, "docker-compose.yml"),
+		managedContent: managed,
+	}
+	err := e.rollbackApplied(logger, []appliedItem{ai}, proxy.Config{})
+	<-holderReady
+	if err == nil {
+		t.Fatal("expected rollback to report incomplete state")
+	}
+	raw, _ := os.ReadFile(snap.composeFile)
+	if string(raw) != string(managed) {
+		t.Fatalf("service was not reverted to managed:\n%s", raw)
+	}
+	if _, ok, _ := e.store.GetService(svc.ID); !ok {
+		t.Fatal("managed record must be kept")
+	}
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("gateway listener missing: %v", e.gw.RouteKeys())
+	}
+	if len(admin.config().Services) != 1 {
+		t.Fatal("proxy target must be kept")
+	}
+}
+
+func TestProxySetupAbortsWhenBackupCannotBeWritten(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	op := model.Operation{ID: "op-proxy-backup", BackupDir: blocker, Status: "running"}
+	if err := e.store.InsertOperation(op); err != nil {
+		t.Fatal(err)
+	}
+	e.runProxySetup(context.Background(), op, func() {})
+	got, ok, err := e.store.GetOperation(op.ID)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if got.Status != "failed" {
+		t.Fatalf("status = %s, error = %s", got.Status, got.Error)
+	}
+	if _, err := os.Stat(e.proxyComposePath()); !os.IsNotExist(err) {
+		t.Fatalf("proxy compose must not be created after backup failure: %v", err)
 	}
 }

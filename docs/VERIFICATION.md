@@ -124,6 +124,21 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 
 新增/扩展测试：`proxy_test.go`（深拷贝）、`recovery_test.go`（崩溃恢复、外部修改保护、关闭取消）、`attach_test.go`（代理安装失败回滚、多服务配置保持、备份保留策略）。`go test -race ./...` 全部通过（并修复了网关目标热更新的数据竞争）。
 
+## 第三轮复审加固（0.1.3）
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| Compose 写入与事务阶段之间的崩溃窗口 | 写入前持久化 `compose_write_pending` + 完整 `PendingContent`；恢复按原始/预期新/实际三态判断。新增“原子替换已完成但 ManagedContent 未写”故障注入测试 |
+| 关闭取消导致回滚不执行 | 回滚使用独立 20 分钟上下文；依赖不可用返回 `rollbackDeferredError`，事务保持 `running` 由启动恢复重试；关闭超时不再关闭数据库/日志/网关，避免使用已关闭资源 |
+| 延迟恢复与 reconcile 网关冲突 | 恢复每个服务前先 `gw.RemoveService`；恢复失败回退托管并重建监听。新增“首次恢复失败 → reconcile 留下监听 → 第二次恢复成功”测试 |
+| restore/remove 无持久化事务 | 新增 `detach` 事务（服务、托管内容、预期恢复内容）；启动恢复先释放网关，再完成/回退，外部修改不覆盖。新增中途崩溃回退与已完成补记测试 |
+| 批量回滚删除托管记录失败 | `rollbackApplied` 删除失败时调用 `revertToManaged`，恢复 Compose/容器/网关，代理目标保留；新增故障注入测试 |
+| 备份清理顺序与嵌套目录 | 先按操作状态清理备份，再清理操作/事务历史；递归处理 `backups/proxy/<opID>`；成功删除、失败保留均有测试 |
+| 代理安装备份写入错误被忽略 | 快照全部改为检查错误的原子写入，任何备份失败在修改 Compose 前中止；新增不可写备份目录测试 |
+| 事务终态与操作终态窗口 | 新增 `FinishTransactionWithOperation` 单 SQLite 事务；启动时 `ReconcileOrphanOperations` 修正孤立 running 操作；新增原子提交与孤儿修正测试 |
+
+真实 OrbStack 验收（2026-10-29）：`phase0.py` 全流程通过；手工模拟 `compose_write_pending` 崩溃（文件已替换、`ManagedContent` 未写、`SIGKILL`）后重启，Compose/原端口/事务/操作记录全部恢复；手工模拟 `detach` 崩溃（Compose 已恢复、记录未删）后重启，自动回退托管、网关与原端口 HTTP 200。`go test -race ./...` 通过。
+
 ## 未验证 / 未实现
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。
