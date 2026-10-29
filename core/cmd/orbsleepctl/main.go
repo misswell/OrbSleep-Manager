@@ -21,7 +21,7 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 type globals struct {
 	socket  string
@@ -86,6 +86,8 @@ func main() {
 		withClient(sock, func(c *client.Client) { printLogs(c, rest) })
 	case "proxy-setup":
 		withClient(sock, func(c *client.Client) { proxySetup(c) })
+	case "proxy-stop":
+		withClient(sock, func(c *client.Client) { proxyStop(c) })
 	case "ping":
 		withClient(sock, func(c *client.Client) {
 			var out map[string]any
@@ -486,6 +488,15 @@ func printLogs(c *client.Client, args []string) {
 	}
 }
 
+func proxyStop(c *client.Client) {
+	var out struct {
+		OperationID string `json:"operationId"`
+	}
+	must(c.Call(context.Background(), "proxy.stop", nil, &out))
+	fmt.Printf("停止代理操作: %s\n", out.OperationID)
+	followOperation(c, out.OperationID)
+}
+
 func proxySetup(c *client.Client) {
 	var out struct {
 		OperationID string `json:"operationId"`
@@ -708,6 +719,7 @@ func usage() {
   settings [set key=value...]     查看/修改设置
   logs [-n 100]                   守护进程日志
   proxy-setup                     安装/启动 Lazy TCP Proxy
+  proxy-stop                      停止/移除代理容器（保留配置）
   restore-all                     恢复所有托管服务
   uninstall --yes [--keep-proxy]  卸载（恢复服务、移除开机启动）
   install-agent [--binary PATH]   安装开机启动

@@ -164,6 +164,9 @@ func (e *Engine) CleanupOldOperations() {
 	if err := e.store.PruneOperations(cutoff); err != nil {
 		e.logger.Printf("warn", "清理操作历史失败: %v", err)
 	}
+	if err := e.store.PruneTransactions(cutoff); err != nil {
+		e.logger.Printf("warn", "清理事务历史失败: %v", err)
+	}
 	if err := e.logger.CleanupOlderThan(days); err != nil {
 		e.logger.Printf("warn", "清理日志文件失败: %v", err)
 	}
@@ -186,9 +189,30 @@ func (e *Engine) cleanupOldBackups(cutoff time.Time) {
 		if err != nil || info.ModTime().After(cutoff) {
 			continue
 		}
+		op, ok, err := e.store.GetOperation(entry.Name())
+		if err != nil || !ok {
+			// Unknown directory: keep it. It may be the only recovery evidence.
+			continue
+		}
+		if !backupPrunable(op) {
+			continue
+		}
 		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
 			e.logger.Printf("warn", "清理旧备份失败 %s: %v", entry.Name(), err)
 		}
+	}
+}
+
+// backupPrunable reports whether an operation's backup may be deleted. Failed
+// or manually-recoverable operations keep their backups until the user acts.
+func backupPrunable(op model.Operation) bool {
+	switch op.Status {
+	case "succeeded", "rolled_back":
+		return op.FinishedAt != ""
+	case "failed", "rollback_failed", "running":
+		return false
+	default:
+		return false
 	}
 }
 

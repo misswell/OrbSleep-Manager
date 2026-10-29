@@ -26,6 +26,9 @@ make phase0         # 需要 OrbStack；会创建/清理测试 Compose 项目
 - 恢复时文件存在则只用 `AddBindings` 定点加回端口，禁止用完整备份覆盖；连通性失败要回退托管并报失败。
 - 代理安装后端口设置锁定；重复安装必须幂等；失败要恢复旧设置与旧代理。不要加 `--remove-orphans`。
 - 共享 Compose 文件：接入时用 `fileStates` 串联修改；恢复时用 `compose.AddBindings` 只加回本服务端口，禁止整体还原备份（会破坏其他托管服务）。
+- 代理配置快照必须用 `Config.Clone()`；`Remove`/`Upsert` 不得原地复用切片。回滚后要逐服务比对基线。
+- 接入必须在修改前持久化 `transactions`（基线 + 每项备份 + 阶段）；启动恢复先于 API。备份清理必须保留 `failed`/`rollback_failed`/`running` 操作的证据。
+- 长事务必须通过 `beginOperation` 注册；关闭时先取消并等待回滚，禁止先关数据库。
 - 守护进程首次 reconcile 必须在 API 就绪前同步完成（保证重启后端口立刻恢复）。
 
 ## 数据位置

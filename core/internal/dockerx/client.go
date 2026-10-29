@@ -213,6 +213,15 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerIns
 	return &out, nil
 }
 
+// RemoveContainer removes a container (force stops it first when requested).
+func (c *Client) RemoveContainer(ctx context.Context, id string, force bool) error {
+	path := "/containers/" + id
+	if force {
+		path += "?force=1"
+	}
+	return c.do(ctx, http.MethodDelete, path, nil, nil)
+}
+
 // Events subscribes to Docker events. The caller must close the body.
 func (c *Client) Events(ctx context.Context) (io.ReadCloser, error) {
 	return c.Stream(ctx, "/events?filters="+urlQueryEscape(`{"type":["container"]}`))

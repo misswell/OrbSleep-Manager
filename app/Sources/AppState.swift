@@ -475,6 +475,21 @@ final class AppState {
         }
     }
 
+    func stopProxy() async {
+        do {
+            let value = try await client.call("proxy.stop", as: PlanApplyResult.self)
+            markReachable()
+            guard let operationId = value.operationId else {
+                showError("proxy.stop 没有返回 operationId")
+                return
+            }
+            isOperationSheetPresented = true
+            beginOperation(operationId: operationId, title: "停止代理")
+        } catch {
+            handle(error)
+        }
+    }
+
     // MARK: LaunchAgent
 
     func installLaunchAgent() async {

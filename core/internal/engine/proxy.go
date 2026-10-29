@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"orbsleep/internal/compose"
 	"orbsleep/internal/dockerx"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
@@ -29,9 +31,6 @@ func (e *Engine) proxyStatus(ctx context.Context) model.ProxyStatus {
 	ps := model.ProxyStatus{
 		ContainerName:  proxy.ContainerName,
 		PublishedRange: model.Range{Start: s.ProxyPortStart, End: s.ProxyPortEnd},
-	}
-	if _, err := os.Stat(e.proxyComposePath()); err == nil {
-		ps.Installed = true
 	}
 	c, err := e.dockerClient(ctx)
 	if err != nil {
@@ -123,6 +122,10 @@ func (e *Engine) proxyContainerIP(ctx context.Context) string {
 
 // ProxySetup installs or restarts the proxy and returns an operation id.
 func (e *Engine) ProxySetup() (string, error) {
+	ctx, done, err := e.beginOperation(10 * time.Minute)
+	if err != nil {
+		return "", err
+	}
 	op := model.Operation{
 		ID:        newID("op"),
 		Kind:      "proxy_setup",
@@ -132,17 +135,67 @@ func (e *Engine) ProxySetup() (string, error) {
 		Log:       []model.LogEntry{},
 	}
 	if err := e.store.InsertOperation(op); err != nil {
+		done()
 		return "", err
 	}
-	go e.runProxySetup(op)
+	go e.runProxySetup(ctx, op, done)
 	return op.ID, nil
 }
 
-func (e *Engine) runProxySetup(op model.Operation) {
+// ProxyStop stops and removes the proxy container but keeps its configuration,
+// settings and backups so it can be started again.
+func (e *Engine) ProxyStop() (string, error) {
+	ctx, done, err := e.beginOperation(5 * time.Minute)
+	if err != nil {
+		return "", err
+	}
+	op := model.Operation{
+		ID:        newID("op"),
+		Kind:      "proxy_stop",
+		Status:    "running",
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		BackupDir: filepath.Join(e.settings.Get().BackupDir, "proxy"),
+		Log:       []model.LogEntry{},
+	}
+	if err := e.store.InsertOperation(op); err != nil {
+		done()
+		return "", err
+	}
+	go e.runProxyStop(ctx, op, done)
+	return op.ID, nil
+}
+
+func (e *Engine) runProxyStop(ctx context.Context, op model.Operation, done func()) {
+	defer done()
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+	logger := e.newOpLogger(op)
+	cli, err := e.cliRunner()
+	if err != nil {
+		logger.finish("failed", err.Error())
+		return
+	}
+	composePath := e.proxyComposePath()
+	if _, err := os.Stat(composePath); err != nil {
+		logger.finish("failed", "代理未安装: "+err.Error())
+		return
+	}
+	logger.add("info", "停止并移除代理容器（配置与设置保留）")
+	if err := cli.ProxyDown(ctx, composePath); err != nil {
+		logger.finish("failed", "停止代理失败: "+err.Error())
+		return
+	}
+	if services, _ := e.store.ListServices(); len(services) > 0 {
+		logger.add("warn", "仍有托管服务：代理停止后，新连接将无法唤醒这些容器")
+	}
+	logger.finish("succeeded", "")
+	e.triggerReconcile()
+}
+
+func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done func()) {
+	defer done()
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	logger := e.newOpLogger(op)
 	logger.add("info", "开始安装/启动 Lazy TCP Proxy")
 
@@ -227,7 +280,7 @@ func (e *Engine) runProxySetup(op model.Operation) {
 		logger.add("warn", "代理容器在运行但管理接口不可达，将重建代理容器")
 	}
 
-	key, err := proxy.APIKey(e.dataDir)
+	key, err := e.proxyAPIKey()
 	if err != nil {
 		logger.finish("failed", "生成代理密钥失败: "+err.Error())
 		return
@@ -239,37 +292,85 @@ func (e *Engine) runProxySetup(op model.Operation) {
 	}
 	cfgPath := filepath.Join(cfgDir, "config.yaml")
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		if err := os.WriteFile(cfgPath, proxy.Config{}.Marshal(), 0o600); err != nil {
+		if err := compose.WriteAtomic(cfgPath, proxy.Config{}.Marshal(), 0o600); err != nil {
 			logger.finish("failed", "写入代理配置失败: "+err.Error())
 			return
 		}
 	}
 	composePath := e.proxyComposePath()
 	oldCompose, composeReadErr := os.ReadFile(composePath)
-	hadCompose := composeReadErr == nil
-	if err := os.WriteFile(composePath, proxy.ComposeFile(next, key, cfgDir), 0o600); err != nil {
-		logger.finish("failed", "写入代理 Compose 文件失败: "+err.Error())
+	hadCompose := false
+	switch {
+	case composeReadErr == nil:
+		hadCompose = true
+	case os.IsNotExist(composeReadErr):
+		hadCompose = false
+	default:
+		logger.finish("failed", "读取旧代理 Compose 文件失败，已中止（未做任何修改）: "+composeReadErr.Error())
 		return
+	}
+	// Persist a complete snapshot before any write so a failed install can be
+	// diagnosed and manually recovered even if automatic restore fails.
+	snapDir := filepath.Join(logger.snapshot().BackupDir, op.ID)
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		logger.finish("failed", "创建代理备份目录失败: "+err.Error())
+		return
+	}
+	if hadCompose {
+		_ = os.WriteFile(filepath.Join(snapDir, "docker-compose.yml"), oldCompose, 0o600)
+	}
+	if settingsJSON, jerr := json.MarshalIndent(old, "", "  "); jerr == nil {
+		_ = os.WriteFile(filepath.Join(snapDir, "settings.json"), settingsJSON, 0o600)
+	}
+	if raw, jerr := json.MarshalIndent(next, "", "  "); jerr == nil {
+		_ = os.WriteFile(filepath.Join(snapDir, "new-settings.json"), raw, 0o600)
 	}
 
 	restore := func(reason error) {
 		logger.add("warn", "恢复代理原有设置: "+reason.Error())
-		_ = e.settings.Save(old)
+		var errs []string
+		if err := e.settings.Save(old); err != nil {
+			errs = append(errs, "恢复设置失败: "+err.Error())
+		}
 		if hadCompose {
-			_ = os.WriteFile(composePath, oldCompose, 0o600)
-		} else {
-			_ = os.Remove(composePath)
+			if err := compose.WriteAtomic(composePath, oldCompose, 0o600); err != nil {
+				errs = append(errs, "恢复旧 Compose 失败: "+err.Error())
+			}
+		} else if err := os.Remove(composePath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, "删除新 Compose 失败: "+err.Error())
 		}
 		if hadCompose {
 			rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			if uerr := cli.ProxyUp(rctx, composePath); uerr != nil {
-				logger.add("error", "恢复旧代理容器失败: "+uerr.Error())
+				errs = append(errs, "恢复旧代理容器失败: "+uerr.Error())
 			} else if werr := e.waitProxyAdminAt(rctx, old.AdminPort, 90*time.Second); werr != nil {
-				logger.add("error", "旧代理管理接口未恢复: "+werr.Error())
+				errs = append(errs, "旧代理管理接口未恢复: "+werr.Error())
+			}
+			rcancel()
+		} else {
+			// A fresh install failed before settings were committed; remove any
+			// half-configured container so the next attempt starts clean.
+			rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if c != nil {
+				if rerr := c.RemoveContainer(rctx, proxy.ContainerName, true); rerr != nil && !dockerx.IsErrNotFound(rerr) {
+					errs = append(errs, "清理新代理容器失败: "+rerr.Error())
+				}
 			}
 			rcancel()
 		}
-		logger.finish("failed", reason.Error())
+		status := "failed"
+		msg := reason.Error()
+		if len(errs) > 0 {
+			status = "rollback_failed"
+			msg += "；回滚不完整: " + strings.Join(errs, "; ")
+			logger.add("error", msg)
+		}
+		logger.finish(status, msg+"；备份位于 "+snapDir)
+	}
+
+	if err := compose.WriteAtomic(composePath, proxy.ComposeFile(next, key, cfgDir), 0o600); err != nil {
+		restore(fmt.Errorf("写入代理 Compose 文件失败: %w", err))
+		return
 	}
 
 	logger.add("info", fmt.Sprintf("代理端口范围 %d-%d，管理 API 127.0.0.1:%d，状态页 127.0.0.1:%d",
@@ -295,6 +396,24 @@ func (e *Engine) runProxySetup(op model.Operation) {
 	logger.add("info", "Lazy TCP Proxy 已就绪")
 	logger.finish("succeeded", "")
 	e.triggerReconcile()
+}
+
+// proxyAPIKey returns the cached admin key, generating one on first use.
+func (e *Engine) proxyAPIKey() (string, error) {
+	e.mu.Lock()
+	key := e.proxyKey
+	e.mu.Unlock()
+	if key != "" {
+		return key, nil
+	}
+	k, err := proxy.APIKey(e.dataDir)
+	if err != nil {
+		return "", err
+	}
+	e.mu.Lock()
+	e.proxyKey = k
+	e.mu.Unlock()
+	return k, nil
 }
 
 // proxyAdminReachable checks the admin API on a specific local port.
@@ -527,6 +646,7 @@ func proxyConfigEqual(a, b proxy.Config) bool {
 	index := func(c proxy.Config) map[string]proxy.ServiceConfig {
 		m := map[string]proxy.ServiceConfig{}
 		for _, s := range c.Services {
+			s.Ports = append([]string(nil), s.Ports...)
 			sort.Strings(s.Ports)
 			m[s.Name] = s
 		}

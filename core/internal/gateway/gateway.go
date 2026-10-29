@@ -25,10 +25,25 @@ type Route struct {
 
 type route struct {
 	Route
+	mu     sync.RWMutex
 	ln     net.Listener
 	active atomic.Int32
 	wg     sync.WaitGroup
 	once   sync.Once
+}
+
+func (r *route) setTarget(host string, port int, label string) {
+	r.mu.Lock()
+	r.TargetHost = host
+	r.TargetPort = port
+	r.Label = label
+	r.mu.Unlock()
+}
+
+func (r *route) target() (string, int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.TargetHost, r.TargetPort
 }
 
 // Gateway owns all host port listeners.
@@ -64,9 +79,7 @@ func (g *Gateway) Ensure(r Route) error {
 		return fmt.Errorf("gateway 已关闭")
 	}
 	if existing, ok := g.routes[r.Key]; ok {
-		existing.TargetHost = r.TargetHost
-		existing.TargetPort = r.TargetPort
-		existing.Label = r.Label
+		existing.setTarget(r.TargetHost, r.TargetPort, r.Label)
 		return nil
 	}
 	addr := net.JoinHostPort(r.BindHost, fmt.Sprintf("%d", r.BindPort))
@@ -200,7 +213,8 @@ func (g *Gateway) handle(rt *route, client net.Conn) {
 		g.onActive(rt.ServiceID, time.Now())
 	}
 
-	target := net.JoinHostPort(rt.TargetHost, fmt.Sprintf("%d", rt.TargetPort))
+	targetHost, targetPort := rt.target()
+	target := net.JoinHostPort(targetHost, fmt.Sprintf("%d", targetPort))
 	var upstream net.Conn
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {

@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"sync"
 	"time"
 
@@ -82,8 +81,4 @@ func (e *Engine) Operations(limit int) ([]model.Operation, error) {
 		ops = []model.Operation{}
 	}
 	return ops, err
-}
-
-func contextWithOpTimeout() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 20*time.Minute)
 }

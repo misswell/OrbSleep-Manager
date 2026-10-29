@@ -45,6 +45,7 @@ GUI 与后台助手（`orbsleepd`）通过 **Unix Domain Socket** + **换行分�
 | `settings.get` | `{}` | `Settings` |
 | `settings.update` | `SettingsPatch` | `Settings` |
 | `proxy.setup` | `{}` | `{"operationId":"..."}` |
+| `proxy.stop` | `{}` | `{"operationId":"..."}` |
 | `agent.install` | `{}` | `{"installed":true}` |
 | `agent.uninstall` | `{}` | `{"installed":false}` |
 | `logs.tail` | `{"limit":200}` | `{"lines":[{"at":"...","level":"info","message":"..."}]}` |
@@ -193,7 +194,7 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 
 ```json
 {
-  "daemonVersion": "0.1.1",
+  "daemonVersion": "0.1.2",
   "dataDir": "/Users/me/Library/Application Support/OrbSleep",
   "context": {"name":"orbstack","endpoint":"unix:///Users/me/.orbstack/run/docker.sock","kind":"orbstack"},
   "dockerReachable": true,
@@ -214,7 +215,7 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 }
 ```
 
-`proxy.installed` 表示代理容器已创建；`running` 表示容器在运行；`adminReachable` 表示管理 API 可从 macOS 访问。
+`proxy.installed` 表示代理容器当前存在（`docker compose down` 后为 false）；`running` 表示容器在运行；`adminReachable` 表示管理 API 可从 macOS 访问。
 
 ### Settings
 

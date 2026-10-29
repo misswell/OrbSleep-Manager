@@ -80,6 +80,21 @@ func (m *Manager) Get() model.Settings {
 	return s
 }
 
+// MigrateLegacy normalises persisted settings that enabled features which are
+// no longer implemented (or are no longer supported).
+func (m *Manager) MigrateLegacy() (bool, error) {
+	s := m.Get()
+	changed := false
+	if s.EnableLowPortHelper {
+		s.EnableLowPortHelper = false
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+	return true, m.Save(s)
+}
+
 // Save persists the given settings, keeping derived fields out of the database.
 func (m *Manager) Save(s model.Settings) error {
 	if s.ProxyPortStart < 1 || s.ProxyPortEnd > 65535 || s.ProxyPortEnd <= s.ProxyPortStart {

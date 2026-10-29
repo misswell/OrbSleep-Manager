@@ -6,6 +6,7 @@ struct SettingsView: View {
     @State private var draft = SettingsDraft()
     @State private var savedMessage: String?
     @State private var showUninstallAgentConfirmation = false
+    @State private var showStopProxyConfirmation = false
 
     var body: some View {
         Form {
@@ -26,6 +27,14 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("设置")
+        .confirmationDialog("停止代理容器", isPresented: $showStopProxyConfirmation) {
+            Button("停止并移除代理容器", role: .destructive) {
+                Task { await app.stopProxy() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("代理容器会被停止并移除，配置、设置和托管记录保留。停止后新连接无法唤醒托管容器；可在修改端口设置后重新安装启动。")
+        }
         .confirmationDialog("卸载 LaunchAgent", isPresented: $showUninstallAgentConfirmation) {
             Button("卸载并停止后台助手", role: .destructive) {
                 Task { await app.uninstallLaunchAgent() }
@@ -162,6 +171,12 @@ struct SettingsView: View {
                     Label("安装 / 启动代理", systemImage: "shippingbox.and.arrow.backward")
                 }
                 .disabled(app.hasOperationInProgress)
+                Button(role: .destructive) {
+                    showStopProxyConfirmation = true
+                } label: {
+                    Label("停止代理", systemImage: "stop.circle")
+                }
+                .disabled(!app.proxyRunning || app.hasOperationInProgress)
             }
 
             if let name = app.status?.proxy?.containerName, !name.isEmpty {

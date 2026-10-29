@@ -109,6 +109,21 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 - 恢复后连通性失败 → 回退托管状态，记录与代理目标保留
 - 代理自有端口识别、管理端口避让、基线配置校验
 
+## 第二轮复审加固（0.1.2）
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| `Config` 浅拷贝污染基线 | 新增 `Config.Clone()`、非原地 `Remove()`、拷贝式 `Upsert()`/`Service()`/`Marshal()`；新增 3 服务回滚测试，验证恢复失败后 A/B/C 配置逐项与操作前一致 |
+| 崩溃后未完成接入无恢复 | 新增 SQLite `transactions` 持久化事务（阶段、基线、每项备份、editing 后内容）；启动时在 API 前自动回滚。真实模拟：手工写入 `compose_updated` 事务 + 已删除端口映射，SIGKILL 守护进程后重启 → Compose 恢复、原端口 HTTP 200、事务标记 `rolled_back` |
+| 代理安装回滚不可靠 | 旧 Compose 先校验读取（非 `IsNotExist` 即中止）、快照写入备份目录、原子写入、失败统一走恢复；恢复失败标记 `rollback_failed`。测试覆盖首次安装失败与旧代理恢复失败 |
+| 关闭打断事务 | 新增事务注册表：关闭时拒绝新操作、取消运行中事务、等待回滚（10 分钟），再关闭数据库/日志/网关；测试验证取消与等待 |
+| 停止代理后无法改端口 | `proxy.installed` 改为“容器存在”；新增 `proxy.stop`（保留设置）与 GUI 停止按钮；停止后可改端口并重新安装（实测） |
+| 旧低端口配置卡死设置 | 启动时 `MigrateLegacy()` 自动将旧 `enableLowPortHelper=true` 迁移为 false，并加单测 |
+| 失败备份被清理 | 备份清理关联操作状态：`failed` / `rollback_failed` / `running` 一律保留，未知目录保留；单测覆盖 |
+| 删除托管记录失败未回退 | 删除失败现在走 `revertManaged`，失败则 `rollback_failed`，保留托管记录 |
+
+新增/扩展测试：`proxy_test.go`（深拷贝）、`recovery_test.go`（崩溃恢复、外部修改保护、关闭取消）、`attach_test.go`（代理安装失败回滚、多服务配置保持、备份保留策略）。`go test -race ./...` 全部通过（并修复了网关目标热更新的数据竞争）。
+
 ## 未验证 / 未实现
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。

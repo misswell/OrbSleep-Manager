@@ -140,6 +140,10 @@ func (e *Engine) updatePolicy(id string, params map[string]any) (map[string]any,
 }
 
 func (e *Engine) startDetach(svc model.Service, remove bool) (string, error) {
+	ctx, done, err := e.beginOperation(20 * time.Minute)
+	if err != nil {
+		return "", err
+	}
 	opID := newID("op")
 	kind := "restore"
 	if remove {
@@ -154,17 +158,17 @@ func (e *Engine) startDetach(svc model.Service, remove bool) (string, error) {
 		Log:       []model.LogEntry{},
 	}
 	if err := e.store.InsertOperation(op); err != nil {
+		done()
 		return "", err
 	}
-	go e.runDetach(svc, op, remove)
+	go e.runDetach(ctx, svc, op, remove, done)
 	return opID, nil
 }
 
-func (e *Engine) runDetach(svc model.Service, op model.Operation, remove bool) {
+func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Operation, remove bool, done func()) {
+	defer done()
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
-	ctx, cancel := contextWithOpTimeout()
-	defer cancel()
 	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("开始恢复 %s 的原始端口映射", svc.ContainerName))
 	if err := e.restoreService(ctx, logger, svc); err != nil {
@@ -233,7 +237,7 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 
 	// 1. Remove the proxy target first. If this cannot be verified, abort before
 	// touching the gateway or Compose file.
-	nextCfg := origCfg
+	nextCfg := origCfg.Clone()
 	nextCfg.Remove(svc.ContainerName)
 	if err := e.putProxyConfigVerified(ctx, admin, nextCfg); err != nil {
 		return fmt.Errorf("删除代理目标失败，已中止恢复（未做任何其他修改）: %w", err)
@@ -345,7 +349,9 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 	logger.add("info", "原端口连通性测试通过")
 
 	if err := e.store.DeleteService(svc.ID); err != nil {
-		return fmt.Errorf("删除托管记录失败（端口已恢复）: %w", err)
+		// The record must not outlive the managed wiring. Put the service back
+		// into the verified managed state, or report rollback_failed.
+		return failWithRevert(fmt.Errorf("删除托管记录失败: %w", err))
 	}
 	return nil
 }

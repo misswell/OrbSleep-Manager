@@ -314,6 +314,13 @@ func (s *Server) handlers() map[string]handler {
 			}
 			return s.eng.UpdateSettings(patch)
 		},
+		"proxy.stop": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			id, err := s.eng.ProxyStop()
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"operationId": id}, nil
+		},
 		"agent.install": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			if err := s.eng.InstallAgent(); err != nil {
 				return nil, err

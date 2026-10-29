@@ -53,6 +53,14 @@ type Engine struct {
 	eventMu     sync.Mutex
 	lastProxyID string
 
+	txnMu      sync.Mutex
+	txnWG      sync.WaitGroup
+	txnCancels map[string]context.CancelFunc
+	closing    bool
+
+	recoveryMu   sync.Mutex
+	lastRecovery time.Time
+
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -74,17 +82,25 @@ func New(version, dataDir string) (*Engine, error) {
 		store.Close()
 		return nil, fmt.Errorf("打开日志失败: %w", err)
 	}
+	settingsMgr := settings.New(store, dataDir)
+	migrated, migrateErr := settingsMgr.MigrateLegacy()
 	e := &Engine{
-		version:  version,
-		dataDir:  dataDir,
-		store:    store,
-		settings: settings.New(store, dataDir),
-		logger:   logger,
-		gw:       gateway.New(func(level, format string, args ...any) { logger.Printf(level, format, args...) }),
-		plans:    map[string]*planEntry{},
-		activity: map[string]time.Time{},
-		eventsCh: make(chan struct{}, 1),
-		stopCh:   make(chan struct{}),
+		version:    version,
+		dataDir:    dataDir,
+		store:      store,
+		settings:   settingsMgr,
+		logger:     logger,
+		gw:         gateway.New(func(level, format string, args ...any) { logger.Printf(level, format, args...) }),
+		plans:      map[string]*planEntry{},
+		activity:   map[string]time.Time{},
+		txnCancels: map[string]context.CancelFunc{},
+		eventsCh:   make(chan struct{}, 1),
+		stopCh:     make(chan struct{}),
+	}
+	if migrateErr != nil {
+		logger.Printf("warn", "迁移旧设置失败: %v", migrateErr)
+	} else if migrated {
+		logger.Printf("info", "已迁移旧设置：低端口助手未实现，已自动关闭")
 	}
 	e.gw.SetActivityHook(func(serviceID string, at time.Time) {
 		e.activityMu.Lock()
@@ -104,6 +120,9 @@ func New(version, dataDir string) (*Engine, error) {
 // Start launches the background loops.
 func (e *Engine) Start() {
 	e.logger.Printf("info", "OrbSleep daemon %s 启动，数据目录 %s", e.version, e.dataDir)
+	// Roll back transactions interrupted by a crash before restoring listeners
+	// and accepting new work.
+	e.RecoverTransactions()
 	// Restore host port listeners before the API accepts requests, so a daemon
 	// restart does not leave a window where managed services are unreachable.
 	e.reconcile()
@@ -116,19 +135,22 @@ func (e *Engine) Start() {
 // Close shuts the daemon down.
 func (e *Engine) Close() {
 	e.closeOnce.Do(func() {
+		// Cancel in-flight transactions and wait for their rollback to finish
+		// before closing the database, logger and gateway.
+		if !e.waitTransactions(10 * time.Minute) {
+			e.logger.Printf("warn", "取消后仍有事务未退出；备份与事务日志已持久化，将在下次启动恢复")
+		}
 		close(e.stopCh)
-		// Wait for an in-flight transactional operation to finish (or roll
-		// back) before tearing down the listeners and database.
-		done := make(chan struct{})
+		writeDone := make(chan struct{})
 		go func() {
 			e.writeMu.Lock()
 			e.writeMu.Unlock()
-			close(done)
+			close(writeDone)
 		}()
 		select {
-		case <-done:
-		case <-time.After(2 * time.Minute):
-			e.logger.Printf("warn", "等待写操作超时，强制关闭")
+		case <-writeDone:
+		case <-time.After(30 * time.Second):
+			e.logger.Printf("warn", "写锁等待超时，强制关闭；未完成事务将在下次启动恢复")
 		}
 		e.gw.StopAll()
 		e.wg.Wait()

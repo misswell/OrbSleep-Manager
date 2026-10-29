@@ -80,6 +80,16 @@ func (s *Store) migrate() error {
 			affected TEXT NOT NULL DEFAULT '[]',
 			log TEXT NOT NULL DEFAULT '[]'
 		)`,
+		`CREATE TABLE IF NOT EXISTS transactions (
+			id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT '',
+			phase TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			data TEXT NOT NULL DEFAULT '{}'
+		)`,
 		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
 	}
@@ -243,6 +253,74 @@ func (s *Store) ListOperations(limit int) ([]model.Operation, error) {
 // PruneOperations deletes operations older than cutoff.
 func (s *Store) PruneOperations(cutoff time.Time) error {
 	_, err := s.db.Exec(`DELETE FROM operations WHERE started_at < ?`, cutoff.UTC().Format(time.RFC3339))
+	return err
+}
+
+// Transaction is a durable record of an in-flight or recovered operation.
+type Transaction struct {
+	ID        string
+	Kind      string
+	Status    string // running | committed | rolled_back | rollback_failed
+	Phase     string
+	StartedAt string
+	UpdatedAt string
+	Error     string
+	Data      string
+}
+
+// SaveTransaction inserts or updates a transaction record.
+func (s *Store) SaveTransaction(t Transaction) error {
+	_, err := s.db.Exec(`INSERT INTO transactions (id, kind, status, phase, started_at, updated_at, error, data)
+		VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET status=excluded.status, phase=excluded.phase,
+		 updated_at=excluded.updated_at, error=excluded.error, data=excluded.data`,
+		t.ID, t.Kind, t.Status, t.Phase, t.StartedAt, t.UpdatedAt, t.Error, t.Data)
+	return err
+}
+
+// GetTransaction returns one transaction record.
+func (s *Store) GetTransaction(id string) (Transaction, bool, error) {
+	row := s.db.QueryRow(`SELECT id, kind, status, phase, started_at, updated_at, error, data FROM transactions WHERE id=?`, id)
+	var t Transaction
+	if err := row.Scan(&t.ID, &t.Kind, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
+		if err == sql.ErrNoRows {
+			return Transaction{}, false, nil
+		}
+		return Transaction{}, false, err
+	}
+	return t, true, nil
+}
+
+// ListRunningTransactions returns transactions that were not finished.
+func (s *Store) ListRunningTransactions() ([]Transaction, error) {
+	rows, err := s.db.Query(`SELECT id, kind, status, phase, started_at, updated_at, error, data
+		FROM transactions WHERE status='running' ORDER BY started_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Transaction
+	for rows.Next() {
+		var t Transaction
+		if err := rows.Scan(&t.ID, &t.Kind, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// FinishTransaction marks a transaction terminal.
+func (s *Store) FinishTransaction(id, status, errMsg, phase string) error {
+	_, err := s.db.Exec(`UPDATE transactions SET status=?, phase=?, updated_at=?, error=? WHERE id=?`,
+		status, phase, time.Now().UTC().Format(time.RFC3339), errMsg, id)
+	return err
+}
+
+// PruneTransactions deletes old terminal transactions.
+func (s *Store) PruneTransactions(cutoff time.Time) error {
+	_, err := s.db.Exec(`DELETE FROM transactions WHERE status<>'running' AND updated_at < ?`,
+		cutoff.UTC().Format(time.RFC3339))
 	return err
 }
 

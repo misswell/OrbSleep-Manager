@@ -112,10 +112,11 @@ func (f *fakeDocker) client(t *testing.T) *dockerx.Client {
 // --- fake docker CLI ---
 
 type fakeCLI struct {
-	configFn func(file string) (map[string]any, error)
-	docker   *fakeDocker
-	upErr    error
-	upCalls  int
+	configFn   func(file string) (map[string]any, error)
+	docker     *fakeDocker
+	upErr      error
+	proxyUpErr error
+	upCalls    int
 }
 
 func (f *fakeCLI) ComposeConfig(ctx context.Context, project, file, workdir string) (map[string]any, error) {
@@ -141,7 +142,7 @@ func (f *fakeCLI) UpService(ctx context.Context, project, file, workdir, service
 	f.docker.setPublished(published)
 	return nil
 }
-func (f *fakeCLI) ProxyUp(ctx context.Context, file string) error   { return nil }
+func (f *fakeCLI) ProxyUp(ctx context.Context, file string) error   { return f.proxyUpErr }
 func (f *fakeCLI) ProxyDown(ctx context.Context, file string) error { return nil }
 func (f *fakeCLI) Version(ctx context.Context) (string, error)      { return "fake", nil }
 
@@ -321,7 +322,7 @@ func TestAttachRestoresProxyWhenVerificationReadFails(t *testing.T) {
 	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(snap.removals), docker: docker})
 
 	adminClient := proxy.NewAdminClient(admin.hostPort(t), "test-key")
-	_, err := e.attachOne(context.Background(), logger, 0, snap, map[string][]byte{}, adminClient)
+	_, err := e.attachOne(context.Background(), logger, 0, snap, map[string][]byte{}, adminClient, "test-txn")
 	if err == nil {
 		t.Fatal("expected attach to fail")
 	}
@@ -379,7 +380,7 @@ func TestAttachCleansUpPartialGatewayListeners(t *testing.T) {
 	e, logger := testEngine(t, admin, docker, cli)
 	adminClient := proxy.NewAdminClient(admin.hostPort(t), "test-key")
 
-	_, err = e.attachOne(context.Background(), logger, 0, snap, map[string][]byte{}, adminClient)
+	_, err = e.attachOne(context.Background(), logger, 0, snap, map[string][]byte{}, adminClient, "test-txn")
 	if err == nil {
 		t.Fatal("expected attach to fail on the occupied gateway port")
 	}
@@ -453,7 +454,7 @@ func TestRunAttachAbortsWithoutProxyBaseline(t *testing.T) {
 	if err := e.store.InsertOperation(op); err != nil {
 		t.Fatal(err)
 	}
-	e.runAttach(plan, nil, op)
+	e.runAttach(context.Background(), plan, nil, op, func() {})
 	got, ok, err := e.store.GetOperation(op.ID)
 	if err != nil || !ok {
 		t.Fatal(err)
@@ -463,6 +464,21 @@ func TestRunAttachAbortsWithoutProxyBaseline(t *testing.T) {
 	}
 	if services, _ := e.store.ListServices(); len(services) != 0 {
 		t.Fatal("unexpected service record")
+	}
+}
+
+func TestBackupPrunable(t *testing.T) {
+	ok := model.Operation{Status: "succeeded", FinishedAt: "now"}
+	if !backupPrunable(ok) {
+		t.Fatal("succeeded operation backup should be prunable")
+	}
+	for _, status := range []string{"failed", "rollback_failed", "running"} {
+		if backupPrunable(model.Operation{Status: status, FinishedAt: "now"}) {
+			t.Fatalf("%s backup must be retained", status)
+		}
+	}
+	if backupPrunable(model.Operation{Status: "succeeded"}) {
+		t.Fatal("unfinished operation backup must be retained")
 	}
 }
 
@@ -624,5 +640,90 @@ func TestRestoreConnectivityFailureRevertsManaged(t *testing.T) {
 	}
 	if keys := e.gw.RouteKeys(); len(keys) != 1 {
 		t.Fatalf("gateway listener must be restored, keys=%v", keys)
+	}
+}
+
+func TestRestoreFailurePreservesUnrelatedProxyServices(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	svc, _, _, _ := managedServiceFixture(t, e, admin, docker, e.cli)
+	proxyPort := svc.Bindings[0].ProxyPort
+	baseline := proxy.Config{Services: []proxy.ServiceConfig{
+		{Name: "service-A", Ports: []string{"21001:80"}, IdleTimeoutSecs: 1800, StartTimeoutSecs: 60},
+		{Name: svc.ContainerName, Ports: []string{fmt.Sprintf("%d:80", proxyPort)}, IdleTimeoutSecs: 1800, StartTimeoutSecs: 60},
+		{Name: "service-C", Ports: []string{"21003:80"}, IdleTimeoutSecs: 1800, StartTimeoutSecs: 60},
+	}}
+	admin.mu.Lock()
+	admin.cfg = baseline.Clone()
+	admin.mu.Unlock()
+
+	// The restored port has no listener, so restore fails and reverts.
+	if err := e.restoreService(context.Background(), logger, svc); err == nil {
+		t.Fatal("expected restore to fail connectivity")
+	}
+	got := admin.config()
+	if !proxyConfigEqual(got, baseline) {
+		t.Fatalf("proxy snapshot corrupted:\n got=%+v\nwant=%+v", got.Services, baseline.Services)
+	}
+	for _, name := range []string{"service-A", "service-C"} {
+		if _, ok := got.Service(name); !ok {
+			t.Fatalf("lost service %s", name)
+		}
+	}
+}
+
+func TestProxySetupWriteFailureRestoresAbsentCompose(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker, proxyUpErr: errors.New("simulated proxy start failure")}
+	e, _ := testEngine(t, admin, docker, cli)
+	op := model.Operation{ID: "op-proxy-a", BackupDir: filepath.Join(t.TempDir(), "backup"), Status: "running"}
+	if err := e.store.InsertOperation(op); err != nil {
+		t.Fatal(err)
+	}
+	e.runProxySetup(context.Background(), op, func() {})
+	got, ok, err := e.store.GetOperation(op.ID)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if got.Status != "failed" {
+		t.Fatalf("status = %s, error = %s", got.Status, got.Error)
+	}
+	if _, err := os.Stat(e.proxyComposePath()); !os.IsNotExist(err) {
+		t.Fatalf("new compose file was not removed: %v", err)
+	}
+}
+
+func TestProxySetupRollbackFailureIsReported(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker, proxyUpErr: errors.New("simulated proxy start failure")}
+	e, _ := testEngine(t, admin, docker, cli)
+	composePath := e.proxyComposePath()
+	if err := os.MkdirAll(filepath.Dir(composePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(composePath, []byte("old-compose-content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	op := model.Operation{ID: "op-proxy-b", BackupDir: filepath.Join(t.TempDir(), "backup"), Status: "running"}
+	if err := e.store.InsertOperation(op); err != nil {
+		t.Fatal(err)
+	}
+	e.runProxySetup(context.Background(), op, func() {})
+	got, ok, err := e.store.GetOperation(op.ID)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if got.Status != "rollback_failed" {
+		t.Fatalf("status = %s, error = %s", got.Status, got.Error)
+	}
+	raw, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "old-compose-content\n" {
+		t.Fatalf("old compose not restored:\n%s", raw)
 	}
 }

@@ -39,6 +39,31 @@ func TestDefaultsAndPersistence(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyDisablesLowPortHelper(t *testing.T) {
+	dir := t.TempDir()
+	st, err := state.Open(filepath.Join(dir, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m := New(st, dir)
+	legacy := m.Get()
+	legacy.EnableLowPortHelper = true
+	if err := m.Save(legacy); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := m.MigrateLegacy()
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if m.Get().EnableLowPortHelper {
+		t.Fatal("legacy flag was not disabled")
+	}
+	if changed, _ := m.MigrateLegacy(); changed {
+		t.Fatal("migration should be idempotent")
+	}
+}
+
 func TestInvalidPortRange(t *testing.T) {
 	dir := t.TempDir()
 	st, err := state.Open(filepath.Join(dir, "state.sqlite"))

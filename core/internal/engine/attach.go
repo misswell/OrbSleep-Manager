@@ -67,11 +67,19 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 		e.plansMu.Unlock()
 		return "", errors.New("接入计划包含阻塞项，无法执行")
 	}
+	if running, _ := e.store.ListRunningTransactions(); len(running) > 0 {
+		e.plansMu.Unlock()
+		return "", errors.New("存在未完成的接入事务，请先查看操作记录并完成恢复")
+	}
 	entry.applying = true
 	plan := entry.plan
 	items := append([]planSnapshot(nil), entry.items...)
 	e.plansMu.Unlock()
 
+	ctx, done, err := e.beginOperation(20 * time.Minute)
+	if err != nil {
+		return "", err
+	}
 	opID := newID("op")
 	backupDir := filepath.Join(e.settings.Get().BackupDir, opID)
 	op := model.Operation{
@@ -83,13 +91,15 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 		Log:       []model.LogEntry{},
 	}
 	if err := e.store.InsertOperation(op); err != nil {
+		done()
 		return "", err
 	}
-	go e.runAttach(plan, items, op)
+	go e.runAttach(ctx, plan, items, op, done)
 	return opID, nil
 }
 
-func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Operation) {
+func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSnapshot, op model.Operation, done func()) {
+	defer done()
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 	defer func() {
@@ -97,8 +107,6 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 		delete(e.plans, plan.ID)
 		e.plansMu.Unlock()
 	}()
-	ctx, cancel := contextWithOpTimeout()
-	defer cancel()
 	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("接入计划 %s 开始执行（%d 个容器）", plan.ID, len(items)))
 
@@ -124,11 +132,21 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 	}
 	logger.add("info", fmt.Sprintf("代理基线已校验（%d 个既有服务）", len(baseCfg.Services)))
 
+	// Persist the transaction before any modification. If the process dies
+	// mid-way, startup recovery uses this record and the per-item backups.
+	payload := txnFromPlan(op.ID, baseCfg, items)
+	txnID, txnErr := e.startTxn(op.ID, "attach", payload)
+	if txnErr != nil {
+		logger.finish("failed", "无法写入事务日志，已终止（未做任何修改）: "+txnErr.Error())
+		e.setLastError("接入未执行: 无法写入事务日志")
+		return
+	}
+
 	fileStates := map[string][]byte{}
 	var applied []appliedItem
 	for i, snap := range items {
 		logger.add("info", fmt.Sprintf("[%d/%d] 接入 %s", i+1, len(items), snap.containerName))
-		ai, err := e.attachOne(ctx, logger, i, &items[i], fileStates, admin)
+		ai, err := e.attachOne(ctx, logger, i, &items[i], fileStates, admin, txnID)
 		if err != nil {
 			rbFailed := false
 			var ae *attachError
@@ -144,9 +162,11 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 				}
 			}
 			if rbFailed {
+				e.finishTxn(txnID, "rollback_failed", err, "rollback_failed")
 				logger.finish("rollback_failed", err.Error())
 				e.setLastError("接入失败且回滚不完整: " + err.Error())
 			} else {
+				e.finishTxn(txnID, "rolled_back", err, "rolled_back")
 				logger.finish("rolled_back", err.Error())
 				e.setLastError("接入失败，已回滚: " + err.Error())
 			}
@@ -160,6 +180,7 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 	}
 	logger.setAffected(ids)
 	logger.add("info", "接入完成；此后原端口由 macOS 端口网关监听，GUI 关闭后仍然有效")
+	e.finishTxn(txnID, "committed", nil, "committed")
 	logger.finish("succeeded", "")
 	if err := e.syncProxyConfig(ctx, true); err != nil {
 		logger.add("warn", "同步代理配置失败: "+err.Error())
@@ -167,7 +188,7 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 	e.triggerReconcile()
 }
 
-func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, fileStates map[string][]byte, admin *proxy.AdminClient) (*appliedItem, error) {
+func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, fileStates map[string][]byte, admin *proxy.AdminClient, txnID string) (*appliedItem, error) {
 	s := e.settings.Get()
 	cli, err := e.cliRunner()
 	if err != nil {
@@ -229,6 +250,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		}
 	}
 
+	svcID := newID("svc")
 	itemDir := filepath.Join(logger.snapshot().BackupDir, fmt.Sprintf("item-%d", idx+1))
 	backupPath, err := compose.BackupFile(snap.composeFile, itemDir)
 	if err != nil {
@@ -250,9 +272,14 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}
 	metaRaw, _ := json.MarshalIndent(meta, "", "  ")
 	_ = os.WriteFile(filepath.Join(itemDir, "metadata.json"), metaRaw, 0o600)
+	if err := e.updateTxn(txnID, "prepared", func(p *txnPayload) {
+		p.Items[idx].BackupPath = backupPath
+		p.Items[idx].ServiceID = svcID
+		p.Items[idx].Phase = "prepared"
+	}); err != nil {
+		return nil, &attachError{Err: fmt.Errorf("写入事务日志失败: %w", err)}
+	}
 	logger.add("info", fmt.Sprintf("已备份 %s 到 %s", snap.composeFile, backupPath))
-
-	svcID := newID("svc")
 	var undos []undoStep
 	fail := func(cause error) (*appliedItem, error) {
 		logger.add("warn", "回滚本容器的修改")
@@ -274,7 +301,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	// 1. Register the service in the proxy. The undo step is registered before
 	// the write so an uncertain result (write applied but verification failed)
 	// is always followed by a restore attempt.
-	nextCfg := prevCfg
+	nextCfg := prevCfg.Clone()
 	sc := proxy.ServiceConfig{
 		Name:             snap.containerName,
 		IdleTimeoutSecs:  s.IdleTimeoutSecs,
@@ -295,6 +322,9 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}
 	if err := e.verifyProxyService(ctx, admin, sc); err != nil {
 		return fail(fmt.Errorf("确认代理配置失败: %w", err))
+	}
+	if err := e.updateTxn(txnID, "proxy_updated", func(p *txnPayload) { p.Items[idx].Phase = "proxy_updated" }); err != nil {
+		return fail(fmt.Errorf("写入事务日志失败: %w", err))
 	}
 	logger.add("info", fmt.Sprintf("代理已注册 %s（%s）", snap.containerName, strings.Join(sc.Ports, ", ")))
 
@@ -322,6 +352,12 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		}
 		return nil
 	}})
+	if err := e.updateTxn(txnID, "compose_updated", func(p *txnPayload) {
+		p.Items[idx].ManagedContent = out
+		p.Items[idx].Phase = "compose_updated"
+	}); err != nil {
+		return fail(fmt.Errorf("写入事务日志失败: %w", err))
+	}
 	logger.add("info", fmt.Sprintf("已移除端口映射: %s", portsText(snap.removals)))
 
 	// 3. Validate the effective config only lost those ports.
@@ -348,6 +384,9 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 			return fail(fmt.Errorf("容器重建后仍然发布 %d/tcp（代理无法接管）", r.HostPort))
 		}
 	}
+	if err := e.updateTxn(txnID, "container_recreated", func(p *txnPayload) { p.Items[idx].Phase = "container_recreated" }); err != nil {
+		return fail(fmt.Errorf("写入事务日志失败: %w", err))
+	}
 	logger.add("info", "容器已重建，原端口已释放")
 
 	// 5. Install the host port gateway. Register the cleanup before creating
@@ -365,11 +404,17 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 			return fail(fmt.Errorf("启动端口网关失败（%s:%d）: %w", hostLabel(b.HostIP), b.HostPort, err))
 		}
 	}
+	if err := e.updateTxn(txnID, "gateway_ready", func(p *txnPayload) { p.Items[idx].Phase = "gateway_ready" }); err != nil {
+		return fail(fmt.Errorf("写入事务日志失败: %w", err))
+	}
 	logger.add("info", fmt.Sprintf("端口网关已监听: %s", bindingsText(snap.bindings)))
 
 	// 6. Verify the original address works (this also wakes the container).
 	if err := e.testBindings(ctx, snap.bindings); err != nil {
 		return fail(fmt.Errorf("原端口连通性测试失败: %w", err))
+	}
+	if err := e.updateTxn(txnID, "verified", func(p *txnPayload) { p.Items[idx].Phase = "verified" }); err != nil {
+		return fail(fmt.Errorf("写入事务日志失败: %w", err))
 	}
 	logger.add("info", "原端口连通性测试通过")
 
@@ -407,6 +452,12 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		_ = e.store.DeleteMeta("serviceBackup:" + svcID)
 		return e.store.DeleteService(svcID)
 	}})
+	if err := e.updateTxn(txnID, "committed_item", func(p *txnPayload) {
+		p.Items[idx].ServiceID = svcID
+		p.Items[idx].Phase = "committed_item"
+	}); err != nil {
+		return fail(fmt.Errorf("写入事务日志失败: %w", err))
+	}
 	logger.add("info", fmt.Sprintf("%s 接入成功：%s → 代理 → 容器", snap.containerName, bindingsText(snap.bindings)))
 	return &appliedItem{snap: snap, serviceID: svcID, backupPath: backupPath, managedContent: out}, nil
 }

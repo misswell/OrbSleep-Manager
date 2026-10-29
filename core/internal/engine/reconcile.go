@@ -40,6 +40,16 @@ func (e *Engine) reconcile() {
 	defer e.reconcileMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
+	if running, _ := e.store.ListRunningTransactions(); len(running) > 0 {
+		s := e.settings.Get()
+		e.recoveryMu.Lock()
+		due := time.Since(e.lastRecovery) > 2*time.Minute
+		e.recoveryMu.Unlock()
+		if due && e.proxyAdminReachable(ctx, s.AdminPort) {
+			e.logger.Printf("warn", "仍存在 %d 个未完成事务，重试恢复", len(running))
+			e.RecoverTransactions()
+		}
+	}
 
 	services, err := e.store.ListServices()
 	if err != nil {
