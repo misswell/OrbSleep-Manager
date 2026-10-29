@@ -288,7 +288,76 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}
 	logger.add("info", fmt.Sprintf("已备份 %s 到 %s", snap.composeFile, backupPath))
 	var undos []undoStep
+	// out is the exact content this item wrote to the Compose file (once
+	// composeWritten is set); fail uses it to detect external edits.
+	var out []byte
+	composeWritten := false
+	// persistManagedState creates the stable backup and the managed record.
+	// It is used on the success path and, when the Compose file was externally
+	// modified mid-attach, on the failure path to keep a coherent managed
+	// state instead of orphaned listeners.
+	persistManagedState := func(runningIns *dockerx.ContainerInspect, status, lastErr string) error {
+		containerID := snap.containerID
+		if runningIns != nil {
+			containerID = runningIns.ID
+		}
+		stableDir := filepath.Join(s.BackupDir, "services", svcID)
+		if err := os.MkdirAll(stableDir, 0o700); err != nil {
+			return err
+		}
+		if err := copyFileSimple(backupPath, filepath.Join(stableDir, filepath.Base(backupPath))); err != nil {
+			return err
+		}
+		// Keep the pre-attach content too (for audit and emergency recovery).
+		_ = os.WriteFile(filepath.Join(stableDir, filepath.Base(backupPath)+".original"), snap.content, 0o600)
+		meta["serviceId"] = svcID
+		metaRaw, _ := json.MarshalIndent(meta, "", "  ")
+		_ = os.WriteFile(filepath.Join(stableDir, "metadata.json"), metaRaw, 0o600)
+		_ = e.store.SetMeta("serviceBackup:"+svcID, stableDir)
+		now := time.Now().UTC().Format(time.RFC3339)
+		return e.store.UpsertService(model.Service{
+			ID:               svcID,
+			ContainerID:      containerID,
+			ContainerName:    snap.containerName,
+			ComposeProject:   snap.composeProject,
+			ComposeService:   snap.composeService,
+			ComposeFile:      snap.composeFile,
+			Status:           status,
+			LastError:        lastErr,
+			Bindings:         snap.bindings,
+			IdleTimeoutSecs:  s.IdleTimeoutSecs,
+			StartTimeoutSecs: s.StartTimeoutSecs,
+			LastActiveAt:     now,
+			CreatedAt:        now,
+		})
+	}
 	fail := func(cause error) (*appliedItem, error) {
+		// If the Compose file was externally modified after this item wrote
+		// it, running the undo stack would either clobber the user's edits
+		// (restoring the backup) or revoke the managed wiring (record, gateway
+		// listeners, proxy entry) while the file no longer matches it. Keep
+		// the managed state and require manual attention instead.
+		if composeWritten {
+			if current, rerr := os.ReadFile(snap.composeFile); rerr == nil && !bytes.Equal(current, out) {
+				logger.add("error", "Compose 文件在接入过程中被外部修改，已跳过自动回滚并保留托管状态")
+				detail := "Compose 文件在接入过程中被外部修改，为避免覆盖用户编辑未自动回滚；已保留托管状态，备份位于 " + backupPath
+				if _, ok, gerr := e.store.GetService(svcID); gerr == nil && !ok {
+					if perr := persistManagedState(ins, "warning", "接入中断：Compose 文件被外部修改，自动回滚已跳过"); perr != nil {
+						detail += "；创建托管记录失败: " + perr.Error()
+					} else {
+						detail += "；已创建托管记录以保留网关监听与代理配置"
+					}
+				}
+				// The failure may have happened before the gateway install
+				// step; make the kept managed state immediately coherent.
+				gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if gerr := e.ensureGatewayForService(gctx, svcID); gerr != nil {
+					detail += "；重建网关监听失败: " + gerr.Error()
+				}
+				gcancel()
+				return nil, &attachError{Err: cause, RollbackFailed: true, Detail: detail}
+			}
+		}
 		logger.add("warn", "回滚本容器的修改")
 		var undoErrs []string
 		for i := len(undos) - 1; i >= 0; i-- {
@@ -336,7 +405,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	logger.add("info", fmt.Sprintf("代理已注册 %s（%s）", snap.containerName, strings.Join(sc.Ports, ", ")))
 
 	// 2. Edit the Compose file.
-	out, _, err := compose.RemoveBindings(current, snap.composeService, snap.removals)
+	out, _, err = compose.RemoveBindings(current, snap.composeService, snap.removals)
 	if err != nil {
 		return fail(fmt.Errorf("修改 Compose 文件失败: %w", err))
 	}
@@ -353,9 +422,18 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}); err != nil {
 		return fail(fmt.Errorf("写入事务日志失败: %w", err))
 	}
+	// Re-check immediately before writing: the plan-time equality check above
+	// ran before the proxy update, and the file must not have been changed in
+	// between either.
+	if fresh, ferr := os.ReadFile(snap.composeFile); ferr != nil {
+		return fail(fmt.Errorf("写入前读取 Compose 文件失败: %w", ferr))
+	} else if !bytes.Equal(fresh, current) {
+		return fail(errors.New("Compose 文件在接入过程中被外部修改，已中止写入"))
+	}
 	if err := compose.WriteAtomic(snap.composeFile, out, info.Mode()); err != nil {
 		return fail(fmt.Errorf("写入 Compose 文件失败: %w", err))
 	}
+	composeWritten = true
 	fileStates[snap.composeFile] = out
 	undos = append(undos, undoStep{name: "恢复 Compose 并重建", fn: func() error {
 		if err := compose.RestoreFile(snap.composeFile, backupPath); err != nil {
@@ -434,34 +512,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}
 	logger.add("info", "原端口连通性测试通过")
 
-	svc := model.Service{
-		ID:               svcID,
-		ContainerID:      newIns.ID,
-		ContainerName:    snap.containerName,
-		ComposeProject:   snap.composeProject,
-		ComposeService:   snap.composeService,
-		ComposeFile:      snap.composeFile,
-		Status:           "managed_running",
-		Bindings:         snap.bindings,
-		IdleTimeoutSecs:  s.IdleTimeoutSecs,
-		StartTimeoutSecs: s.StartTimeoutSecs,
-		LastActiveAt:     time.Now().UTC().Format(time.RFC3339),
-		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
-	}
-	stableDir := filepath.Join(s.BackupDir, "services", svcID)
-	if err := os.MkdirAll(stableDir, 0o700); err != nil {
-		return fail(fmt.Errorf("创建服务备份目录失败: %w", err))
-	}
-	if err := copyFileSimple(backupPath, filepath.Join(stableDir, filepath.Base(backupPath))); err != nil {
-		return fail(fmt.Errorf("保存原始 Compose 备份失败: %w", err))
-	}
-	// Keep the pre-attach content too (for audit and emergency recovery).
-	_ = os.WriteFile(filepath.Join(stableDir, filepath.Base(backupPath)+".original"), snap.content, 0o600)
-	meta["serviceId"] = svcID
-	metaRaw, _ = json.MarshalIndent(meta, "", "  ")
-	_ = os.WriteFile(filepath.Join(stableDir, "metadata.json"), metaRaw, 0o600)
-	_ = e.store.SetMeta("serviceBackup:"+svcID, stableDir)
-	if err := e.store.UpsertService(svc); err != nil {
+	if err := persistManagedState(newIns, "managed_running", ""); err != nil {
 		return fail(fmt.Errorf("保存托管状态失败: %w", err))
 	}
 	undos = append(undos, undoStep{name: "删除托管记录", fn: func() error {
@@ -727,14 +778,17 @@ func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) err
 	return nil
 }
 
-func (e *Engine) gatewayRoute(ctx context.Context, svcID, name string, b model.Binding, s model.Settings) (gateway.Route, error) {
+// gatewayRouteFor builds a gateway route from an already-resolved proxy IP.
+// In container_ip mode proxyIP must be non-empty: the caller gets an error
+// instead of a silent fallback to 127.0.0.1, which could forward connections
+// to an unrelated local process.
+func gatewayRouteFor(svcID, name string, b model.Binding, s model.Settings, proxyIP string) (gateway.Route, error) {
 	targetHost := "127.0.0.1"
 	if s.ProxyDialMode == "container_ip" {
-		ip := e.proxyContainerIP(ctx)
-		if ip == "" {
+		if proxyIP == "" {
 			return gateway.Route{}, fmt.Errorf("container_ip 模式无法解析代理容器 IP（代理不可用）")
 		}
-		targetHost = ip
+		targetHost = proxyIP
 	}
 	return gateway.Route{
 		Key:        fmt.Sprintf("%s|%s|%d", svcID, b.HostIP, b.HostPort),
@@ -745,6 +799,14 @@ func (e *Engine) gatewayRoute(ctx context.Context, svcID, name string, b model.B
 		TargetPort: b.ProxyPort,
 		Label:      name,
 	}, nil
+}
+
+func (e *Engine) gatewayRoute(ctx context.Context, svcID, name string, b model.Binding, s model.Settings) (gateway.Route, error) {
+	ip := ""
+	if s.ProxyDialMode == "container_ip" {
+		ip = e.proxyContainerIP(ctx)
+	}
+	return gatewayRouteFor(svcID, name, b, s, ip)
 }
 
 func portsText(list []model.PortBinding) string {

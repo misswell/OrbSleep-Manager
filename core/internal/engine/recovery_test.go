@@ -5,9 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"orbsleep/internal/compose"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/state"
@@ -564,5 +566,205 @@ func TestDetachRecoveryWithoutExpectedSnapshotDoesNotOverwrite(t *testing.T) {
 	raw, _ := os.ReadFile(snap.composeFile)
 	if string(raw) != string(external) {
 		t.Fatalf("external edit was overwritten:\n%s", raw)
+	}
+}
+
+func TestRecoverySharedComposeItemCrashedBeforeComposeWrite(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "shared-web-1", "abc123", nil)
+	cli := &fakeCLI{configFn: composeConfigFor(nil), docker: docker}
+	e, _ := testEngine(t, admin, docker, cli)
+	// fakeCLI.UpService re-publishes ports it finds in the restored file.
+	docker.setPorts([]model.PortBinding{{HostIP: "127.0.0.1", HostPort: 19001, ContainerPort: 80, Protocol: "tcp"}}, false)
+
+	file := filepath.Join(t.TempDir(), "docker-compose.yml")
+	original := []byte("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:19001:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:19002:80\"\n")
+	intermediate := []byte("services:\n  web:\n    image: nginx:alpine\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:19002:80\"\n")
+	if err := os.WriteFile(file, intermediate, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	web := model.Service{ID: "svc-web", ContainerName: "shared-web-1", ComposeProject: "shared",
+		ComposeService: "web", ComposeFile: file, Status: "managed_running", StartTimeoutSecs: 1}
+	if err := e.store.UpsertService(web); err != nil {
+		t.Fatal(err)
+	}
+
+	backupDir := t.TempDir()
+	backupA := filepath.Join(backupDir, "item-1", "docker-compose.yml")
+	backupB := filepath.Join(backupDir, "item-2", "docker-compose.yml")
+	for _, b := range []struct {
+		path    string
+		content []byte
+	}{
+		{backupA, original}, {backupB, intermediate},
+	} {
+		if err := os.MkdirAll(filepath.Dir(b.path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(b.path, b.content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A committed; B registered its proxy target and crashed before writing
+	// the shared file. The file on disk is A's committed state.
+	admin.mu.Lock()
+	admin.cfg = proxy.Config{Services: []proxy.ServiceConfig{
+		{Name: "shared-web-1", Ports: []string{"21010:80"}},
+		{Name: "shared-api-1", Ports: []string{"21011:80"}},
+	}}
+	admin.mu.Unlock()
+
+	txnID, err := e.startTxn("op-shared-crash", "attach", txnPayload{
+		OperationID: "op-shared-crash",
+		Baseline: proxy.Config{Services: []proxy.ServiceConfig{
+			{Name: "shared-web-1", Ports: []string{"20001:80"}},
+		}},
+		Items: []txnItem{
+			{ContainerName: web.ContainerName, ComposeFile: file, ComposeService: "web",
+				ServiceID: web.ID, Content: original, Removals: []model.PortBinding{{HostIP: "127.0.0.1", HostPort: 19001, ContainerPort: 80, Protocol: "tcp"}},
+				BackupPath: backupA, ManagedContent: intermediate, Phase: "committed_item"},
+			{ContainerName: "shared-api-1", ComposeFile: file, ComposeService: "api",
+				ServiceID: "svc-api", Content: original, BackupPath: backupB, Phase: "proxy_updated"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.InsertOperation(model.Operation{ID: "op-shared-crash", Kind: "attach", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.RecoverTransactions()
+
+	got, _, _ := e.store.GetTransaction(txnID)
+	if got.Status != "rolled_back" {
+		t.Fatalf("status = %s error=%s", got.Status, got.Error)
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != string(original) {
+		t.Fatalf("shared compose not restored to pre-attach content:\n%s", raw)
+	}
+	for _, id := range []string{web.ID, "svc-api"} {
+		if _, ok, _ := e.store.GetService(id); ok {
+			t.Fatalf("record %s must be gone after full rollback", id)
+		}
+	}
+	cfg := admin.config()
+	if len(cfg.Services) != 1 {
+		t.Fatalf("proxy must equal the baseline, got %+v", cfg.Services)
+	}
+	if sc, ok := cfg.Service("shared-web-1"); !ok || len(sc.Ports) != 1 || sc.Ports[0] != "20001:80" {
+		t.Fatalf("web baseline entry not restored: %+v", cfg.Services)
+	}
+	if _, ok := cfg.Service("shared-api-1"); ok {
+		t.Fatalf("crashed item's proxy entry must be revoked: %+v", cfg.Services)
+	}
+}
+
+func TestRecoverDetachWithMissingCompose(t *testing.T) {
+	t.Run("deleted during detach with managed snapshot", func(t *testing.T) {
+		admin := newFakeAdmin(t)
+		docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+		e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+		svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+		if err := os.Remove(snap.composeFile); err != nil {
+			t.Fatal(err)
+		}
+		txnID, err := e.startTxn("op-detach-del", "detach", detachPayload{
+			OperationID: "op-detach-del", Service: svc, ManagedContent: managed, Phase: "prepared",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.RecoverTransactions()
+		got, _, _ := e.store.GetTransaction(txnID)
+		if got.Status != "rolled_back" {
+			t.Fatalf("status = %s error=%s", got.Status, got.Error)
+		}
+		raw, err := os.ReadFile(snap.composeFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != string(managed) {
+			t.Fatalf("managed content was not rebuilt:\n%s", raw)
+		}
+		if _, ok, _ := e.store.GetService(svc.ID); !ok {
+			t.Fatal("managed record must be kept")
+		}
+		if len(e.gw.RouteKeys()) != 1 {
+			t.Fatalf("gateway listener missing: %v", e.gw.RouteKeys())
+		}
+	})
+
+	t.Run("already missing at detach start without managed snapshot", func(t *testing.T) {
+		admin := newFakeAdmin(t)
+		docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+		e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+		svc, snap, original, _ := managedServiceFixture(t, e, admin, docker, e.cli)
+		if err := os.Remove(snap.composeFile); err != nil {
+			t.Fatal(err)
+		}
+		txnID, err := e.startTxn("op-detach-gone", "detach", detachPayload{
+			OperationID: "op-detach-gone", Service: svc, Phase: "prepared",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.RecoverTransactions()
+		got, _, _ := e.store.GetTransaction(txnID)
+		if got.Status != "rolled_back" {
+			t.Fatalf("status = %s error=%s", got.Status, got.Error)
+		}
+		raw, err := os.ReadFile(snap.composeFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Rebuilt from the pre-attach backup with this service's ports
+		// removed again: the managed equivalent of the original content.
+		managed, _, err := compose.RemoveBindings(original, svc.ComposeService, bindingsFor(svc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != string(managed) {
+			t.Fatalf("rebuilt managed content mismatch:\n got=%q\nwant=%q", raw, managed)
+		}
+		if _, ok, _ := e.store.GetService(svc.ID); !ok {
+			t.Fatal("managed record must be kept")
+		}
+	})
+}
+
+func TestReconcileContainerIPMissingProxyIPSkipsListener(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	s := e.settings.Get()
+	s.ProxyDialMode = "container_ip"
+	if err := e.settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	bindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: freePort(t), ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}
+	svc := model.Service{ID: "svc-rec", ContainerID: "abc123", ContainerName: "demo-web-1",
+		ComposeProject: "demo", ComposeService: "web",
+		ComposeFile: filepath.Join(t.TempDir(), "docker-compose.yml"),
+		Status:      "managed_running", Bindings: bindings, StartTimeoutSecs: 1}
+	if err := e.store.UpsertService(svc); err != nil {
+		t.Fatal(err)
+	}
+
+	e.reconcile()
+
+	got, ok, _ := e.store.GetService(svc.ID)
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if got.Status != "warning" || !strings.Contains(got.LastError, "代理容器 IP") {
+		t.Fatalf("service must warn about the unresolvable proxy IP: status=%s lastError=%s", got.Status, got.LastError)
+	}
+	if keys := e.gw.RouteKeys(); len(keys) != 0 {
+		t.Fatalf("no fallback listener may be created, got %v", keys)
 	}
 }

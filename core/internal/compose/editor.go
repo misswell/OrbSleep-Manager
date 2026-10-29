@@ -92,31 +92,49 @@ func declFromNode(n *yaml.Node) (*PortDecl, error) {
 // RemoveBindings removes the given host bindings from a service's ports list.
 // It returns the new file content and the declarations that were removed.
 func RemoveBindings(content []byte, service string, remove []model.PortBinding) ([]byte, []PortDecl, error) {
-	return removeBindings(content, service, remove, true)
+	return removeBindings(content, service, remove)
 }
 
-// RemoveBindingsLenient removes any matching declarations but tolerates a
-// missing service, a missing ports key, or a partial match. It is used when
-// reconstructing a deleted shared Compose file from one service's backup: the
-// backup may or may not still contain another managed service's ports.
-func RemoveBindingsLenient(content []byte, service string, remove []model.PortBinding) ([]byte, []PortDecl, error) {
-	return removeBindings(content, service, remove, false)
+// ClearServicePorts removes every port declaration of a service, including the
+// now-empty ports key. It tolerates a missing service or a missing ports key
+// (the service may not exist in the reconstructed file) but fails on port
+// lists it cannot safely edit, so stale declarations are never left behind.
+// It is used when rebuilding a deleted shared Compose file: managed services
+// must not republish any port, including stale ones an old backup still
+// contains that no longer match the service's current bindings.
+func ClearServicePorts(content []byte, service string) ([]byte, error) {
+	decls, err := ReadDecls(content, service)
+	if err != nil {
+		if errors.Is(err, ErrServiceNotFound) {
+			return content, nil
+		}
+		return nil, err
+	}
+	if len(decls) == 0 {
+		return content, nil
+	}
+	remove := make([]model.PortBinding, 0, len(decls))
+	for _, d := range decls {
+		remove = append(remove, d.Binding)
+	}
+	out, removed, err := removeBindings(content, service, remove)
+	if err != nil {
+		return nil, err
+	}
+	if len(removed) != len(decls) {
+		return nil, fmt.Errorf("服务 %s 的端口声明清除不完整（%d/%d）", service, len(removed), len(decls))
+	}
+	return out, nil
 }
 
-func removeBindings(content []byte, service string, remove []model.PortBinding, strict bool) ([]byte, []PortDecl, error) {
+func removeBindings(content []byte, service string, remove []model.PortBinding) ([]byte, []PortDecl, error) {
 	doc, _, svc, err := findService(content, service)
 	if err != nil {
-		if !strict && errors.Is(err, ErrServiceNotFound) {
-			return content, nil, nil
-		}
 		return nil, nil, err
 	}
 	portsKey := mappingKeyNode(svc, "ports")
 	portsNode := mappingValue(svc, "ports")
 	if portsNode == nil {
-		if !strict {
-			return content, nil, nil
-		}
 		return nil, nil, ErrServiceNotFound
 	}
 	if portsNode.Kind == yaml.AliasNode || portsNode.Style&yaml.FlowStyle != 0 {
@@ -152,7 +170,7 @@ func removeBindings(content []byte, service string, remove []model.PortBinding, 
 			del[line-1] = true
 		}
 	}
-	if len(removed) != len(remove) && strict {
+	if len(removed) != len(remove) {
 		return nil, nil, fmt.Errorf("Compose 文件中的端口声明与容器实际映射不一致（找到 %d，需要移除 %d）；请重新扫描", len(removed), len(remove))
 	}
 	if remaining == 0 {
@@ -167,10 +185,8 @@ func removeBindings(content []byte, service string, remove []model.PortBinding, 
 		}
 	}
 	out := []byte(strings.Join(kept, "\n"))
-	if strict {
-		if err := ValidateRemoval(content, out, service, remove); err != nil {
-			return nil, nil, err
-		}
+	if err := ValidateRemoval(content, out, service, remove); err != nil {
+		return nil, nil, err
 	}
 	_ = doc
 	return out, removed, nil

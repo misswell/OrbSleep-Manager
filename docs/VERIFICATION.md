@@ -150,6 +150,19 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 | detach 回滚仍使用取消上下文 / container_ip 静默回退 | `revertManaged` 的网关恢复改用独立 30 秒上下文；`container_ip` 无法解析代理 IP 时返回错误，不回退 loopback；新增路由错误测试 |
 | SQLite `ALTER TABLE` 忽略所有错误 | 仅忽略 duplicate column，其他迁移错误直接返回；新增二次打开与错误识别测试 |
 
+## 第五轮复审加固（0.1.5）
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| 接入回滚无条件整文件覆盖 | `attachOne` 的撤销栈执行前校验 Compose 是否仍等于本次写入内容；被外部修改时跳过全部撤销、补齐托管记录/网关监听并标记 `rollback_failed`；写入前二次校验缩小竞态窗口。新增“接入中外部修改 + 重建失败”故障注入测试，断言用户编辑、托管记录、代理与监听全部保留 |
+| 读取失败被当作文件缺失 | `restoreService` 仅在 `errors.Is(err, os.ErrNotExist)` 时从备份重建，权限/IO 错误直接中止且不覆盖；恢复入口 `runDetach` 同样放宽为仅对缺失文件继续 |
+| 正常恢复入口走不到缺失文件重建 | `runDetach` 允许 Compose 缺失时继续（事务记录托管内容为空、标注重建路径）；新增经 `runDetach` 入口的缺失文件重建测试，验证端口加回、其他托管服务端口不回写、记录与代理正确处理 |
+| 共享文件中间阶段崩溃误判外部修改 | `recoverAttachTxn` 新增分支：无托管/待写快照的项（崩溃在 `proxy_updated` 等）不按计划时 `Content` 比对，仅撤销其代理注册。新增 A 已提交、B 停在 `proxy_updated` 的崩溃恢复测试，断言文件回到接入前、代理配置等于基线 |
+| 重建共享文件可能回写其他服务旧端口 | 新增 `compose.ClearServicePorts` 清除其他托管服务在备份中的全部端口声明（含历史旧端口），无法安全编辑的结构直接中止重建；删除已无调用点的 `RemoveBindingsLenient`。新增“备份含其他服务旧端口”回归测试与编辑器单测 |
+| reconcile 自建路由绕过 `container_ip` 检查 | 路由构造抽取为 `gatewayRouteFor`，reconcile 与接入共用；无法解析代理 IP 时标记 `warning`、不创建 `127.0.0.1` 回退监听。新增 reconcile 缺代理 IP 测试 |
+
+`go vet ./...`、`go test -race ./...` 全部通过；守护进程/CLI 以 `make build-core` 构建通过。本轮未重跑真实 OrbStack 故障注入（上轮 2026-10-29 的 phase0 结果仍有效；建议合并后在真机补“接入中外部修改 Compose”与“共享文件 `proxy_updated` 崩溃”两个场景）。
+
 ## 未验证 / 未实现
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。

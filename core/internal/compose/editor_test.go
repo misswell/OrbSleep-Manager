@@ -295,3 +295,42 @@ func TestAddBindingsLongSyntax(t *testing.T) {
 		t.Fatalf("new binding missing:\n%s", out)
 	}
 }
+
+func TestClearServicePorts(t *testing.T) {
+	out, err := ClearServicePorts([]byte(fixture), "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "18082") {
+		t.Fatalf("api ports were not cleared:\n%s", out)
+	}
+	if !strings.Contains(string(out), "api:\n    image: alpine\n") {
+		t.Fatalf("api service block must survive:\n%s", out)
+	}
+	if !strings.Contains(string(out), "18080") || !strings.Contains(string(out), "19090") {
+		t.Fatalf("web ports must be untouched:\n%s", out)
+	}
+	decls, err := ReadDecls(out, "web")
+	if err != nil || len(decls) != 3 {
+		t.Fatalf("web decls=%d err=%v", len(decls), err)
+	}
+
+	// A service without ports, or one that does not exist at all, is a no-op.
+	if out, err = ClearServicePorts(out, "api"); err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := ClearServicePorts([]byte(fixture), "missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unchanged) != fixture {
+		t.Fatalf("missing service must be a no-op:\n%s", unchanged)
+	}
+
+	// Port lists the editor cannot safely rewrite must fail the rebuild
+	// instead of leaving stale declarations behind.
+	flow := []byte("services:\n  api: {image: alpine, ports: [\"18082:82\"]}\n")
+	if _, err := ClearServicePorts(flow, "api"); err == nil {
+		t.Fatal("flow-style ports must be rejected")
+	}
+}

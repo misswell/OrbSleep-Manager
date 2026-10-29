@@ -172,7 +172,7 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("开始恢复 %s 的原始端口映射", svc.ContainerName))
 	managedContent, readErr := os.ReadFile(svc.ComposeFile)
-	if readErr != nil {
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 		logger.finish("failed", "读取 Compose 文件失败，已中止: "+readErr.Error())
 		return
 	}
@@ -188,8 +188,15 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 		}
 	}
 	payload := detachPayload{OperationID: op.ID, Service: svc, WorkingDir: workDir, ManagedContent: managedContent, Phase: "prepared"}
-	if expected, _, aerr := compose.AddBindings(managedContent, svc.ComposeService, bindingsFor(svc)); aerr == nil {
-		payload.ExpectedRestored = expected
+	if readErr == nil {
+		if expected, _, aerr := compose.AddBindings(managedContent, svc.ComposeService, bindingsFor(svc)); aerr == nil {
+			payload.ExpectedRestored = expected
+		}
+	} else {
+		// The Compose file is already gone; restoreService rebuilds it from
+		// this service's pre-attach backup. Recovery derives the managed
+		// content the same way if the process dies mid-way.
+		logger.add("warn", "Compose 文件缺失，恢复时将从备份重建")
 	}
 	txnID, txnErr := e.startTxn(op.ID, "detach", payload)
 	if txnErr != nil {
@@ -242,7 +249,10 @@ func (e *Engine) rebuildMissingCompose(svc model.Service, backupFile string) ([]
 		if other.ID == svc.ID || other.ComposeFile != svc.ComposeFile {
 			continue
 		}
-		out, _, rerr := compose.RemoveBindingsLenient(content, other.ComposeService, bindingsFor(other))
+		// Managed services must not republish any port. Clear every port
+		// declaration of theirs — including stale ones an old backup may
+		// still contain — instead of matching only their current bindings.
+		out, rerr := compose.ClearServicePorts(content, other.ComposeService)
 		if rerr != nil {
 			return nil, fmt.Errorf("移除共享服务 %s 的旧端口失败: %w", other.ContainerName, rerr)
 		}
@@ -363,9 +373,15 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 	// 3. Restore only this service's ports. Never overwrite the file with a full
 	// backup while it exists: that could discard unrelated user edits.
 	current, readErr := os.ReadFile(composeFile)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		// A read failure is not proof the file is gone (permissions, I/O
+		// errors). WriteAtomic would replace a file we could not even read,
+		// so refuse and keep the managed state.
+		return failWithRevert(fmt.Errorf("读取 Compose 文件失败，为避免覆盖用户文件已中止: %w", readErr))
+	}
 	if readErr != nil {
 		if backupFile == "" {
-			return failWithRevert(fmt.Errorf("Compose 文件不可读且没有备份: %w", readErr))
+			return failWithRevert(fmt.Errorf("Compose 文件不存在且没有备份，无法恢复: %w", readErr))
 		}
 		rebuilt, rerr := e.rebuildMissingCompose(svc, backupFile)
 		if rerr != nil {

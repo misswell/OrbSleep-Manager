@@ -176,6 +176,26 @@ func (e *Engine) recoverAttachTxn(txn state.Transaction) {
 				_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
 			}
 			restored = append(restored, it.ContainerName)
+		case len(expectedManaged) == 0:
+			// Crash before this item wrote the Compose file: no managed or
+			// pending snapshot was ever persisted. Items sharing one Compose
+			// file must not be judged against plan-time Content — earlier
+			// items may already have committed their edits. Only this item's
+			// proxy registration needs undoing.
+			if hasRecord {
+				if !e.recoverVerifyOriginal(ctx, cli, it, logger, &errs) {
+					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
+					continue
+				}
+				if derr := e.store.DeleteService(it.ServiceID); derr != nil {
+					errs = append(errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
+					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
+					continue
+				}
+				_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+			}
+			restored = append(restored, it.ContainerName)
+			logger.add("info", it.ContainerName+" 未修改过 Compose 文件，仅撤销其代理注册")
 		default:
 			errs = append(errs, fmt.Sprintf("%s: Compose 文件在事务中断后被外部修改，未覆盖", it.ContainerName))
 			if hasRecord {
@@ -256,12 +276,30 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 		e.setLastError("恢复操作回滚不完整: " + msg)
 	}
 	current, err := os.ReadFile(p.Service.ComposeFile)
+	rebuilt := false
 	if err != nil {
-		fail("读取 Compose 失败: " + err.Error())
-		return
+		if !errors.Is(err, os.ErrNotExist) {
+			fail("读取 Compose 失败: " + err.Error())
+			return
+		}
+		// The Compose file is gone (deleted during the interrupted detach, or
+		// already missing when it started). Rebuild the managed content: the
+		// managed record still exists and the service must stay managed.
+		managed, merr := e.rebuildManagedCompose(p.Service, p.ManagedContent)
+		if merr != nil {
+			fail("Compose 文件缺失且无法安全重建托管内容: " + merr.Error())
+			return
+		}
+		if werr := compose.WriteAtomic(p.Service.ComposeFile, managed, 0o644); werr != nil {
+			fail("恢复托管 Compose 失败: " + werr.Error())
+			return
+		}
+		e.logger.Printf("warn", "Compose 文件缺失，已重建托管内容: %s", p.Service.ComposeFile)
+		current = managed
+		rebuilt = true
 	}
 	e.gw.RemoveService(p.Service.ID)
-	if !bytes.Equal(current, p.ManagedContent) {
+	if !rebuilt && !bytes.Equal(current, p.ManagedContent) {
 		if len(p.ManagedContent) == 0 {
 			fail("缺少托管 Compose 快照")
 			return
@@ -307,6 +345,38 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 	}
 	e.finishTxnAtomic(txn.ID, p.OperationID, "rolled_back", nil, "rolled_back")
 	e.logger.Printf("info", "未完成的恢复操作已回退到托管状态: %s", p.Service.ContainerName)
+}
+
+// rebuildManagedCompose reconstructs managed Compose content for a service
+// whose Compose file is gone. The stored managed snapshot wins; otherwise the
+// pre-attach backup is rebuilt (with other managed services' ports cleared)
+// and this service's own ports removed again.
+func (e *Engine) rebuildManagedCompose(svc model.Service, managedContent []byte) ([]byte, error) {
+	if len(managedContent) > 0 {
+		return managedContent, nil
+	}
+	backupDir, ok := e.store.GetMeta("serviceBackup:" + svc.ID)
+	if !ok {
+		return nil, errors.New("没有服务备份，无法重建")
+	}
+	composeFile := svc.ComposeFile
+	if raw, merr := os.ReadFile(filepath.Join(backupDir, "metadata.json")); merr == nil {
+		var meta struct {
+			ComposeFile string `json:"composeFile"`
+		}
+		if json.Unmarshal(raw, &meta) == nil && meta.ComposeFile != "" {
+			composeFile = meta.ComposeFile
+		}
+	}
+	restored, err := e.rebuildMissingCompose(svc, filepath.Join(backupDir, filepath.Base(composeFile)))
+	if err != nil {
+		return nil, err
+	}
+	managed, _, err := compose.RemoveBindings(restored, svc.ComposeService, bindingsFor(svc))
+	if err != nil {
+		return nil, fmt.Errorf("从重建内容推导托管内容失败: %w", err)
+	}
+	return managed, nil
 }
 
 // recoverVerifyOriginal starts the service from its original Compose content

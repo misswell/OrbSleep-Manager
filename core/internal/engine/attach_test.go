@@ -1015,3 +1015,237 @@ func TestRestoreMissingSharedComposeRemovesOtherManagedPorts(t *testing.T) {
 		t.Fatal("other managed service record must be kept")
 	}
 }
+
+func TestAttachRollbackKeepsManagedStateWhenComposeExternallyModified(t *testing.T) {
+	hostPort := freePort(t)
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	bindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}
+	snap := makeSnapshot(t, hostPort, bindings)
+	docker.setPorts(snap.removals, true)
+	e.cli.(*fakeCLI).configFn = composeConfigFor(snap.removals)
+	external := []byte("services:\n  web:\n    image: nginx:alpine\n    # user edit during attach\n")
+	// After OrbSleep rewrote the file, an external tool edits it; the
+	// subsequent recreate then fails.
+	e.cli.(*fakeCLI).upFn = func(file string) error {
+		if err := os.WriteFile(file, external, 0o644); err != nil {
+			return err
+		}
+		return errors.New("simulated recreate failure")
+	}
+	adminClient := proxy.NewAdminClient(admin.hostPort(t), "test-key")
+	txnID, err := e.startTxn("op-ext", "attach", txnFromPlan("op-ext", proxy.Config{}, []planSnapshot{*snap}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = e.attachOne(context.Background(), logger, 0, snap, map[string][]byte{}, adminClient, txnID)
+	if err == nil {
+		t.Fatal("expected attach to fail")
+	}
+	var ae *attachError
+	if !errors.As(err, &ae) || !ae.RollbackFailed {
+		t.Fatalf("expected rollback_failed attachError, got %v", err)
+	}
+	if !strings.Contains(ae.Detail, "外部修改") {
+		t.Fatalf("unexpected detail: %s", ae.Detail)
+	}
+	got, _ := os.ReadFile(snap.composeFile)
+	if string(got) != string(external) {
+		t.Fatalf("user edits were clobbered by the rollback:\n%s", got)
+	}
+	services, _ := e.store.ListServices()
+	if len(services) != 1 || services[0].Status != "warning" {
+		t.Fatalf("a managed record must be kept to avoid orphaned listeners: %+v", services)
+	}
+	if _, ok := e.store.GetMeta("serviceBackup:" + services[0].ID); !ok {
+		t.Fatal("stable backup must be kept for manual recovery")
+	}
+	if len(admin.config().Services) != 1 {
+		t.Fatalf("proxy entry must be kept, got %+v", admin.config().Services)
+	}
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("gateway listener must be kept, got %v", e.gw.RouteKeys())
+	}
+}
+
+func TestRunDetachRebuildsMissingCompose(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	aPort, bPort := freePort(t), freePort(t)
+	aProxy, bProxy := freePort(t), freePort(t)
+	aBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, ProxyPort: aProxy, Protocol: "tcp"}}
+	bBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: bPort, ContainerPort: 80, ProxyPort: bProxy, Protocol: "tcp"}}
+	backup := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n", aPort, bPort))
+	backupDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(backupDir, "docker-compose.yml"), backup, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta, _ := json.Marshal(map[string]any{"composeFile": composeFile, "workingDir": dir})
+	if err := os.WriteFile(filepath.Join(backupDir, "metadata.json"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	web := model.Service{ID: "svc-web", ContainerID: "abc123", ContainerName: "demo-web-1",
+		ComposeProject: "shared", ComposeService: "web", ComposeFile: composeFile,
+		Status: "managed_running", Bindings: aBindings, StartTimeoutSecs: 1}
+	api := model.Service{ID: "svc-api", ContainerID: "def456", ContainerName: "shared-api-1",
+		ComposeProject: "shared", ComposeService: "api", ComposeFile: composeFile,
+		Status: "managed_running", Bindings: bBindings, StartTimeoutSecs: 1}
+	for _, s := range []model.Service{web, api} {
+		if err := e.store.UpsertService(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.store.SetMeta("serviceBackup:svc-web", backupDir); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	admin.cfg = proxy.Config{Services: []proxy.ServiceConfig{{Name: web.ContainerName, Ports: []string{fmt.Sprintf("%d:80", aProxy)}}}}
+	admin.mu.Unlock()
+	docker.setPorts([]model.PortBinding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, Protocol: "tcp"}}, false)
+
+	// The entry point under test: the Compose file is already missing when
+	// the restore starts. It must rebuild instead of aborting.
+	managed := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n  api:\n    image: nginx:alpine\n"))
+	if err := os.WriteFile(composeFile, managed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(composeFile); err != nil {
+		t.Fatal(err)
+	}
+	holder := &portHolder{}
+	holderReady := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", aPort))
+			if err == nil {
+				holder.set(ln)
+				close(holderReady)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(holderReady)
+	}()
+	t.Cleanup(holder.close)
+
+	op := model.Operation{ID: "op-detach-missing", Kind: "restore", Status: "running", BackupDir: t.TempDir()}
+	if err := e.store.InsertOperation(op); err != nil {
+		t.Fatal(err)
+	}
+	e.runDetach(context.Background(), web, op, false, func() {})
+	got, ok, err := e.store.GetOperation(op.ID)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if got.Status != "succeeded" {
+		t.Fatalf("restore did not succeed: %s %s", got.Status, got.Error)
+	}
+	<-holderReady
+	raw, err := os.ReadFile(composeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), fmt.Sprintf("%d:80", aPort)) {
+		t.Fatalf("this service's port was not rebuilt:\n%s", raw)
+	}
+	if strings.Contains(string(raw), fmt.Sprintf("%d:80", bPort)) {
+		t.Fatalf("other managed service's port was reintroduced:\n%s", raw)
+	}
+	if _, ok, _ := e.store.GetService(web.ID); ok {
+		t.Fatal("restored service record must be deleted")
+	}
+	if _, ok, _ := e.store.GetService(api.ID); !ok {
+		t.Fatal("other managed service record must be kept")
+	}
+	cfg := admin.config()
+	if _, ok := cfg.Service(web.ContainerName); ok {
+		t.Fatalf("proxy target must be removed: %+v", cfg.Services)
+	}
+	if _, ok := cfg.Service(api.ContainerName); !ok {
+		t.Fatalf("other managed service's proxy entry must be kept: %+v", cfg.Services)
+	}
+}
+
+func TestRestoreMissingSharedComposeRemovesStalePorts(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	aPort, bStale, bPort := freePort(t), freePort(t), freePort(t)
+	aProxy := freePort(t)
+	aBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, ProxyPort: aProxy, Protocol: "tcp"}}
+	// The backup predates api's re-attach on a new port: it still declares
+	// the stale bStale mapping instead of the current bPort.
+	backup := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n", aPort, bStale))
+	backupDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(backupDir, "docker-compose.yml"), backup, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta, _ := json.Marshal(map[string]any{"composeFile": composeFile, "workingDir": dir})
+	if err := os.WriteFile(filepath.Join(backupDir, "metadata.json"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc := model.Service{ID: "svc-web", ContainerID: "abc123", ContainerName: "demo-web-1",
+		ComposeProject: "shared", ComposeService: "web", ComposeFile: composeFile,
+		Status: "managed_running", Bindings: aBindings, StartTimeoutSecs: 1}
+	api := model.Service{ID: "svc-api", ContainerID: "def456", ContainerName: "shared-api-1",
+		ComposeProject: "shared", ComposeService: "api", ComposeFile: composeFile,
+		Status:           "managed_running",
+		Bindings:         []model.Binding{{HostIP: "127.0.0.1", HostPort: bPort, ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}},
+		StartTimeoutSecs: 1}
+	for _, s := range []model.Service{svc, api} {
+		if err := e.store.UpsertService(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.store.SetMeta("serviceBackup:svc-web", backupDir); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	admin.cfg = proxy.Config{Services: []proxy.ServiceConfig{{Name: svc.ContainerName, Ports: []string{fmt.Sprintf("%d:80", aProxy)}}}}
+	admin.mu.Unlock()
+	docker.setPorts([]model.PortBinding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, Protocol: "tcp"}}, false)
+
+	holder := &portHolder{}
+	holderReady := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", aPort))
+			if err == nil {
+				holder.set(ln)
+				close(holderReady)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(holderReady)
+	}()
+	t.Cleanup(holder.close)
+
+	if err := e.restoreService(context.Background(), logger, svc); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	<-holderReady
+	raw, err := os.ReadFile(composeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stale := range []int{bStale, bPort} {
+		if strings.Contains(string(raw), fmt.Sprintf("%d:80", stale)) {
+			t.Fatalf("stale port %d was reintroduced from the backup:\n%s", stale, raw)
+		}
+	}
+	if !strings.Contains(string(raw), fmt.Sprintf("%d:80", aPort)) {
+		t.Fatalf("this service's port was not restored:\n%s", raw)
+	}
+}

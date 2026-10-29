@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"orbsleep/internal/dockerx"
-	"orbsleep/internal/gateway"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 )
@@ -122,24 +121,18 @@ func (e *Engine) reconcile() {
 		// Keep the host gateway listeners alive for every binding, even while
 		// the container sleeps: the first connection wakes it through the proxy.
 		for _, b := range svc.Bindings {
-			targetHost := "127.0.0.1"
-			if s.ProxyDialMode == "container_ip" && proxyIP != "" {
-				targetHost = proxyIP
-			}
 			key := fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)
 			keep[key] = true
-			err := e.gw.Ensure(gateway.Route{
-				Key:        key,
-				ServiceID:  svc.ID,
-				BindHost:   b.HostIP,
-				BindPort:   b.HostPort,
-				TargetHost: targetHost,
-				TargetPort: b.ProxyPort,
-				Label:      svc.ContainerName,
-			})
-			if err != nil {
+			// Build routes through the shared helper: in container_ip mode an
+			// unresolvable proxy IP must surface as an error and skip the
+			// listener, never fall back to 127.0.0.1.
+			route, rerr := gatewayRouteFor(svc.ID, svc.ContainerName, b, s, proxyIP)
+			if rerr == nil {
+				rerr = e.gw.Ensure(route)
+			}
+			if rerr != nil {
 				status = "warning"
-				lastErr = err.Error()
+				lastErr = rerr.Error()
 			}
 			if ins != nil && containerPublishes(ins, model.PortBinding{
 				HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
