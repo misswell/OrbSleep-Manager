@@ -1,0 +1,519 @@
+package engine
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"orbsleep/internal/compose"
+	"orbsleep/internal/dockerx"
+	"orbsleep/internal/gateway"
+	"orbsleep/internal/model"
+	"orbsleep/internal/proxy"
+)
+
+type attachError struct {
+	Err            error
+	RollbackFailed bool
+}
+
+func (a *attachError) Error() string { return a.Err.Error() }
+func (a *attachError) Unwrap() error { return a.Err }
+
+type appliedItem struct {
+	snap       *planSnapshot
+	serviceID  string
+	backupPath string
+}
+
+// ApplyPlan starts executing a plan asynchronously and returns an operation id.
+func (e *Engine) ApplyPlan(planID string) (string, error) {
+	e.plansMu.Lock()
+	entry, ok := e.plans[planID]
+	if !ok {
+		e.plansMu.Unlock()
+		return "", errors.New("接入计划不存在或已过期，请重新生成")
+	}
+	if entry.applying {
+		e.plansMu.Unlock()
+		return "", errors.New("该计划正在执行")
+	}
+	if time.Since(entry.createdAt) > 10*time.Minute {
+		delete(e.plans, planID)
+		e.plansMu.Unlock()
+		return "", errors.New("接入计划已过期，请重新生成")
+	}
+	if entry.plan.Status != "ready" || len(entry.items) == 0 {
+		e.plansMu.Unlock()
+		return "", errors.New("接入计划包含阻塞项，无法执行")
+	}
+	entry.applying = true
+	plan := entry.plan
+	items := append([]planSnapshot(nil), entry.items...)
+	e.plansMu.Unlock()
+
+	opID := newID("op")
+	backupDir := filepath.Join(e.settings.Get().BackupDir, opID)
+	op := model.Operation{
+		ID:        opID,
+		Kind:      "attach",
+		Status:    "running",
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		BackupDir: backupDir,
+		Log:       []model.LogEntry{},
+	}
+	if err := e.store.InsertOperation(op); err != nil {
+		return "", err
+	}
+	go e.runAttach(plan, items, op)
+	return opID, nil
+}
+
+func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Operation) {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	defer func() {
+		e.plansMu.Lock()
+		delete(e.plans, plan.ID)
+		e.plansMu.Unlock()
+	}()
+	ctx, cancel := contextWithOpTimeout()
+	defer cancel()
+	logger := e.newOpLogger(op)
+	logger.add("info", fmt.Sprintf("接入计划 %s 开始执行（%d 个容器）", plan.ID, len(items)))
+
+	admin, adminErr := e.adminClient()
+	var baseConfig proxy.Config
+	if adminErr == nil {
+		if cfg, err := admin.GetConfig(ctx); err == nil {
+			baseConfig = cfg
+		}
+	}
+	fileStates := map[string][]byte{}
+	var applied []appliedItem
+	for i, snap := range items {
+		logger.add("info", fmt.Sprintf("[%d/%d] 接入 %s", i+1, len(items), snap.containerName))
+		ai, err := e.attachOne(ctx, logger, i, &items[i], fileStates)
+		if err != nil {
+			rbFailed := false
+			var ae *attachError
+			if errors.As(err, &ae) {
+				rbFailed = ae.RollbackFailed
+			}
+			logger.add("error", err.Error())
+			if len(applied) > 0 {
+				logger.add("warn", "回滚此前已完成的接入")
+				if rbErr := e.rollbackAll(ctx, logger, applied, baseConfig); rbErr != nil {
+					logger.add("error", rbErr.Error())
+					rbFailed = true
+				}
+			}
+			if rbFailed {
+				logger.finish("rollback_failed", err.Error())
+				e.setLastError("接入失败且回滚不完整: " + err.Error())
+			} else {
+				logger.finish("rolled_back", err.Error())
+				e.setLastError("接入失败，已回滚: " + err.Error())
+			}
+			return
+		}
+		applied = append(applied, *ai)
+	}
+	ids := make([]string, 0, len(applied))
+	for _, ai := range applied {
+		ids = append(ids, ai.serviceID)
+	}
+	logger.setAffected(ids)
+	logger.add("info", "接入完成；此后原端口由 macOS 端口网关监听，GUI 关闭后仍然有效")
+	logger.finish("succeeded", "")
+	e.syncProxyConfig(ctx, true)
+	e.triggerReconcile()
+}
+
+func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, fileStates map[string][]byte) (*appliedItem, error) {
+	s := e.settings.Get()
+	cli, err := e.cliRunner()
+	if err != nil {
+		return nil, &attachError{Err: err}
+	}
+	c, err := e.dockerClient(ctx)
+	if err != nil {
+		return nil, &attachError{Err: err}
+	}
+	admin, err := e.adminClient()
+	if err != nil {
+		return nil, &attachError{Err: err}
+	}
+
+	ins, err := c.InspectContainer(ctx, snap.containerID)
+	if err != nil {
+		return nil, &attachError{Err: fmt.Errorf("目标容器在接入前已消失: %w", err)}
+	}
+	if name := strings.TrimPrefix(ins.Name, "/"); name != snap.containerName {
+		return nil, &attachError{Err: fmt.Errorf("容器名称已变化（%s → %s），请重新扫描", snap.containerName, name)}
+	}
+	// Guard against edits made after the plan was generated: never overwrite
+	// a Compose file the user changed in the meantime. When several plan items
+	// share one Compose file, compare against the state left by previous items.
+	expected, ok := fileStates[snap.composeFile]
+	if !ok {
+		expected = snap.content
+	}
+	current, err := os.ReadFile(snap.composeFile)
+	if err != nil {
+		return nil, &attachError{Err: fmt.Errorf("读取 Compose 文件失败: %w", err)}
+	}
+	if !bytes.Equal(current, expected) {
+		return nil, &attachError{Err: errors.New("Compose 文件在计划生成后被修改过，请重新扫描并生成计划")}
+	}
+	for _, r := range snap.removals {
+		if !containerPublishes(ins, r) {
+			return nil, &attachError{Err: fmt.Errorf("容器当前不再发布 %d/tcp，请重新扫描", r.HostPort)}
+		}
+	}
+
+	beforeCfg, err := cli.ComposeConfig(ctx, snap.composeProject, snap.composeFile, snap.workingDir)
+	if err != nil {
+		return nil, &attachError{Err: fmt.Errorf("读取 Compose 有效配置失败: %w", err)}
+	}
+	prevCfg, err := admin.GetConfig(ctx)
+	if err != nil {
+		return nil, &attachError{Err: fmt.Errorf("读取代理配置失败: %w", err)}
+	}
+	// Re-check proxy port ownership: another plan may have been applied since
+	// this plan was generated.
+	existing, _ := e.store.ListServices()
+	for _, other := range existing {
+		for _, ob := range other.Bindings {
+			for _, nb := range snap.bindings {
+				if ob.ProxyPort == nb.ProxyPort {
+					return nil, &attachError{Err: fmt.Errorf("代理端口 %d 已被服务 %s 占用，请重新生成计划", nb.ProxyPort, other.ContainerName)}
+				}
+			}
+		}
+	}
+
+	itemDir := filepath.Join(logger.snapshot().BackupDir, fmt.Sprintf("item-%d", idx+1))
+	backupPath, err := compose.BackupFile(snap.composeFile, itemDir)
+	if err != nil {
+		return nil, &attachError{Err: fmt.Errorf("备份 Compose 文件失败: %w", err)}
+	}
+	if err := os.WriteFile(filepath.Join(itemDir, "proxy-config.yaml"), prevCfg.Marshal(), 0o600); err != nil {
+		return nil, &attachError{Err: fmt.Errorf("备份代理配置失败: %w", err)}
+	}
+	meta := map[string]any{
+		"containerId":    snap.containerID,
+		"containerName":  snap.containerName,
+		"composeProject": snap.composeProject,
+		"composeService": snap.composeService,
+		"composeFile":    snap.composeFile,
+		"workingDir":     snap.workingDir,
+		"removals":       snap.removals,
+		"bindings":       snap.bindings,
+		"createdAt":      time.Now().UTC().Format(time.RFC3339),
+	}
+	metaRaw, _ := json.MarshalIndent(meta, "", "  ")
+	_ = os.WriteFile(filepath.Join(itemDir, "metadata.json"), metaRaw, 0o600)
+	logger.add("info", fmt.Sprintf("已备份 %s 到 %s", snap.composeFile, backupPath))
+
+	svcID := newID("svc")
+	var undos []func() error
+	rollbackFailed := false
+	fail := func(cause error) (*appliedItem, error) {
+		logger.add("warn", "回滚本容器的修改")
+		for i := len(undos) - 1; i >= 0; i-- {
+			if uerr := undos[i](); uerr != nil {
+				rollbackFailed = true
+				logger.add("error", "回滚步骤失败: "+uerr.Error())
+			}
+		}
+		return nil, &attachError{Err: cause, RollbackFailed: rollbackFailed}
+	}
+
+	// 1. Register the service in the proxy before touching the container.
+	nextCfg := prevCfg
+	sc := proxy.ServiceConfig{
+		Name:             snap.containerName,
+		IdleTimeoutSecs:  s.IdleTimeoutSecs,
+		StartTimeoutSecs: s.StartTimeoutSecs,
+	}
+	for _, m := range snap.proxyMappings {
+		sc.Ports = append(sc.Ports, fmt.Sprintf("%d:%d", m.ListenPort, m.TargetPort))
+	}
+	nextCfg.Upsert(sc)
+	if err := admin.UpdateConfig(ctx, nextCfg); err != nil {
+		return fail(fmt.Errorf("更新代理配置失败: %w", err))
+	}
+	verify, err := admin.GetConfig(ctx)
+	if err != nil {
+		return fail(fmt.Errorf("验证代理配置失败: %w", err))
+	}
+	if _, ok := verify.Service(snap.containerName); !ok {
+		return fail(errors.New("代理未接受新的服务配置"))
+	}
+	undos = append(undos, func() error {
+		rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return admin.UpdateConfig(rctx, prevCfg)
+	})
+	logger.add("info", fmt.Sprintf("代理已注册 %s（%s）", snap.containerName, strings.Join(sc.Ports, ", ")))
+
+	// 2. Edit the Compose file.
+	out, _, err := compose.RemoveBindings(current, snap.composeService, snap.removals)
+	if err != nil {
+		return fail(fmt.Errorf("修改 Compose 文件失败: %w", err))
+	}
+	info, err := os.Stat(snap.composeFile)
+	if err != nil {
+		return fail(fmt.Errorf("读取 Compose 文件属性失败: %w", err))
+	}
+	if err := compose.WriteAtomic(snap.composeFile, out, info.Mode()); err != nil {
+		return fail(fmt.Errorf("写入 Compose 文件失败: %w", err))
+	}
+	fileStates[snap.composeFile] = out
+	undos = append(undos, func() error {
+		if err := compose.RestoreFile(snap.composeFile, backupPath); err != nil {
+			return fmt.Errorf("恢复 Compose 文件失败: %w", err)
+		}
+		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := cli.UpService(rctx, snap.composeProject, snap.composeFile, snap.workingDir, snap.composeService); err != nil {
+			return fmt.Errorf("回滚后重建服务失败: %w", err)
+		}
+		return nil
+	})
+	logger.add("info", fmt.Sprintf("已移除端口映射: %s", portsText(snap.removals)))
+
+	// 3. Validate the effective config only lost those ports.
+	afterCfg, err := cli.ComposeConfig(ctx, snap.composeProject, snap.composeFile, snap.workingDir)
+	if err != nil {
+		return fail(fmt.Errorf("修改后 Compose 配置无效: %w", err))
+	}
+	if err := compose.ValidateEffective(beforeCfg, afterCfg, snap.composeService, snap.removals); err != nil {
+		return fail(err)
+	}
+	logger.add("info", "Compose 有效配置校验通过")
+
+	// 4. Recreate only the target service.
+	logger.add("info", "重建目标服务（仅该服务）…")
+	if err := cli.UpService(ctx, snap.composeProject, snap.composeFile, snap.workingDir, snap.composeService); err != nil {
+		return fail(fmt.Errorf("重建容器失败: %w", err))
+	}
+	newIns, err := e.waitContainerRunning(ctx, snap.containerName, time.Duration(maxInt(s.StartTimeoutSecs, 30))*time.Second)
+	if err != nil {
+		return fail(err)
+	}
+	for _, r := range snap.removals {
+		if containerPublishes(newIns, r) {
+			return fail(fmt.Errorf("容器重建后仍然发布 %d/tcp（代理无法接管）", r.HostPort))
+		}
+	}
+	logger.add("info", "容器已重建，原端口已释放")
+
+	// 5. Install the host port gateway.
+	for _, b := range snap.bindings {
+		route, err := e.gatewayRoute(ctx, svcID, snap.containerName, b, s)
+		if err != nil {
+			return fail(err)
+		}
+		if err := e.gw.Ensure(route); err != nil {
+			return fail(fmt.Errorf("启动端口网关失败: %w", err))
+		}
+	}
+	undos = append(undos, func() error {
+		e.gw.RemoveService(svcID)
+		return nil
+	})
+	logger.add("info", fmt.Sprintf("端口网关已监听: %s", bindingsText(snap.bindings)))
+
+	// 6. Verify the original address works (this also wakes the container).
+	if err := e.testBindings(ctx, snap.bindings); err != nil {
+		return fail(fmt.Errorf("原端口连通性测试失败: %w", err))
+	}
+	logger.add("info", "原端口连通性测试通过")
+
+	svc := model.Service{
+		ID:               svcID,
+		ContainerID:      newIns.ID,
+		ContainerName:    snap.containerName,
+		ComposeProject:   snap.composeProject,
+		ComposeService:   snap.composeService,
+		ComposeFile:      snap.composeFile,
+		Status:           "managed_running",
+		Bindings:         snap.bindings,
+		IdleTimeoutSecs:  s.IdleTimeoutSecs,
+		StartTimeoutSecs: s.StartTimeoutSecs,
+		LastActiveAt:     time.Now().UTC().Format(time.RFC3339),
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+	}
+	stableDir := filepath.Join(s.BackupDir, "services", svcID)
+	if err := os.MkdirAll(stableDir, 0o700); err != nil {
+		return fail(fmt.Errorf("创建服务备份目录失败: %w", err))
+	}
+	if err := copyFileSimple(backupPath, filepath.Join(stableDir, filepath.Base(backupPath))); err != nil {
+		return fail(fmt.Errorf("保存原始 Compose 备份失败: %w", err))
+	}
+	// Keep the pre-attach content too (for audit and emergency recovery).
+	_ = os.WriteFile(filepath.Join(stableDir, filepath.Base(backupPath)+".original"), snap.content, 0o600)
+	meta["serviceId"] = svcID
+	metaRaw, _ = json.MarshalIndent(meta, "", "  ")
+	_ = os.WriteFile(filepath.Join(stableDir, "metadata.json"), metaRaw, 0o600)
+	_ = e.store.SetMeta("serviceBackup:"+svcID, stableDir)
+	if err := e.store.UpsertService(svc); err != nil {
+		return fail(fmt.Errorf("保存托管状态失败: %w", err))
+	}
+	undos = append(undos, func() error { return e.store.DeleteService(svcID) })
+	logger.add("info", fmt.Sprintf("%s 接入成功：%s → 代理 → 容器", snap.containerName, bindingsText(snap.bindings)))
+	return &appliedItem{snap: snap, serviceID: svcID, backupPath: backupPath}, nil
+}
+
+func (e *Engine) rollbackAll(ctx context.Context, logger *opLogger, applied []appliedItem, base proxy.Config) error {
+	var errs []string
+	cli, cliErr := e.cliRunner()
+	for i := len(applied) - 1; i >= 0; i-- {
+		ai := applied[i]
+		logger.add("warn", "回滚 "+ai.snap.containerName)
+		e.gw.RemoveService(ai.serviceID)
+		_ = e.store.DeleteService(ai.serviceID)
+		if err := compose.RestoreFile(ai.snap.composeFile, ai.backupPath); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: 恢复 Compose 失败: %v", ai.snap.containerName, err))
+			continue
+		}
+		if cliErr == nil {
+			rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			err := cli.UpService(rctx, ai.snap.composeProject, ai.snap.composeFile, ai.snap.workingDir, ai.snap.composeService)
+			cancel()
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: 重建失败: %v", ai.snap.containerName, err))
+			}
+		}
+	}
+	if admin, err := e.adminClient(); err == nil {
+		if err := admin.UpdateConfig(ctx, base); err != nil {
+			errs = append(errs, "恢复代理配置失败: "+err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("回滚不完整：%s；备份位于 %s，请按日志手动恢复", strings.Join(errs, "; "), logger.snapshot().BackupDir)
+	}
+	logger.add("info", "回滚完成，服务已恢复到接入前状态")
+	return nil
+}
+
+func (e *Engine) waitContainerRunning(ctx context.Context, name string, timeout time.Duration) (*dockerx.ContainerInspect, error) {
+	c, err := e.dockerClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		ins, err := c.InspectContainer(ctx, name)
+		if err == nil && ins.State.Running {
+			return ins, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("容器状态为 %s", ins.State.Status)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("容器 %s 未在 %s 内就绪: %v", name, timeout, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func containerPublishes(ins *dockerx.ContainerInspect, b model.PortBinding) bool {
+	for key, bindings := range ins.HostConfig.PortBindings {
+		port, proto := splitPortKey(key)
+		if port != b.ContainerPort || proto != b.Protocol {
+			continue
+		}
+		for _, hb := range bindings {
+			if hb.HostPort == fmt.Sprintf("%d", b.HostPort) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func splitPortKey(key string) (int, string) {
+	proto := "tcp"
+	portStr := key
+	if i := strings.Index(key, "/"); i >= 0 {
+		portStr, proto = key[:i], key[i+1:]
+	}
+	var n int
+	fmt.Sscanf(portStr, "%d", &n)
+	return n, proto
+}
+
+func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) error {
+	for _, b := range bindings {
+		host := b.HostIP
+		if host == "" || host == "0.0.0.0" {
+			host = "127.0.0.1"
+		}
+		addr := fmt.Sprintf("%s:%d", host, b.HostPort)
+		d := netDialer(15 * time.Second)
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return fmt.Errorf("%s 无法连接: %w", addr, err)
+		}
+		conn.Close()
+	}
+	return nil
+}
+
+func (e *Engine) gatewayRoute(ctx context.Context, svcID, name string, b model.Binding, s model.Settings) (gateway.Route, error) {
+	targetHost := "127.0.0.1"
+	if s.ProxyDialMode == "container_ip" {
+		if ip := e.proxyContainerIP(ctx); ip != "" {
+			targetHost = ip
+		}
+	}
+	return gateway.Route{
+		Key:        fmt.Sprintf("%s|%s|%d", svcID, b.HostIP, b.HostPort),
+		ServiceID:  svcID,
+		BindHost:   b.HostIP,
+		BindPort:   b.HostPort,
+		TargetHost: targetHost,
+		TargetPort: b.ProxyPort,
+		Label:      name,
+	}, nil
+}
+
+func portsText(list []model.PortBinding) string {
+	var parts []string
+	for _, p := range list {
+		parts = append(parts, fmt.Sprintf("%s:%d->%d/%s", hostLabel(p.HostIP), p.HostPort, p.ContainerPort, p.Protocol))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func bindingsText(list []model.Binding) string {
+	var parts []string
+	for _, b := range list {
+		parts = append(parts, fmt.Sprintf("%s:%d → 代理 %d", hostLabel(b.HostIP), b.HostPort, b.ProxyPort))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

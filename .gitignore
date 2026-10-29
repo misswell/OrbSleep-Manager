@@ -1,0 +1,12 @@
+bin/
+app/build/
+
+app/OrbSleepManager.xcodeproj/
+app/*.xcworkspace/
+*.xcuserdatad/
+.swiftpm/
+.build/
+.DS_Store
+__pycache__/
+*.pyc
+/tmp/

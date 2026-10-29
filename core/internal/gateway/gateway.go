@@ -1,0 +1,259 @@
+// Package gateway implements the macOS-side TCP listener that forwards the
+// original host port to the lazy proxy's published listen port.
+package gateway
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Route is one host port -> proxy listener mapping.
+type Route struct {
+	Key        string
+	ServiceID  string
+	BindHost   string // "" means all interfaces
+	BindPort   int
+	TargetHost string
+	TargetPort int
+	Label      string
+}
+
+type route struct {
+	Route
+	ln     net.Listener
+	active atomic.Int32
+	wg     sync.WaitGroup
+	once   sync.Once
+}
+
+// Gateway owns all host port listeners.
+type Gateway struct {
+	mu       sync.Mutex
+	routes   map[string]*route
+	sem      chan struct{}
+	logf     func(level, format string, args ...any)
+	onActive func(serviceID string, at time.Time)
+	closed   bool
+}
+
+// New creates a gateway. logf may be nil.
+func New(logf func(level, format string, args ...any)) *Gateway {
+	if logf == nil {
+		logf = func(string, string, ...any) {}
+	}
+	return &Gateway{
+		routes: make(map[string]*route),
+		sem:    make(chan struct{}, 1024),
+		logf:   logf,
+	}
+}
+
+// SetActivityHook registers a callback fired when a connection is accepted.
+func (g *Gateway) SetActivityHook(fn func(serviceID string, at time.Time)) { g.onActive = fn }
+
+// Ensure creates or updates a route.
+func (g *Gateway) Ensure(r Route) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return fmt.Errorf("gateway 已关闭")
+	}
+	if existing, ok := g.routes[r.Key]; ok {
+		existing.TargetHost = r.TargetHost
+		existing.TargetPort = r.TargetPort
+		existing.Label = r.Label
+		return nil
+	}
+	addr := net.JoinHostPort(r.BindHost, fmt.Sprintf("%d", r.BindPort))
+	ln, err := net.Listen("tcp4", addr)
+	if err != nil {
+		return fmt.Errorf("无法监听 %s: %w", addr, err)
+	}
+	rt := &route{Route: r, ln: ln}
+	g.routes[r.Key] = rt
+	go g.accept(rt)
+	g.logf("info", "监听 %s（服务 %s，转发到 %s:%d）", addr, r.ServiceID, r.TargetHost, r.TargetPort)
+	return nil
+}
+
+// Remove closes one listener. Established connections are left to drain.
+func (g *Gateway) Remove(key string) {
+	g.mu.Lock()
+	rt, ok := g.routes[key]
+	delete(g.routes, key)
+	g.mu.Unlock()
+	if ok {
+		rt.once.Do(func() { rt.ln.Close() })
+		g.logf("info", "停止监听 %s", key)
+	}
+}
+
+// RemoveService closes every listener of a service.
+func (g *Gateway) RemoveService(serviceID string) {
+	g.mu.Lock()
+	var keys []string
+	for k, rt := range g.routes {
+		if rt.ServiceID == serviceID {
+			keys = append(keys, k)
+		}
+	}
+	g.mu.Unlock()
+	for _, k := range keys {
+		g.Remove(k)
+	}
+}
+
+// Prune removes routes whose keys are not in keep.
+func (g *Gateway) Prune(keep map[string]bool) {
+	g.mu.Lock()
+	var stale []string
+	for k := range g.routes {
+		if !keep[k] {
+			stale = append(stale, k)
+		}
+	}
+	g.mu.Unlock()
+	for _, k := range stale {
+		g.Remove(k)
+	}
+}
+
+// ActiveConns returns the number of live connections for a service.
+func (g *Gateway) ActiveConns(serviceID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	total := 0
+	for _, rt := range g.routes {
+		if rt.ServiceID == serviceID {
+			total += int(rt.active.Load())
+		}
+	}
+	return total
+}
+
+// RouteKeys returns the currently installed route keys.
+func (g *Gateway) RouteKeys() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]string, 0, len(g.routes))
+	for k := range g.routes {
+		out = append(out, k)
+	}
+	return out
+}
+
+// StopAll closes every listener and active connection (daemon shutdown).
+func (g *Gateway) StopAll() {
+	g.mu.Lock()
+	g.closed = true
+	routes := make([]*route, 0, len(g.routes))
+	for _, rt := range g.routes {
+		routes = append(routes, rt)
+	}
+	g.routes = map[string]*route{}
+	g.mu.Unlock()
+	for _, rt := range routes {
+		rt.once.Do(func() { rt.ln.Close() })
+	}
+}
+
+func (g *Gateway) accept(rt *route) {
+	for {
+		conn, err := rt.ln.Accept()
+		if err != nil {
+			if isClosed(err) {
+				return
+			}
+			g.logf("warn", "接受连接失败 %s: %v", rt.Key, err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		select {
+		case g.sem <- struct{}{}:
+		default:
+			g.logf("warn", "并发连接达到上限，拒绝 %s", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		rt.wg.Add(1)
+		go func() {
+			defer func() { <-g.sem; rt.wg.Done() }()
+			g.handle(rt, conn)
+		}()
+	}
+}
+
+func (g *Gateway) handle(rt *route, client net.Conn) {
+	defer client.Close()
+	if tc, ok := client.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+	rt.active.Add(1)
+	defer rt.active.Add(-1)
+	if g.onActive != nil {
+		g.onActive(rt.ServiceID, time.Now())
+	}
+
+	target := net.JoinHostPort(rt.TargetHost, fmt.Sprintf("%d", rt.TargetPort))
+	var upstream net.Conn
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		d := net.Dialer{Timeout: 10 * time.Second}
+		upstream, err = d.Dial("tcp", target)
+		if err == nil {
+			break
+		}
+		g.logf("warn", "连接上游 %s 失败（第 %d 次）: %v", target, attempt+1, err)
+		time.Sleep(250 * time.Millisecond)
+	}
+	if err != nil {
+		g.logf("error", "放弃转发 %s -> %s: %v", client.RemoteAddr(), target, err)
+		return
+	}
+	defer upstream.Close()
+	if tc, ok := upstream.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(upstream, client)
+		closeWrite(upstream)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(client, upstream)
+		closeWrite(client)
+	}()
+	wg.Wait()
+	// Give the peer a moment to observe the half-close before tearing down.
+	time.Sleep(10 * time.Millisecond)
+}
+
+func closeWrite(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.CloseWrite()
+		return
+	}
+	c.Close()
+}
+
+func isClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") || strings.Contains(msg, "closed network connection")
+}
