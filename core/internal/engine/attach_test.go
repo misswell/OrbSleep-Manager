@@ -727,3 +727,63 @@ func TestProxySetupRollbackFailureIsReported(t *testing.T) {
 		t.Fatalf("old compose not restored:\n%s", raw)
 	}
 }
+
+func TestRestoreRevertsWhenDeletingManagedRecordFails(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+	hostPort := svc.Bindings[0].HostPort
+
+	// Once the gateway releases the port, occupy it with a real listener so the
+	// connectivity probe succeeds. The delete hook closes it just before the
+	// revert, allowing the gateway to bind again.
+	var holder net.Listener
+	holderReady := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
+			if err == nil {
+				holder = ln
+				close(holderReady)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(holderReady)
+	}()
+
+	originalDelete := deleteServiceRecord
+	deleteServiceRecord = func(e *Engine, id string) error {
+		if holder != nil {
+			_ = holder.Close()
+		}
+		return errors.New("simulated sqlite failure")
+	}
+	t.Cleanup(func() {
+		deleteServiceRecord = originalDelete
+		if holder != nil {
+			_ = holder.Close()
+		}
+	})
+
+	err := e.restoreService(context.Background(), logger, svc)
+	<-holderReady
+	if err == nil {
+		t.Fatal("expected restore to fail when the record cannot be deleted")
+	}
+	if _, ok, _ := e.store.GetService(svc.ID); !ok {
+		t.Fatal("record should remain after a failed delete")
+	}
+	raw, _ := os.ReadFile(snap.composeFile)
+	if string(raw) != string(managed) {
+		t.Fatalf("service was not reverted to managed state:\n%s", raw)
+	}
+	if len(admin.config().Services) != 1 {
+		t.Fatalf("proxy target was not restored: %+v", admin.config().Services)
+	}
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("gateway listener was not restored: %v", e.gw.RouteKeys())
+	}
+}

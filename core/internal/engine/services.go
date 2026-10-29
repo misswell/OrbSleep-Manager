@@ -348,12 +348,17 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 	}
 	logger.add("info", "原端口连通性测试通过")
 
-	if err := e.store.DeleteService(svc.ID); err != nil {
+	if err := deleteServiceRecord(e, svc.ID); err != nil {
 		// The record must not outlive the managed wiring. Put the service back
 		// into the verified managed state, or report rollback_failed.
 		return failWithRevert(fmt.Errorf("删除托管记录失败: %w", err))
 	}
 	return nil
+}
+
+// deleteServiceRecord is a seam for fault-injection tests.
+var deleteServiceRecord = func(e *Engine, id string) error {
+	return e.store.DeleteService(id)
 }
 
 func bindingsFor(svc model.Service) []model.PortBinding {

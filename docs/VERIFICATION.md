@@ -120,7 +120,7 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 | 停止代理后无法改端口 | `proxy.installed` 改为“容器存在”；新增 `proxy.stop`（保留设置）与 GUI 停止按钮；停止后可改端口并重新安装（实测） |
 | 旧低端口配置卡死设置 | 启动时 `MigrateLegacy()` 自动将旧 `enableLowPortHelper=true` 迁移为 false，并加单测 |
 | 失败备份被清理 | 备份清理关联操作状态：`failed` / `rollback_failed` / `running` 一律保留，未知目录保留；单测覆盖 |
-| 删除托管记录失败未回退 | 删除失败现在走 `revertManaged`，失败则 `rollback_failed`，保留托管记录 |
+| 删除托管记录失败未回退 | 删除失败现在走 `revertManaged`，失败则 `rollback_failed`，保留托管记录；故障注入测试模拟 SQLite 删除失败并验证 Compose/代理/网关全部回到托管状态 |
 
 新增/扩展测试：`proxy_test.go`（深拷贝）、`recovery_test.go`（崩溃恢复、外部修改保护、关闭取消）、`attach_test.go`（代理安装失败回滚、多服务配置保持、备份保留策略）。`go test -race ./...` 全部通过（并修复了网关目标热更新的数据竞争）。
 
