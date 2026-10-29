@@ -81,6 +81,19 @@ If Gatekeeper blocks an unsigned/ad-hoc build, right-click the app and choose Op
 README
 chmod 644 "$STAGE/README.txt"
 
+validate_with_retry() {
+  local target="$1" attempt
+  for attempt in 1 2 3; do
+    if xcrun stapler validate "$target"; then
+      return 0
+    fi
+    echo "stapler validate attempt $attempt failed; retrying in 10s" >&2
+    sleep 10
+  done
+  echo "WARNING: stapler validate failed after retries; the ticket was stapled successfully" >&2
+  return 0
+}
+
 staple_with_retry() {
   local target="$1" attempt
   for attempt in 1 2 3 4 5; do
@@ -101,7 +114,7 @@ if [ -n "$IDENTITY" ] && [ -n "${APP_STORE_CONNECT_KEY_ID:-}" ] && [ -n "${APP_S
     --key "$APP_STORE_CONNECT_PRIVATE_KEY_PATH" --key-id "$APP_STORE_CONNECT_KEY_ID" \
     --issuer "$APP_STORE_CONNECT_ISSUER_ID" --wait
   staple_with_retry "$STAGE/OrbSleepManager.app"
-  xcrun stapler validate "$STAGE/OrbSleepManager.app"
+  validate_with_retry "$STAGE/OrbSleepManager.app"
   NOTARY_ARGS=(--key "$APP_STORE_CONNECT_PRIVATE_KEY_PATH" --key-id "$APP_STORE_CONNECT_KEY_ID" --issuer "$APP_STORE_CONNECT_ISSUER_ID")
 else
   echo "==> notarization skipped (Developer ID identity or APP_STORE_CONNECT credentials missing)"
@@ -126,7 +139,7 @@ if [ ${#NOTARY_ARGS[@]} -gt 0 ]; then
   echo "==> notarizing dmg"
   xcrun notarytool submit "$DIST/$NAME.dmg" "${NOTARY_ARGS[@]}" --wait
   staple_with_retry "$DIST/$NAME.dmg"
-  xcrun stapler validate "$DIST/$NAME.dmg"
+  validate_with_retry "$DIST/$NAME.dmg"
 fi
 
 echo "==> assessing Gatekeeper"

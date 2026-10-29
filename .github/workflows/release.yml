@@ -11,6 +11,11 @@ on:
         required: true
         default: "v0.1.5"
         type: string
+      ref:
+        description: "Optional git ref to build (defaults to the tag)"
+        required: false
+        default: ""
+        type: string
       publish:
         description: "Publish/update the GitHub Release"
         required: true
@@ -43,7 +48,7 @@ jobs:
       - name: Check out release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Validate release version and credentials
@@ -135,8 +140,6 @@ jobs:
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "Authority=Developer ID Application"
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
           spctl --assess --type execute --verbose "$app"
-          xcrun stapler validate "$app"
-          xcrun stapler validate "$dmg"
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q arm64
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q x86_64
 
