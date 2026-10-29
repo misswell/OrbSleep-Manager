@@ -22,11 +22,12 @@ type Logger struct {
 
 // New creates the log file inside dir.
 func New(dir string) (*Logger, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(dir, 0o700)
 	path := filepath.Join(dir, "daemon.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -35,6 +36,7 @@ func New(dir string) (*Logger, error) {
 	if st != nil {
 		l.size = st.Size()
 	}
+	_ = os.Chmod(path, 0o600)
 	return l, nil
 }
 
@@ -61,7 +63,7 @@ func (l *Logger) rotateLocked() {
 		os.Rename(fmt.Sprintf("%s.%d", l.path, i), fmt.Sprintf("%s.%d", l.path, i+1))
 	}
 	os.Rename(l.path, l.path+".1")
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err == nil {
 		l.file = f
 		l.size = 0
@@ -75,6 +77,30 @@ func (l *Logger) Close() {
 	if l.file != nil {
 		l.file.Close()
 	}
+}
+
+// CleanupOlderThan removes rotated log files older than the retention period.
+// The active daemon.log is left alone (it is open).
+func (l *Logger) CleanupOlderThan(days int) error {
+	if days <= 0 {
+		days = 14
+	}
+	cutoff := time.Now().AddDate(0, 0, -days)
+	entries, err := os.ReadDir(filepath.Dir(l.path))
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == filepath.Base(l.path) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(filepath.Dir(l.path), entry.Name()))
+	}
+	return nil
 }
 
 // Tail returns the last n lines of the current log file.

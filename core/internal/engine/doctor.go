@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -162,5 +163,45 @@ func (e *Engine) CleanupOldOperations() {
 	cutoff := time.Now().AddDate(0, 0, -days)
 	if err := e.store.PruneOperations(cutoff); err != nil {
 		e.logger.Printf("warn", "清理操作历史失败: %v", err)
+	}
+	if err := e.logger.CleanupOlderThan(days); err != nil {
+		e.logger.Printf("warn", "清理日志文件失败: %v", err)
+	}
+	e.cleanupOldBackups(cutoff)
+}
+
+// cleanupOldBackups removes old operation backup directories but never touches
+// the per-service recovery backups under backups/services.
+func (e *Engine) cleanupOldBackups(cutoff time.Time) {
+	root := e.settings.Get().BackupDir
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "services" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			e.logger.Printf("warn", "清理旧备份失败 %s: %v", entry.Name(), err)
+		}
+	}
+}
+
+func (e *Engine) retentionLoop() {
+	defer e.wg.Done()
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+			e.CleanupOldOperations()
+		}
 	}
 }

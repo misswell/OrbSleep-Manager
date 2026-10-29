@@ -58,7 +58,7 @@ struct ServicesView: View {
                 removeTarget = nil
             }
         } message: { service in
-            Text("将移除「\(service.displayName)」的托管，并重建容器以恢复原始端口映射。操作会中断服务约 1–5 秒，且不会自动撤销。")
+            Text("将移除「\(service.displayName)」的托管，重建容器以恢复原始端口映射，并删除 OrbSleep 保存的恢复备份。操作会中断服务约 1–5 秒，且不可撤销。")
         }
         .confirmationDialog(
             "恢复原始端口映射",

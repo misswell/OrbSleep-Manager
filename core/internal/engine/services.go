@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"orbsleep/internal/compose"
 	"orbsleep/internal/model"
-	"orbsleep/internal/proxy"
 )
 
 // Services returns managed services with live connection counts.
@@ -41,22 +41,21 @@ func (e *Engine) Services() ([]model.Service, error) {
 // ServiceAction performs a lifecycle action. start/stop/updatePolicy are
 // synchronous; restore/remove are transactional and return an operation id.
 func (e *Engine) ServiceAction(ctx context.Context, id, action string, params map[string]any) (map[string]any, error) {
-	svc, ok, err := e.store.GetService(id)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("托管服务不存在: %s", id)
-	}
 	switch action {
-	case "start":
-		if err := e.containerAction(ctx, svc, "start"); err != nil {
+	case "start", "stop":
+		// Serialise lifecycle changes with attach/restore/proxy transactions.
+		if !e.writeMu.TryLock() {
+			return nil, errors.New("正在执行接入/恢复等操作，请稍后重试")
+		}
+		defer e.writeMu.Unlock()
+		svc, ok, err := e.store.GetService(id)
+		if err != nil {
 			return nil, err
 		}
-		e.triggerReconcile()
-		return map[string]any{"ok": true}, nil
-	case "stop":
-		if err := e.containerAction(ctx, svc, "stop"); err != nil {
+		if !ok {
+			return nil, fmt.Errorf("托管服务不存在: %s", id)
+		}
+		if err := e.containerAction(ctx, svc, action); err != nil {
 			return nil, err
 		}
 		e.triggerReconcile()
@@ -64,6 +63,13 @@ func (e *Engine) ServiceAction(ctx context.Context, id, action string, params ma
 	case "updatePolicy":
 		return e.updatePolicy(id, params)
 	case "restore", "remove":
+		svc, ok, err := e.store.GetService(id)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("托管服务不存在: %s", id)
+		}
 		opID, err := e.startDetach(svc, action == "remove")
 		if err != nil {
 			return nil, err
@@ -100,7 +106,9 @@ func (e *Engine) containerAction(ctx context.Context, svc model.Service, action 
 }
 
 func (e *Engine) updatePolicy(id string, params map[string]any) (map[string]any, error) {
-	e.writeMu.Lock()
+	if !e.writeMu.TryLock() {
+		return nil, errors.New("正在执行接入/恢复等操作，请稍后重试")
+	}
 	defer e.writeMu.Unlock()
 	svc, ok, err := e.store.GetService(id)
 	if err != nil {
@@ -160,9 +168,21 @@ func (e *Engine) runDetach(svc model.Service, op model.Operation, remove bool) {
 	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("开始恢复 %s 的原始端口映射", svc.ContainerName))
 	if err := e.restoreService(ctx, logger, svc); err != nil {
-		logger.finish("failed", err.Error())
+		status := "failed"
+		var ae *attachError
+		if errors.As(err, &ae) && ae.RollbackFailed {
+			status = "rollback_failed"
+		}
+		logger.finish(status, err.Error())
 		e.setLastError("恢复失败: " + err.Error())
 		return
+	}
+	if remove {
+		if dir, ok := e.store.GetMeta("serviceBackup:" + svc.ID); ok {
+			if err := os.RemoveAll(dir); err == nil {
+				_ = e.store.DeleteMeta("serviceBackup:" + svc.ID)
+			}
+		}
 	}
 	logger.add("info", "原始端口映射已恢复；OrbSleep 已停止管理该服务")
 	if err := e.syncProxyConfig(ctx, true); err != nil {
@@ -172,11 +192,26 @@ func (e *Engine) runDetach(svc model.Service, op model.Operation, remove bool) {
 	e.triggerReconcile()
 }
 
+// restoreService restores the original host port mapping. The proxy target is
+// removed first and verified; the managed record is only deleted after the
+// container is running and the original ports are published and reachable.
 func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model.Service) error {
 	cli, cliErr := e.cliRunner()
 	if cliErr != nil {
 		return fmt.Errorf("docker CLI 不可用，无法重建服务: %w", cliErr)
 	}
+	admin, adminErr := e.adminClient()
+	if adminErr != nil {
+		return fmt.Errorf("代理管理接口不可用，无法安全恢复: %w", adminErr)
+	}
+	origCfg, err := admin.GetConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("读取代理配置失败，已中止恢复（未做任何修改）: %w", err)
+	}
+	if err := validateProxyConfig(origCfg); err != nil {
+		return fmt.Errorf("代理配置无效，已中止恢复（未做任何修改）: %w", err)
+	}
+
 	composeFile := svc.ComposeFile
 	workDir := filepath.Dir(composeFile)
 	backupFile := ""
@@ -196,99 +231,92 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 		backupFile = filepath.Join(backupDir, filepath.Base(composeFile))
 	}
 
-	// 1. Release the host ports from the gateway.
-	e.gw.RemoveService(svc.ID)
-	restoreGateway := func() {
-		for _, b := range svc.Bindings {
-			if route, err := e.gatewayRoute(ctx, svc.ID, svc.ContainerName, b, e.settings.Get()); err == nil {
-				_ = e.gw.Ensure(route)
-			}
-		}
+	// 1. Remove the proxy target first. If this cannot be verified, abort before
+	// touching the gateway or Compose file.
+	nextCfg := origCfg
+	nextCfg.Remove(svc.ContainerName)
+	if err := e.putProxyConfigVerified(ctx, admin, nextCfg); err != nil {
+		return fmt.Errorf("删除代理目标失败，已中止恢复（未做任何其他修改）: %w", err)
 	}
+	logger.add("info", "已从代理移除目标: "+svc.ContainerName)
+
+	// 2. Release the host ports.
+	e.gw.RemoveService(svc.ID)
 	logger.add("info", "已停止端口网关监听")
 
-	// 2. Remove the proxy target (keep the original config for rollback).
-	admin, adminErr := e.adminClient()
-	var origConfig, nextConfig proxy.Config
-	proxyRemoved := false
-	if adminErr == nil {
-		if cfg, err := admin.GetConfig(ctx); err == nil {
-			origConfig = cfg
-			nextConfig = cfg
-			nextConfig.Remove(svc.ContainerName)
-			if err := admin.UpdateConfig(ctx, nextConfig); err != nil {
-				logger.add("warn", "移除代理目标失败: "+err.Error())
-			} else {
-				proxyRemoved = true
-			}
-		}
-	}
-
 	removals := bindingsFor(svc)
-	// revertManaged re-establishes the managed (proxied) state if restoring the
-	// original config fails halfway, so we never leave the service unreachable.
-	revertManaged := func() {
-		if current, err := os.ReadFile(composeFile); err == nil {
+
+	// revertManaged puts the service back into the managed state. Every step is
+	// verified; failures are returned so the caller can report rollback_failed.
+	revertManaged := func() error {
+		var errs []string
+		current, readErr := os.ReadFile(composeFile)
+		if readErr == nil {
 			if modified, _, err := compose.RemoveBindings(current, svc.ComposeService, removals); err == nil {
 				mode := os.FileMode(0o644)
 				if st, statErr := os.Stat(composeFile); statErr == nil {
 					mode = st.Mode()
 				}
-				if compose.WriteAtomic(composeFile, modified, mode) == nil {
-					rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-					_ = cli.UpService(rctx, svc.ComposeProject, composeFile, workDir, svc.ComposeService)
-					cancel()
+				if werr := compose.WriteAtomic(composeFile, modified, mode); werr != nil {
+					errs = append(errs, "重写托管 Compose 失败: "+werr.Error())
 				}
 			}
 		}
-		restoreGateway()
-		if proxyRemoved {
-			_ = admin.UpdateConfig(ctx, origConfig)
+		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		if uerr := cli.UpService(rctx, svc.ComposeProject, composeFile, workDir, svc.ComposeService); uerr != nil {
+			errs = append(errs, "重建容器失败: "+uerr.Error())
 		}
+		cancel()
+		if gerr := e.ensureGatewayForService(ctx, svc.ID); gerr != nil {
+			errs = append(errs, "重新监听端口失败: "+gerr.Error())
+		}
+		pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if perr := e.putProxyConfigVerified(pctx, admin, origCfg); perr != nil {
+			errs = append(errs, "恢复代理配置失败: "+perr.Error())
+		}
+		pcancel()
+		if len(errs) > 0 {
+			return errors.New(strings.Join(errs, "; "))
+		}
+		return nil
+	}
+	failWithRevert := func(cause error) error {
+		rerr := revertManaged()
+		ae := &attachError{Err: cause}
+		if rerr != nil {
+			ae.RollbackFailed = true
+			ae.Detail = "已尝试回退到托管状态，但失败: " + rerr.Error()
+			logger.add("error", ae.Detail)
+		} else {
+			logger.add("warn", "已回退到托管状态")
+		}
+		return ae
 	}
 
-	// 3. Re-add only this service's ports. Restoring the whole file would also
-	// revert ports of other managed services sharing the same Compose file.
+	// 3. Restore only this service's ports. Never overwrite the file with a full
+	// backup while it exists: that could discard unrelated user edits.
 	current, readErr := os.ReadFile(composeFile)
 	if readErr != nil {
 		if backupFile == "" {
-			restoreGateway()
-			if proxyRemoved {
-				_ = admin.UpdateConfig(ctx, origConfig)
-			}
-			return fmt.Errorf("读取 Compose 文件失败且没有可用备份: %w", readErr)
+			return failWithRevert(fmt.Errorf("Compose 文件不可读且没有备份: %w", readErr))
 		}
 		if err := compose.RestoreFile(composeFile, backupFile); err != nil {
-			restoreGateway()
-			if proxyRemoved {
-				_ = admin.UpdateConfig(ctx, origConfig)
-			}
-			return fmt.Errorf("恢复 Compose 文件失败: %w", err)
+			return failWithRevert(fmt.Errorf("从备份恢复 Compose 文件失败: %w", err))
 		}
-		logger.add("warn", "Compose 文件缺失，已从备份完整恢复")
+		logger.add("warn", "Compose 文件缺失，已从备份恢复")
 	} else {
 		out, added, err := compose.AddBindings(current, svc.ComposeService, removals)
 		if err != nil {
-			if backupFile == "" {
-				restoreGateway()
-				if proxyRemoved {
-					_ = admin.UpdateConfig(ctx, origConfig)
-				}
-				return fmt.Errorf("无法安全地恢复端口声明: %w", err)
-			}
-			logger.add("warn", "无法定点恢复端口（"+err.Error()+"），改用完整备份恢复；若该 Compose 文件还管理着其他服务，请检查端口")
-			if err := compose.RestoreFile(composeFile, backupFile); err != nil {
-				revertManaged()
-				return fmt.Errorf("完整备份恢复失败: %w", err)
-			}
-		} else if len(added) > 0 {
+			return failWithRevert(fmt.Errorf("无法安全地定点恢复端口（未覆盖原文件）: %w；请手动将 %s 加回 %s",
+				err, portsText(removals), composeFile))
+		}
+		if len(added) > 0 {
 			mode := os.FileMode(0o644)
 			if st, statErr := os.Stat(composeFile); statErr == nil {
 				mode = st.Mode()
 			}
 			if err := compose.WriteAtomic(composeFile, out, mode); err != nil {
-				revertManaged()
-				return fmt.Errorf("写入 Compose 文件失败: %w", err)
+				return failWithRevert(fmt.Errorf("写入 Compose 文件失败: %w", err))
 			}
 			logger.add("info", fmt.Sprintf("已恢复端口声明: %s", portsText(removals)))
 		} else {
@@ -296,20 +324,28 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 		}
 	}
 
-	// 4. Recreate the service and verify.
+	// 4. Recreate, then verify both container state and published ports.
 	if err := cli.UpService(ctx, svc.ComposeProject, composeFile, workDir, svc.ComposeService); err != nil {
-		revertManaged()
-		return fmt.Errorf("重建服务失败，已回退到托管状态: %w", err)
+		return failWithRevert(fmt.Errorf("重建服务失败: %w", err))
 	}
-	if _, err := e.waitContainerRunning(ctx, svc.ContainerName, time.Duration(maxInt(svc.StartTimeoutSecs, 30))*time.Second); err != nil {
-		revertManaged()
-		return fmt.Errorf("服务未恢复运行，已回退到托管状态: %w", err)
+	ins, err := e.waitContainerRunning(ctx, svc.ContainerName, time.Duration(maxInt(svc.StartTimeoutSecs, 30))*time.Second)
+	if err != nil {
+		return failWithRevert(fmt.Errorf("服务未恢复运行: %w", err))
+	}
+	for _, b := range svc.Bindings {
+		if !containerPublishes(ins, model.PortBinding{
+			HostIP: b.HostIP, HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
+		}) {
+			return failWithRevert(fmt.Errorf("容器未重新发布原始端口 %s:%d", hostLabel(b.HostIP), b.HostPort))
+		}
 	}
 	if err := e.testBindings(ctx, svc.Bindings); err != nil {
-		logger.add("warn", "原端口连通性测试未通过: "+err.Error())
+		return failWithRevert(fmt.Errorf("原端口连通性测试失败: %w", err))
 	}
+	logger.add("info", "原端口连通性测试通过")
+
 	if err := e.store.DeleteService(svc.ID); err != nil {
-		return fmt.Errorf("删除托管记录失败: %w", err)
+		return fmt.Errorf("删除托管记录失败（端口已恢复）: %w", err)
 	}
 	return nil
 }

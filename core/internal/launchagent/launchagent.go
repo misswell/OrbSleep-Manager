@@ -61,6 +61,8 @@ func Plist(binary, dataDir string) []byte {
 	<string>Background</string>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
+	<key>Umask</key>
+	<integer>63</integer>
 	<key>StandardOutPath</key>
 	<string>%s</string>
 	<key>StandardErrorPath</key>
@@ -94,9 +96,10 @@ func Install(binary, dataDir string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(dataDir, "logs"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dataDir, "logs"), 0o700); err != nil {
 		return err
 	}
+	_ = os.Chmod(filepath.Join(dataDir, "logs"), 0o700)
 	// bootout first so changes to the plist take effect.
 	_ = bootout(path)
 	if err := os.WriteFile(path, Plist(binary, dataDir), 0o644); err != nil {

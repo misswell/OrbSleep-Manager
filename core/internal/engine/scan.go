@@ -27,7 +27,6 @@ func (e *Engine) Scan(ctx context.Context) (model.ScanResult, error) {
 	}
 	opts := scan.Options{
 		ExcludeImagePatterns: e.settings.Get().ExcludeImagePatterns,
-		EnableLowPortHelper:  e.settings.Get().EnableLowPortHelper,
 		ProxyContainerName:   proxy.ContainerName,
 	}
 	services, _ := e.store.ListServices()
@@ -153,7 +152,6 @@ func (e *Engine) Inspect(ctx context.Context, id string) (model.Container, map[s
 	}
 	cont := scan.Convert(ins, scan.Options{
 		ExcludeImagePatterns: e.settings.Get().ExcludeImagePatterns,
-		EnableLowPortHelper:  e.settings.Get().EnableLowPortHelper,
 		ProxyContainerName:   proxy.ContainerName,
 	})
 	services, _ := e.store.ListServices()

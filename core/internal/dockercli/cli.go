@@ -116,7 +116,7 @@ func (r *Runner) UpService(ctx context.Context, project, file, workdir, service 
 // ProxyUp starts (or recreates) the OrbSleep proxy compose project.
 func (r *Runner) ProxyUp(ctx context.Context, file string) error {
 	_, err := r.run(ctx, filepath.Dir(file), 5*time.Minute,
-		"compose", "-p", "orbsleep-proxy", "-f", file, "up", "-d", "--remove-orphans")
+		"compose", "-p", "orbsleep-proxy", "-f", file, "up", "-d")
 	return err
 }
 

@@ -17,7 +17,6 @@ import (
 // Options tunes classification.
 type Options struct {
 	ExcludeImagePatterns []string
-	EnableLowPortHelper  bool
 	ProxyContainerName   string
 }
 
@@ -203,12 +202,13 @@ func Classify(c *model.Container, opts Options) model.Classification {
 			block("unknown_container_port", "无法确定容器内部端口")
 			continue
 		}
-		if p.HostPort < 1024 && !opts.EnableLowPortHelper {
-			block("low_port", fmt.Sprintf("宿主机端口 %d 低于 1024，需要特权端口助手（当前未启用）", p.HostPort))
+		if p.HostPort < 1024 {
+			block("low_port", fmt.Sprintf("宿主机端口 %d 低于 1024；特权端口助手尚未实现", p.HostPort))
 			continue
 		}
 		if p.HostIP == "::1" || p.HostIP == "::" || strings.Contains(p.HostIP, ":") {
-			review("ipv6_binding", fmt.Sprintf("端口 %d 使用 IPv6 绑定（%s），第一版优先支持 IPv4", p.HostPort, p.HostIP))
+			block("ipv6_binding", fmt.Sprintf("端口 %d 使用 IPv6 绑定（%s），当前端口网关仅支持 IPv4", p.HostPort, p.HostIP))
+			continue
 		}
 		if p.HostIP == "" {
 			review("all_interfaces", fmt.Sprintf("端口 %d 绑定所有网卡，接入后仍会保持；请确认 OrbStack 的 LAN 暴露策略", p.HostPort))
@@ -231,7 +231,10 @@ func Classify(c *model.Container, opts Options) model.Classification {
 		info("healthcheck", "容器配置了健康检查，代理会在冷启动时等待其就绪")
 	}
 	for _, p := range c.Ports {
-		if p.Protocol != "tcp" || p.HostPort <= 0 || p.HostPort < 1024 && !opts.EnableLowPortHelper {
+		if p.Protocol != "tcp" || p.HostPort <= 0 || p.HostPort < 1024 {
+			continue
+		}
+		if strings.Contains(p.HostIP, ":") {
 			continue
 		}
 		if p.ContainerPort <= 0 {

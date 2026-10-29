@@ -34,7 +34,7 @@ type Engine struct {
 
 	mu         sync.Mutex
 	docker     *dockerx.Client
-	cli        *dockercli.Runner
+	cli        composeCLI
 	dockerErr  string
 	lastDetect time.Time
 	lastErr    model.LastError
@@ -61,9 +61,10 @@ type Engine struct {
 
 // New opens the state database and prepares the engine.
 func New(version, dataDir string) (*Engine, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(dataDir, 0o700)
 	store, err := state.Open(filepath.Join(dataDir, "state.sqlite"))
 	if err != nil {
 		return nil, fmt.Errorf("打开状态数据库失败: %w", err)
@@ -90,12 +91,13 @@ func New(version, dataDir string) (*Engine, error) {
 		e.activity[serviceID] = at
 		e.activityMu.Unlock()
 	})
-	if err := os.MkdirAll(filepath.Join(dataDir, "proxy"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dataDir, "proxy"), 0o700); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(e.settings.Get().BackupDir, 0o700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(e.settings.Get().BackupDir, 0o700)
 	return e, nil
 }
 
@@ -105,9 +107,10 @@ func (e *Engine) Start() {
 	// Restore host port listeners before the API accepts requests, so a daemon
 	// restart does not leave a window where managed services are unreachable.
 	e.reconcile()
-	e.wg.Add(2)
+	e.wg.Add(3)
 	go e.reconcileLoop()
 	go e.eventsLoop()
+	go e.retentionLoop()
 }
 
 // Close shuts the daemon down.
@@ -192,6 +195,62 @@ func (e *Engine) Status() model.Status {
 	st.LastError = lastErr
 	st.Proxy = e.proxyStatus(ctx)
 	return st
+}
+
+// proxyInstalled reports whether the OrbSleep proxy container exists.
+func (e *Engine) proxyInstalled() (bool, error) {
+	composeExists := false
+	if _, err := os.Stat(e.proxyComposePath()); err == nil {
+		composeExists = true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := e.dockerClient(ctx)
+	if err != nil {
+		return composeExists, err
+	}
+	_, ierr := c.InspectContainer(ctx, proxy.ContainerName)
+	if ierr == nil {
+		return true, nil
+	}
+	if dockerx.IsErrNotFound(ierr) {
+		return false, nil
+	}
+	return false, ierr
+}
+
+// validateContainerIPDialMode only accepts container_ip mode when the macOS
+// host can actually reach the proxy container's internal listener.
+func (e *Engine) validateContainerIPDialMode() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	ip := e.proxyContainerIP(ctx)
+	if ip == "" {
+		return errors.New("无法获取代理容器 IP，不能启用 container_ip 模式")
+	}
+	d := netDialer(3 * time.Second)
+	// Probe the exact ports the gateway would use. Without managed services,
+	// fall back to the proxy web listener as a basic routing check.
+	services, _ := e.store.ListServices()
+	probed := 0
+	for _, svc := range services {
+		for _, b := range svc.Bindings {
+			conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ip, b.ProxyPort))
+			if err != nil {
+				return fmt.Errorf("无法直连代理容器 IP 的端口 %s:%d: %v；请保持 published 模式", ip, b.ProxyPort, err)
+			}
+			conn.Close()
+			probed++
+		}
+	}
+	if probed == 0 {
+		conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:8080", ip))
+		if err != nil {
+			return fmt.Errorf("当前环境无法直连代理容器 IP（%s:8080）: %v；请保持 published 模式", ip, err)
+		}
+		conn.Close()
+	}
+	return nil
 }
 
 // InstallAgent installs the LaunchAgent pointing at the running daemon binary.
@@ -282,6 +341,26 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 	if s.AdminPort == s.WebPort {
 		return s, errors.New("代理管理端口与状态端口不能相同")
 	}
+	if s.AdminPort >= s.ProxyPortStart && s.AdminPort <= s.ProxyPortEnd ||
+		s.WebPort >= s.ProxyPortStart && s.WebPort <= s.ProxyPortEnd {
+		return s, errors.New("管理端口/状态端口不能落在代理发布端口范围内")
+	}
+	if s.EnableLowPortHelper {
+		return s, errors.New("低端口特权助手尚未实现，无法启用；低于 1024 的端口仍会被排除")
+	}
+	if s.ProxyDialMode == "container_ip" {
+		if err := e.validateContainerIPDialMode(); err != nil {
+			return s, err
+		}
+	}
+	old := e.settings.Get()
+	portsChanged := old.AdminPort != s.AdminPort || old.WebPort != s.WebPort ||
+		old.ProxyPortStart != s.ProxyPortStart || old.ProxyPortEnd != s.ProxyPortEnd
+	if portsChanged {
+		if installed, _ := e.proxyInstalled(); installed {
+			return s, errors.New("代理已安装：修改管理端口/状态端口/端口范围会导致管理接口失联。请先卸载代理（docker compose -p orbsleep-proxy down）后再修改，并重新运行 proxy-setup")
+		}
+	}
 	// Refuse a range change that would orphan already managed services.
 	services, _ := e.store.ListServices()
 	for _, svc := range services {
@@ -360,7 +439,7 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 	return c, nil
 }
 
-func (e *Engine) cliRunner() (*dockercli.Runner, error) {
+func (e *Engine) cliRunner() (composeCLI, error) {
 	e.mu.Lock()
 	cli := e.cli
 	c := e.docker

@@ -14,7 +14,7 @@
 | 4 | 代理能启动 / 停止业务容器 | phase0 脚本的「停止后唤醒」「空闲停止」 | ✅ |
 | 5 | macOS 原生 TCP 网关可转发到代理 | `internal/gateway` 单测（本机真实 TCP） | ✅ |
 | 6 | 修改 Compose 后可安全释放/接管端口 | Compose 定点修改单测 + phase0 端到端 | ✅ |
-| 7 | macOS 直连代理容器 IP | `proxyDialMode=container_ip` | ❌ `no route to host`（改用发布端口） |
+| 7 | macOS 直连代理容器 IP | `proxyDialMode=container_ip` | ⚠️ 不稳定（曾出现 `no route to host`）；默认用发布端口，切换前逐端口探测 |
 
 ## 运行
 

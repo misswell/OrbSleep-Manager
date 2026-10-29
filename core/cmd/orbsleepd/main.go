@@ -15,9 +15,11 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 func main() {
+	// Keep state, logs and backups readable by the current user only.
+	syscall.Umask(0o077)
 	var (
 		dataDir = flag.String("data-dir", "", "应用数据目录（默认 ~/Library/Application Support/OrbSleep）")
 		socket  = flag.String("socket", "", "Unix socket 路径（默认 <data-dir>/daemon.sock）")

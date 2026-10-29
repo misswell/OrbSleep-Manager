@@ -78,9 +78,9 @@ func TestLowPortNeedsHelper(t *testing.T) {
 	if c.Classification.Verdict != "excluded" || !hasReason(c.Classification, "low_port") {
 		t.Fatalf("verdict = %s reasons=%+v", c.Classification.Verdict, c.Classification.Reasons)
 	}
-	c = Convert(ins, Options{EnableLowPortHelper: true})
-	if c.Classification.Verdict == "excluded" {
-		t.Fatalf("helper enabled but still excluded: %+v", c.Classification.Reasons)
+	c = Convert(ins, Options{})
+	if c.Classification.Verdict != "excluded" || !hasReason(c.Classification, "low_port") {
+		t.Fatalf("low port must stay excluded until a privileged helper exists: %+v", c.Classification.Reasons)
 	}
 }
 
@@ -93,6 +93,15 @@ func TestAllInterfacesNeedsReview(t *testing.T) {
 	}
 	if len(c.Classification.Warnings) == 0 || c.Classification.Warnings[0].Code != "all_interfaces" {
 		t.Fatalf("warnings = %+v", c.Classification.Warnings)
+	}
+}
+
+func TestIPv6BindingExcluded(t *testing.T) {
+	ins := baseInspect(t)
+	ins.HostConfig.PortBindings = map[string][]dockerx.PortBinding{"80/tcp": {{HostIP: "::1", HostPort: "18080"}}}
+	c := Convert(ins, Options{})
+	if c.Classification.Verdict != "excluded" || !hasReason(c.Classification, "ipv6_binding") {
+		t.Fatalf("verdict = %s reasons=%+v", c.Classification.Verdict, c.Classification.Reasons)
 	}
 }
 

@@ -21,7 +21,10 @@ make phase0         # 需要 OrbStack；会创建/清理测试 Compose 项目
 - 不切换用户的全局 Docker Context；所有 docker 命令显式使用检测到的 socket（`DOCKER_HOST`）。
 - 不执行 `docker system prune`，不删除数据卷、镜像、业务文件。
 - 修改 Compose 必须：备份 → 定点编辑（保留注释/顺序/其它服务）→ YAML 重解析 → `docker compose config --format json` 只允许端口差异 → 失败回滚。
-- 默认 `proxyDialMode=published`：代理端口范围发布到 `127.0.0.1`。实测 macOS 无法直连 OrbStack 容器 IP（`no route to host`），不要改回默认 `container_ip`。
+- 默认 `proxyDialMode=published`：代理端口范围发布到 `127.0.0.1`。实测 macOS 直连 OrbStack 容器 IP 不可靠（曾出现 `no route to host`）；`container_ip` 仅在逐端口探测通过后才允许启用。
+- 接入前必须读取并校验代理配置基线；每个撤销动作必须在写入前登记；回滚只有在容器重建并验证原端口发布成功后才能删除托管记录。
+- 恢复时文件存在则只用 `AddBindings` 定点加回端口，禁止用完整备份覆盖；连通性失败要回退托管并报失败。
+- 代理安装后端口设置锁定；重复安装必须幂等；失败要恢复旧设置与旧代理。不要加 `--remove-orphans`。
 - 共享 Compose 文件：接入时用 `fileStates` 串联修改；恢复时用 `compose.AddBindings` 只加回本服务端口，禁止整体还原备份（会破坏其他托管服务）。
 - 守护进程首次 reconcile 必须在 API 就绪前同步完成（保证重启后端口立刻恢复）。
 

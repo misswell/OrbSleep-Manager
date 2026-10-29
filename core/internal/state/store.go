@@ -36,6 +36,11 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Keep the database (and its WAL sidecars) readable by the current user only.
+	_ = os.Chmod(path, 0o600)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		_ = os.Chmod(path+suffix, 0o600)
+	}
 	return s, nil
 }
 
@@ -268,6 +273,12 @@ func (s *Store) GetMeta(key string) (string, bool) {
 // SetMeta writes an internal metadata value.
 func (s *Store) SetMeta(key, value string) error {
 	_, err := s.db.Exec(`INSERT INTO meta (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	return err
+}
+
+// DeleteMeta removes an internal metadata value.
+func (s *Store) DeleteMeta(key string) error {
+	_, err := s.db.Exec(`DELETE FROM meta WHERE key=?`, key)
 	return err
 }
 

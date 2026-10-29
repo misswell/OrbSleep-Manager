@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"orbsleep/internal/compose"
-	"orbsleep/internal/dockercli"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/scan"
@@ -101,7 +100,14 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 		})
 	}
 
-	cli, _ := e.cliRunner()
+	cli, cliErr := e.cliRunner()
+	if cliErr != nil {
+		plan.Blockers = append(plan.Blockers, model.Reason{
+			Code:     "compose_cli_unavailable",
+			Message:  "Docker Compose CLI 不可用，无法安全校验和重建服务: " + cliErr.Error(),
+			Severity: "blocker",
+		})
+	}
 	published, _ := e.proxyPublishedPorts(ctx)
 	seen := map[string]bool{}
 	entry := &planEntry{createdAt: time.Now(), allowLan: allowLan}
@@ -119,7 +125,6 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 		}
 		cont := scan.Convert(ins, scan.Options{
 			ExcludeImagePatterns: s.ExcludeImagePatterns,
-			EnableLowPortHelper:  s.EnableLowPortHelper,
 			ProxyContainerName:   proxy.ContainerName,
 		})
 		if name, ok := managed[cont.ID]; ok {
@@ -176,7 +181,7 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 	return plan, nil
 }
 
-func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *model.Plan, used *map[int]bool, rangeStart, rangeEnd int, cli *dockercli.Runner, published map[int]bool) (*model.PlanItem, *planSnapshot, []model.Reason) {
+func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *model.Plan, used *map[int]bool, rangeStart, rangeEnd int, cli composeCLI, published map[int]bool) (*model.PlanItem, *planSnapshot, []model.Reason) {
 	var blockers []model.Reason
 	block := func(code, msg string) {
 		blockers = append(blockers, model.Reason{Code: code, Message: msg, Severity: "blocker"})
@@ -196,11 +201,13 @@ func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *
 		block("compose_file_unreadable", "无法读取 Compose 文件: "+err.Error())
 		return nil, nil, blockers
 	}
-	if cli != nil {
-		if _, err := cli.ComposeConfig(ctx, cont.ComposeProject, file, cont.ComposeWorkingDir); err != nil {
-			block("compose_invalid", "Compose 有效配置校验失败（可能缺少 .env 变量或存在语法错误）: "+err.Error())
-			return nil, nil, blockers
-		}
+	if cli == nil {
+		block("compose_cli_unavailable", "Docker Compose CLI 不可用，无法校验 Compose 配置")
+		return nil, nil, blockers
+	}
+	if _, err := cli.ComposeConfig(ctx, cont.ComposeProject, file, cont.ComposeWorkingDir); err != nil {
+		block("compose_invalid", "Compose 有效配置校验失败（可能缺少 .env 变量或存在语法错误）: "+err.Error())
+		return nil, nil, blockers
 	}
 	decls, err := compose.ReadDecls(content, cont.ComposeService)
 	if err != nil {

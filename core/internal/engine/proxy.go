@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,53 +156,76 @@ func (e *Engine) runProxySetup(op model.Operation) {
 		logger.finish("failed", err.Error())
 		return
 	}
-	if ins, err := c.InspectContainer(ctx, proxy.ContainerName); err == nil {
-		if proj := ins.Config.Labels["com.docker.compose.project"]; proj != "orbsleep-proxy" {
+	old := e.settings.Get()
+	var ins *dockerx.ContainerInspect
+	if i, err := c.InspectContainer(ctx, proxy.ContainerName); err == nil {
+		if proj := i.Config.Labels["com.docker.compose.project"]; proj != "orbsleep-proxy" {
 			logger.finish("failed", fmt.Sprintf("已存在同名容器 %s（Compose 项目 %q），为避免覆盖用户配置已停止；请先改名或移除该容器", proxy.ContainerName, proj))
 			return
 		}
+		ins = i
 	}
-	s := e.settings.Get()
+	owned := proxyOwnedHostPorts(ins)
+	next := old
 
-	// Pick free management ports.
-	if !proxy.PortFree("127.0.0.1", s.AdminPort) || s.AdminPort == s.WebPort {
-		if p, err := proxy.PickFreePort(47811); err == nil {
-			s.AdminPort = p
-		}
+	// Select the published range, treating ports already published by our own
+	// proxy as reusable (a running proxy legitimately owns them).
+	size := next.ProxyPortEnd - next.ProxyPortStart + 1
+	if size <= 0 {
+		logger.finish("failed", "代理端口范围无效")
+		return
 	}
-	if !proxy.PortFree("127.0.0.1", s.WebPort) || s.WebPort == s.AdminPort {
-		if p, err := proxy.PickFreePort(47810); err == nil {
-			s.WebPort = p
-		}
-	}
-	// Ensure the whole published range is free.
-	size := s.ProxyPortEnd - s.ProxyPortStart + 1
-	if !rangeFree(s.ProxyPortStart, s.ProxyPortEnd) {
-		base, end, ok := findFreeRange(size)
+	if !rangeUsable(next.ProxyPortStart, next.ProxyPortEnd, owned) {
+		base, end, ok := findFreeRangeExcluding(size, owned, map[int]bool{next.AdminPort: true, next.WebPort: true})
 		if !ok {
 			logger.finish("failed", "找不到可用的代理端口范围，请在设置中手动指定")
 			return
 		}
-		logger.add("warn", fmt.Sprintf("端口范围 %d-%d 已被占用，改用 %d-%d", s.ProxyPortStart, s.ProxyPortEnd, base, end))
-		s.ProxyPortStart, s.ProxyPortEnd = base, end
+		logger.add("warn", fmt.Sprintf("端口范围 %d-%d 不可用，改用 %d-%d", next.ProxyPortStart, next.ProxyPortEnd, base, end))
+		next.ProxyPortStart, next.ProxyPortEnd = base, end
 	}
+	rangeSet := portRangeSet(next.ProxyPortStart, next.ProxyPortEnd)
+
+	// Allocate management ports jointly so they can never collide.
+	adminPort, err := chooseManagedPort(next.AdminPort, owned, mergeSets(rangeSet, next.WebPort))
+	if err != nil {
+		logger.finish("failed", "分配代理管理端口失败: "+err.Error())
+		return
+	}
+	webPort, err := chooseManagedPort(next.WebPort, owned, mergeSets(rangeSet, adminPort))
+	if err != nil {
+		logger.finish("failed", "分配代理状态端口失败: "+err.Error())
+		return
+	}
+	next.AdminPort, next.WebPort = adminPort, webPort
+
 	// Never silently change the range while services still use ports from it.
 	existing, _ := e.store.ListServices()
 	for _, svc := range existing {
 		for _, b := range svc.Bindings {
-			if b.ProxyPort < s.ProxyPortStart || b.ProxyPort > s.ProxyPortEnd {
+			if b.ProxyPort < next.ProxyPortStart || b.ProxyPort > next.ProxyPortEnd {
 				logger.finish("failed", fmt.Sprintf("端口范围 %d-%d 不包含已托管服务 %s 的代理端口 %d；请先恢复该服务",
-					s.ProxyPortStart, s.ProxyPortEnd, svc.ContainerName, b.ProxyPort))
+					next.ProxyPortStart, next.ProxyPortEnd, svc.ContainerName, b.ProxyPort))
 				return
 			}
 		}
 	}
-	if err := e.settings.Save(s); err != nil {
-		logger.finish("failed", "保存设置失败: "+err.Error())
+
+	samePorts := old.ProxyPortStart == next.ProxyPortStart && old.ProxyPortEnd == next.ProxyPortEnd &&
+		old.AdminPort == next.AdminPort && old.WebPort == next.WebPort
+	if ins != nil && ins.State.Running && samePorts && e.proxyAdminReachable(ctx, next.AdminPort) {
+		if err := e.syncProxyConfig(ctx, true); err != nil {
+			logger.finish("failed", "代理正在运行，但同步服务配置失败: "+err.Error())
+			return
+		}
+		logger.add("info", "代理已就绪且端口未变化，无需重建（重复执行安全）")
+		logger.finish("succeeded", "")
+		e.triggerReconcile()
 		return
 	}
-	logger.add("info", fmt.Sprintf("代理端口范围 %d-%d，管理 API 127.0.0.1:%d，状态页 127.0.0.1:%d",
-		s.ProxyPortStart, s.ProxyPortEnd, s.AdminPort, s.WebPort))
+	if ins != nil && ins.State.Running && samePorts {
+		logger.add("warn", "代理容器在运行但管理接口不可达，将重建代理容器")
+	}
 
 	key, err := proxy.APIKey(e.dataDir)
 	if err != nil {
@@ -220,22 +244,52 @@ func (e *Engine) runProxySetup(op model.Operation) {
 			return
 		}
 	}
-	if err := os.WriteFile(e.proxyComposePath(), proxy.ComposeFile(s, key, cfgDir), 0o600); err != nil {
+	composePath := e.proxyComposePath()
+	oldCompose, composeReadErr := os.ReadFile(composePath)
+	hadCompose := composeReadErr == nil
+	if err := os.WriteFile(composePath, proxy.ComposeFile(next, key, cfgDir), 0o600); err != nil {
 		logger.finish("failed", "写入代理 Compose 文件失败: "+err.Error())
 		return
 	}
+
+	restore := func(reason error) {
+		logger.add("warn", "恢复代理原有设置: "+reason.Error())
+		_ = e.settings.Save(old)
+		if hadCompose {
+			_ = os.WriteFile(composePath, oldCompose, 0o600)
+		} else {
+			_ = os.Remove(composePath)
+		}
+		if hadCompose {
+			rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			if uerr := cli.ProxyUp(rctx, composePath); uerr != nil {
+				logger.add("error", "恢复旧代理容器失败: "+uerr.Error())
+			} else if werr := e.waitProxyAdminAt(rctx, old.AdminPort, 90*time.Second); werr != nil {
+				logger.add("error", "旧代理管理接口未恢复: "+werr.Error())
+			}
+			rcancel()
+		}
+		logger.finish("failed", reason.Error())
+	}
+
+	logger.add("info", fmt.Sprintf("代理端口范围 %d-%d，管理 API 127.0.0.1:%d，状态页 127.0.0.1:%d",
+		next.ProxyPortStart, next.ProxyPortEnd, next.AdminPort, next.WebPort))
 	logger.add("info", "拉取并启动代理容器…")
-	if err := cli.ProxyUp(ctx, e.proxyComposePath()); err != nil {
-		logger.finish("failed", "启动代理失败: "+err.Error())
+	if err := cli.ProxyUp(ctx, composePath); err != nil {
+		restore(fmt.Errorf("启动代理失败: %w", err))
 		return
 	}
 	logger.add("info", "等待代理管理接口就绪…")
-	if err := e.waitProxyAdmin(ctx, 90*time.Second); err != nil {
-		logger.finish("failed", err.Error())
+	if err := e.waitProxyAdminAt(ctx, next.AdminPort, 90*time.Second); err != nil {
+		restore(err)
+		return
+	}
+	if err := e.settings.Save(next); err != nil {
+		restore(fmt.Errorf("保存设置失败: %w", err))
 		return
 	}
 	if err := e.syncProxyConfig(ctx, true); err != nil {
-		logger.finish("failed", "写入代理服务配置失败: "+err.Error())
+		restore(fmt.Errorf("写入代理服务配置失败: %w", err))
 		return
 	}
 	logger.add("info", "Lazy TCP Proxy 已就绪")
@@ -243,8 +297,36 @@ func (e *Engine) runProxySetup(op model.Operation) {
 	e.triggerReconcile()
 }
 
-func (e *Engine) waitProxyAdmin(ctx context.Context, timeout time.Duration) error {
-	admin, err := e.adminClient()
+// proxyAdminReachable checks the admin API on a specific local port.
+func (e *Engine) proxyAdminReachable(ctx context.Context, port int) bool {
+	admin, err := e.proxyAdminAt(port)
+	if err != nil {
+		return false
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return admin.Ping(pingCtx) == nil
+}
+
+func (e *Engine) proxyAdminAt(port int) (*proxy.AdminClient, error) {
+	e.mu.Lock()
+	key := e.proxyKey
+	e.mu.Unlock()
+	if key == "" {
+		k, err := proxy.APIKey(e.dataDir)
+		if err != nil {
+			return nil, err
+		}
+		e.mu.Lock()
+		e.proxyKey = k
+		e.mu.Unlock()
+		key = k
+	}
+	return proxy.NewAdminClient(fmt.Sprintf("127.0.0.1:%d", port), key), nil
+}
+
+func (e *Engine) waitProxyAdminAt(ctx context.Context, port int, timeout time.Duration) error {
+	admin, err := e.proxyAdminAt(port)
 	if err != nil {
 		return err
 	}
@@ -258,7 +340,7 @@ func (e *Engine) waitProxyAdmin(ctx context.Context, timeout time.Duration) erro
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("代理管理接口在 %s 内不可达: %v", timeout, last)
+			return fmt.Errorf("代理管理接口 127.0.0.1:%d 在 %s 内不可达: %v", port, timeout, last)
 		}
 		select {
 		case <-ctx.Done():
@@ -266,6 +348,117 @@ func (e *Engine) waitProxyAdmin(ctx context.Context, timeout time.Duration) erro
 		case <-time.After(1 * time.Second):
 		}
 	}
+}
+
+// proxyOwnedHostPorts returns host ports currently published by the proxy
+// container (including ranges), so setup can treat them as its own.
+func proxyOwnedHostPorts(ins *dockerx.ContainerInspect) map[int]bool {
+	out := map[int]bool{}
+	if ins == nil {
+		return out
+	}
+	add := func(hp string) {
+		hp = strings.TrimSpace(hp)
+		if hp == "" {
+			return
+		}
+		if i := strings.Index(hp, "-"); i > 0 {
+			start, err1 := strconv.Atoi(hp[:i])
+			end, err2 := strconv.Atoi(hp[i+1:])
+			if err1 == nil && err2 == nil && start > 0 && end >= start && end <= 65535 {
+				for p := start; p <= end; p++ {
+					out[p] = true
+				}
+			}
+			return
+		}
+		if p, err := strconv.Atoi(hp); err == nil && p > 0 {
+			out[p] = true
+		}
+	}
+	for _, bindings := range ins.NetworkSettings.Ports {
+		for _, b := range bindings {
+			add(b.HostPort)
+		}
+	}
+	for _, bindings := range ins.HostConfig.PortBindings {
+		for _, b := range bindings {
+			add(b.HostPort)
+		}
+	}
+	return out
+}
+
+func rangeUsable(start, end int, owned map[int]bool) bool {
+	if start <= 0 || end < start {
+		return false
+	}
+	for p := start; p <= end; p++ {
+		if owned[p] {
+			continue
+		}
+		if !proxy.PortFree("127.0.0.1", p) {
+			return false
+		}
+	}
+	return true
+}
+
+func findFreeRangeExcluding(size int, owned, reserved map[int]bool) (int, int, bool) {
+	if size <= 0 {
+		size = 100
+	}
+	for base := 20000; base+size-1 <= 40000; base += size {
+		ok := true
+		for p := base; p < base+size; p++ {
+			if reserved[p] || owned[p] || !proxy.PortFree("127.0.0.1", p) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return base, base + size - 1, true
+		}
+	}
+	return 0, 0, false
+}
+
+// chooseManagedPort keeps preferred when it is free or already owned by our
+// proxy, otherwise picks the next free port not reserved for other purposes.
+func chooseManagedPort(preferred int, owned, reserved map[int]bool) (int, error) {
+	if preferred > 0 && !reserved[preferred] && (owned[preferred] || proxy.PortFree("127.0.0.1", preferred)) {
+		return preferred, nil
+	}
+	for p := preferred; p < preferred+200 && p <= 65535; p++ {
+		if reserved[p] || owned[p] {
+			continue
+		}
+		if proxy.PortFree("127.0.0.1", p) {
+			return p, nil
+		}
+	}
+	return 0, fmt.Errorf("从 %d 起找不到空闲端口", preferred)
+}
+
+func portRangeSet(start, end int) map[int]bool {
+	out := map[int]bool{}
+	for p := start; p <= end; p++ {
+		out[p] = true
+	}
+	return out
+}
+
+func mergeSets(base map[int]bool, ports ...int) map[int]bool {
+	out := map[int]bool{}
+	for p := range base {
+		out[p] = true
+	}
+	for _, p := range ports {
+		if p > 0 {
+			out[p] = true
+		}
+	}
+	return out
 }
 
 func (e *Engine) syncProxyConfig(ctx context.Context, force bool) error {
@@ -369,4 +562,68 @@ func findFreeRange(size int) (int, int, bool) {
 		}
 	}
 	return 0, 0, false
+}
+
+// validateProxyConfig rejects a baseline that cannot be safely restored.
+func validateProxyConfig(cfg proxy.Config) error {
+	seen := map[string]bool{}
+	for _, svc := range cfg.Services {
+		if strings.TrimSpace(svc.Name) == "" {
+			return errors.New("代理配置中存在空服务名")
+		}
+		if seen[svc.Name] {
+			return fmt.Errorf("代理配置中存在重复服务 %q", svc.Name)
+		}
+		seen[svc.Name] = true
+		if len(svc.Ports) == 0 {
+			return fmt.Errorf("代理配置中服务 %q 没有监听端口", svc.Name)
+		}
+		for _, p := range svc.Ports {
+			parts := strings.Split(p, ":")
+			if len(parts) != 2 {
+				return fmt.Errorf("服务 %q 的端口声明无效: %q", svc.Name, p)
+			}
+			listen, err1 := strconv.Atoi(parts[0])
+			target, err2 := strconv.Atoi(parts[1])
+			if err1 != nil || err2 != nil || listen < 1 || listen > 65535 || target < 1 || target > 65535 {
+				return fmt.Errorf("服务 %q 的端口声明无效: %q", svc.Name, p)
+			}
+		}
+	}
+	return nil
+}
+
+// putProxyConfigVerified writes a config and re-reads it. A failure to read
+// back does not mean the write did not happen; callers must treat this as an
+// uncertain state and attempt a restore.
+func (e *Engine) putProxyConfigVerified(ctx context.Context, admin *proxy.AdminClient, cfg proxy.Config) error {
+	if err := admin.UpdateConfig(ctx, cfg); err != nil {
+		return err
+	}
+	got, err := admin.GetConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("写入后读取代理配置失败: %w", err)
+	}
+	if !proxyConfigEqual(got, cfg) {
+		return errors.New("代理配置写入后校验不一致")
+	}
+	return nil
+}
+
+// verifyProxyService confirms one service entry exists with the expected ports.
+func (e *Engine) verifyProxyService(ctx context.Context, admin *proxy.AdminClient, want proxy.ServiceConfig) error {
+	got, err := admin.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	svc, ok := got.Service(want.Name)
+	if !ok {
+		return fmt.Errorf("代理中没有服务 %q", want.Name)
+	}
+	sort.Strings(svc.Ports)
+	sort.Strings(want.Ports)
+	if strings.Join(svc.Ports, ",") != strings.Join(want.Ports, ",") {
+		return fmt.Errorf("代理中服务 %q 的端口为 %v，期望 %v", want.Name, svc.Ports, want.Ports)
+	}
+	return nil
 }

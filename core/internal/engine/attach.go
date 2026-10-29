@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,15 +23,27 @@ import (
 type attachError struct {
 	Err            error
 	RollbackFailed bool
+	Detail         string
 }
 
-func (a *attachError) Error() string { return a.Err.Error() }
+func (a *attachError) Error() string {
+	if a.Detail != "" {
+		return a.Err.Error() + "（" + a.Detail + "）"
+	}
+	return a.Err.Error()
+}
 func (a *attachError) Unwrap() error { return a.Err }
 
 type appliedItem struct {
-	snap       *planSnapshot
-	serviceID  string
-	backupPath string
+	snap           *planSnapshot
+	serviceID      string
+	backupPath     string
+	managedContent []byte
+}
+
+type undoStep struct {
+	name string
+	fn   func() error
 }
 
 // ApplyPlan starts executing a plan asynchronously and returns an operation id.
@@ -88,18 +102,33 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("接入计划 %s 开始执行（%d 个容器）", plan.ID, len(items)))
 
-	admin, adminErr := e.adminClient()
-	var baseConfig proxy.Config
-	if adminErr == nil {
-		if cfg, err := admin.GetConfig(ctx); err == nil {
-			baseConfig = cfg
-		}
+	// A complete, validated baseline snapshot is mandatory. Never start
+	// modifying anything if it cannot be read: rollback must be able to
+	// restore exactly what existed before.
+	admin, err := e.adminClient()
+	if err != nil {
+		logger.finish("failed", "无法连接代理管理接口，已终止（未做任何修改）: "+err.Error())
+		e.setLastError("接入未执行: " + err.Error())
+		return
 	}
+	baseCfg, err := admin.GetConfig(ctx)
+	if err != nil {
+		logger.finish("failed", "读取代理基线配置失败，已终止（未做任何修改）: "+err.Error())
+		e.setLastError("接入未执行: 无法读取代理基线配置")
+		return
+	}
+	if err := validateProxyConfig(baseCfg); err != nil {
+		logger.finish("failed", "代理基线配置无效，已终止（未做任何修改）: "+err.Error())
+		e.setLastError("接入未执行: 代理基线配置无效")
+		return
+	}
+	logger.add("info", fmt.Sprintf("代理基线已校验（%d 个既有服务）", len(baseCfg.Services)))
+
 	fileStates := map[string][]byte{}
 	var applied []appliedItem
 	for i, snap := range items {
 		logger.add("info", fmt.Sprintf("[%d/%d] 接入 %s", i+1, len(items), snap.containerName))
-		ai, err := e.attachOne(ctx, logger, i, &items[i], fileStates)
+		ai, err := e.attachOne(ctx, logger, i, &items[i], fileStates, admin)
 		if err != nil {
 			rbFailed := false
 			var ae *attachError
@@ -109,7 +138,7 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 			logger.add("error", err.Error())
 			if len(applied) > 0 {
 				logger.add("warn", "回滚此前已完成的接入")
-				if rbErr := e.rollbackAll(ctx, logger, applied, baseConfig); rbErr != nil {
+				if rbErr := e.rollbackApplied(ctx, logger, applied, baseCfg); rbErr != nil {
 					logger.add("error", rbErr.Error())
 					rbFailed = true
 				}
@@ -132,21 +161,19 @@ func (e *Engine) runAttach(plan model.Plan, items []planSnapshot, op model.Opera
 	logger.setAffected(ids)
 	logger.add("info", "接入完成；此后原端口由 macOS 端口网关监听，GUI 关闭后仍然有效")
 	logger.finish("succeeded", "")
-	e.syncProxyConfig(ctx, true)
+	if err := e.syncProxyConfig(ctx, true); err != nil {
+		logger.add("warn", "同步代理配置失败: "+err.Error())
+	}
 	e.triggerReconcile()
 }
 
-func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, fileStates map[string][]byte) (*appliedItem, error) {
+func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, fileStates map[string][]byte, admin *proxy.AdminClient) (*appliedItem, error) {
 	s := e.settings.Get()
 	cli, err := e.cliRunner()
 	if err != nil {
 		return nil, &attachError{Err: err}
 	}
 	c, err := e.dockerClient(ctx)
-	if err != nil {
-		return nil, &attachError{Err: err}
-	}
-	admin, err := e.adminClient()
 	if err != nil {
 		return nil, &attachError{Err: err}
 	}
@@ -186,6 +213,9 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	if err != nil {
 		return nil, &attachError{Err: fmt.Errorf("读取代理配置失败: %w", err)}
 	}
+	if err := validateProxyConfig(prevCfg); err != nil {
+		return nil, &attachError{Err: fmt.Errorf("代理配置无效，无法安全接入: %w", err)}
+	}
 	// Re-check proxy port ownership: another plan may have been applied since
 	// this plan was generated.
 	existing, _ := e.store.ListServices()
@@ -223,20 +253,27 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	logger.add("info", fmt.Sprintf("已备份 %s 到 %s", snap.composeFile, backupPath))
 
 	svcID := newID("svc")
-	var undos []func() error
-	rollbackFailed := false
+	var undos []undoStep
 	fail := func(cause error) (*appliedItem, error) {
 		logger.add("warn", "回滚本容器的修改")
+		var undoErrs []string
 		for i := len(undos) - 1; i >= 0; i-- {
-			if uerr := undos[i](); uerr != nil {
-				rollbackFailed = true
-				logger.add("error", "回滚步骤失败: "+uerr.Error())
+			if uerr := undos[i].fn(); uerr != nil {
+				logger.add("error", fmt.Sprintf("回滚步骤「%s」失败: %v", undos[i].name, uerr))
+				undoErrs = append(undoErrs, undos[i].name+": "+uerr.Error())
 			}
 		}
-		return nil, &attachError{Err: cause, RollbackFailed: rollbackFailed}
+		ae := &attachError{Err: cause}
+		if len(undoErrs) > 0 {
+			ae.RollbackFailed = true
+			ae.Detail = strings.Join(undoErrs, "; ")
+		}
+		return nil, ae
 	}
 
-	// 1. Register the service in the proxy before touching the container.
+	// 1. Register the service in the proxy. The undo step is registered before
+	// the write so an uncertain result (write applied but verification failed)
+	// is always followed by a restore attempt.
 	nextCfg := prevCfg
 	sc := proxy.ServiceConfig{
 		Name:             snap.containerName,
@@ -246,22 +283,19 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	for _, m := range snap.proxyMappings {
 		sc.Ports = append(sc.Ports, fmt.Sprintf("%d:%d", m.ListenPort, m.TargetPort))
 	}
+	sort.Strings(sc.Ports)
 	nextCfg.Upsert(sc)
+	undos = append(undos, undoStep{name: "恢复代理配置", fn: func() error {
+		rctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return e.putProxyConfigVerified(rctx, admin, prevCfg)
+	}})
 	if err := admin.UpdateConfig(ctx, nextCfg); err != nil {
 		return fail(fmt.Errorf("更新代理配置失败: %w", err))
 	}
-	verify, err := admin.GetConfig(ctx)
-	if err != nil {
-		return fail(fmt.Errorf("验证代理配置失败: %w", err))
+	if err := e.verifyProxyService(ctx, admin, sc); err != nil {
+		return fail(fmt.Errorf("确认代理配置失败: %w", err))
 	}
-	if _, ok := verify.Service(snap.containerName); !ok {
-		return fail(errors.New("代理未接受新的服务配置"))
-	}
-	undos = append(undos, func() error {
-		rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		return admin.UpdateConfig(rctx, prevCfg)
-	})
 	logger.add("info", fmt.Sprintf("代理已注册 %s（%s）", snap.containerName, strings.Join(sc.Ports, ", ")))
 
 	// 2. Edit the Compose file.
@@ -277,7 +311,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		return fail(fmt.Errorf("写入 Compose 文件失败: %w", err))
 	}
 	fileStates[snap.composeFile] = out
-	undos = append(undos, func() error {
+	undos = append(undos, undoStep{name: "恢复 Compose 并重建", fn: func() error {
 		if err := compose.RestoreFile(snap.composeFile, backupPath); err != nil {
 			return fmt.Errorf("恢复 Compose 文件失败: %w", err)
 		}
@@ -287,7 +321,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 			return fmt.Errorf("回滚后重建服务失败: %w", err)
 		}
 		return nil
-	})
+	}})
 	logger.add("info", fmt.Sprintf("已移除端口映射: %s", portsText(snap.removals)))
 
 	// 3. Validate the effective config only lost those ports.
@@ -316,20 +350,21 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}
 	logger.add("info", "容器已重建，原端口已释放")
 
-	// 5. Install the host port gateway.
+	// 5. Install the host port gateway. Register the cleanup before creating
+	// any listener so a partial failure on a later port cannot leave one behind.
+	undos = append(undos, undoStep{name: "移除端口网关监听", fn: func() error {
+		e.gw.RemoveService(svcID)
+		return nil
+	}})
 	for _, b := range snap.bindings {
 		route, err := e.gatewayRoute(ctx, svcID, snap.containerName, b, s)
 		if err != nil {
 			return fail(err)
 		}
 		if err := e.gw.Ensure(route); err != nil {
-			return fail(fmt.Errorf("启动端口网关失败: %w", err))
+			return fail(fmt.Errorf("启动端口网关失败（%s:%d）: %w", hostLabel(b.HostIP), b.HostPort, err))
 		}
 	}
-	undos = append(undos, func() error {
-		e.gw.RemoveService(svcID)
-		return nil
-	})
 	logger.add("info", fmt.Sprintf("端口网关已监听: %s", bindingsText(snap.bindings)))
 
 	// 6. Verify the original address works (this also wakes the container).
@@ -368,41 +403,153 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	if err := e.store.UpsertService(svc); err != nil {
 		return fail(fmt.Errorf("保存托管状态失败: %w", err))
 	}
-	undos = append(undos, func() error { return e.store.DeleteService(svcID) })
+	undos = append(undos, undoStep{name: "删除托管记录", fn: func() error {
+		_ = e.store.DeleteMeta("serviceBackup:" + svcID)
+		return e.store.DeleteService(svcID)
+	}})
 	logger.add("info", fmt.Sprintf("%s 接入成功：%s → 代理 → 容器", snap.containerName, bindingsText(snap.bindings)))
-	return &appliedItem{snap: snap, serviceID: svcID, backupPath: backupPath}, nil
+	return &appliedItem{snap: snap, serviceID: svcID, backupPath: backupPath, managedContent: out}, nil
 }
 
-func (e *Engine) rollbackAll(ctx context.Context, logger *opLogger, applied []appliedItem, base proxy.Config) error {
+// rollbackApplied reverts previously successful items of a failed plan. It only
+// deletes a managed record after the original Compose port mapping has been
+// restored, the container is running and the original ports are published.
+func (e *Engine) rollbackApplied(ctx context.Context, logger *opLogger, applied []appliedItem, base proxy.Config) error {
+	cli, err := e.cliRunner()
+	if err != nil {
+		return fmt.Errorf("回滚未执行：docker CLI 不可用: %w（未修改任何状态，请人工恢复；备份位于 %s）", err, logger.snapshot().BackupDir)
+	}
+	admin, err := e.adminClient()
+	if err != nil {
+		return fmt.Errorf("回滚未执行：代理管理接口不可用: %w（未修改任何状态，请人工恢复；备份位于 %s）", err, logger.snapshot().BackupDir)
+	}
+	if _, err := admin.GetConfig(ctx); err != nil {
+		return fmt.Errorf("回滚未执行：无法读取代理配置: %w（未修改任何状态，请人工恢复；备份位于 %s）", err, logger.snapshot().BackupDir)
+	}
 	var errs []string
-	cli, cliErr := e.cliRunner()
+	rolledBack := map[string]bool{}
 	for i := len(applied) - 1; i >= 0; i-- {
 		ai := applied[i]
-		logger.add("warn", "回滚 "+ai.snap.containerName)
+		name := ai.snap.containerName
+		logger.add("warn", "回滚 "+name)
 		e.gw.RemoveService(ai.serviceID)
-		_ = e.store.DeleteService(ai.serviceID)
-		if err := compose.RestoreFile(ai.snap.composeFile, ai.backupPath); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: 恢复 Compose 失败: %v", ai.snap.containerName, err))
+
+		current, err := os.ReadFile(ai.snap.composeFile)
+		if err != nil || !bytes.Equal(current, ai.managedContent) {
+			errs = append(errs, name+": Compose 文件在回滚前被外部修改，已跳过自动恢复（保留托管记录）")
+			if gerr := e.ensureGatewayForService(ctx, ai.serviceID); gerr != nil {
+				errs = append(errs, name+": 重新监听失败: "+gerr.Error())
+			}
 			continue
 		}
-		if cliErr == nil {
-			rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			err := cli.UpService(rctx, ai.snap.composeProject, ai.snap.composeFile, ai.snap.workingDir, ai.snap.composeService)
-			cancel()
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s: 重建失败: %v", ai.snap.containerName, err))
+		if err := compose.RestoreFile(ai.snap.composeFile, ai.backupPath); err != nil {
+			errs = append(errs, name+": 恢复 Compose 失败: "+err.Error())
+			if gerr := e.ensureGatewayForService(ctx, ai.serviceID); gerr != nil {
+				errs = append(errs, name+": 重新监听失败: "+gerr.Error())
+			}
+			continue
+		}
+		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		upErr := cli.UpService(rctx, ai.snap.composeProject, ai.snap.composeFile, ai.snap.workingDir, ai.snap.composeService)
+		cancel()
+		if upErr == nil {
+			var ins *dockerx.ContainerInspect
+			ins, upErr = e.waitContainerRunning(ctx, name, 2*time.Minute)
+			if upErr == nil {
+				for _, r := range ai.snap.removals {
+					if !containerPublishes(ins, r) {
+						upErr = fmt.Errorf("原始端口 %d/tcp 未重新发布", r.HostPort)
+						break
+					}
+				}
 			}
 		}
+		if upErr != nil {
+			errs = append(errs, name+": 恢复原容器失败: "+upErr.Error())
+			if rerr := e.revertToManaged(ai); rerr != nil {
+				errs = append(errs, name+": 回退到托管状态失败: "+rerr.Error())
+			}
+			continue
+		}
+		if err := e.store.DeleteService(ai.serviceID); err != nil {
+			errs = append(errs, name+": 删除托管记录失败: "+err.Error())
+			continue
+		}
+		_ = e.store.DeleteMeta("serviceBackup:" + ai.serviceID)
+		rolledBack[name] = true
+		logger.add("info", name+" 已恢复到接入前状态")
 	}
-	if admin, err := e.adminClient(); err == nil {
-		if err := admin.UpdateConfig(ctx, base); err != nil {
-			errs = append(errs, "恢复代理配置失败: "+err.Error())
+
+	if len(rolledBack) > 0 {
+		cur, err := admin.GetConfig(ctx)
+		if err != nil {
+			errs = append(errs, "读取代理配置失败: "+err.Error())
+		} else {
+			for name := range rolledBack {
+				cur.Remove(name)
+				if original, ok := base.Service(name); ok {
+					cur.Upsert(original)
+				}
+			}
+			rctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			err := e.putProxyConfigVerified(rctx, admin, cur)
+			cancel()
+			if err != nil {
+				errs = append(errs, "恢复代理配置失败: "+err.Error())
+			}
 		}
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("回滚不完整：%s；备份位于 %s，请按日志手动恢复", strings.Join(errs, "; "), logger.snapshot().BackupDir)
 	}
 	logger.add("info", "回滚完成，服务已恢复到接入前状态")
+	return nil
+}
+
+// revertToManaged rewrites the managed Compose content, recreates the container
+// and re-installs gateway listeners. Used when restoring the original port
+// mapping failed midway.
+func (e *Engine) revertToManaged(ai appliedItem) error {
+	cli, err := e.cliRunner()
+	if err != nil {
+		return err
+	}
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(ai.snap.composeFile); err == nil {
+		mode = st.Mode()
+	}
+	if err := compose.WriteAtomic(ai.snap.composeFile, ai.managedContent, mode); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := cli.UpService(ctx, ai.snap.composeProject, ai.snap.composeFile, ai.snap.workingDir, ai.snap.composeService); err != nil {
+		return err
+	}
+	if _, err := e.waitContainerRunning(ctx, ai.snap.containerName, 2*time.Minute); err != nil {
+		return err
+	}
+	return e.ensureGatewayForService(ctx, ai.serviceID)
+}
+
+func (e *Engine) ensureGatewayForService(ctx context.Context, serviceID string) error {
+	svc, ok, err := e.store.GetService(serviceID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	s := e.settings.Get()
+	for _, b := range svc.Bindings {
+		route, err := e.gatewayRoute(ctx, serviceID, svc.ContainerName, b, s)
+		if err != nil {
+			return err
+		}
+		if err := e.gw.Ensure(route); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -455,10 +602,13 @@ func splitPortKey(key string) (int, string) {
 	if i := strings.Index(key, "/"); i >= 0 {
 		portStr, proto = key[:i], key[i+1:]
 	}
-	var n int
-	fmt.Sscanf(portStr, "%d", &n)
+	n, _ := strconv.Atoi(portStr)
 	return n, proto
 }
+
+// bindingProbeTimeout is how long a freshly recreated container gets to start
+// accepting TCP connections on its original port.
+var bindingProbeTimeout = 10 * time.Second
 
 func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) error {
 	for _, b := range bindings {
@@ -467,12 +617,29 @@ func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) err
 			host = "127.0.0.1"
 		}
 		addr := fmt.Sprintf("%s:%d", host, b.HostPort)
-		d := netDialer(15 * time.Second)
-		conn, err := d.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			return fmt.Errorf("%s 无法连接: %w", addr, err)
+		deadline := time.Now().Add(bindingProbeTimeout)
+		var lastErr error
+		for {
+			d := netDialer(3 * time.Second)
+			conn, err := d.DialContext(ctx, "tcp", addr)
+			if err == nil {
+				conn.Close()
+				lastErr = nil
+				break
+			}
+			lastErr = err
+			if time.Now().After(deadline) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+			}
 		}
-		conn.Close()
+		if lastErr != nil {
+			return fmt.Errorf("%s 无法连接: %w", addr, lastErr)
+		}
 	}
 	return nil
 }

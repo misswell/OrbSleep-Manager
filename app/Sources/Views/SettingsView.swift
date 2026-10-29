@@ -123,7 +123,11 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Toggle("启用低端口辅助程序（enableLowPortHelper）", isOn: $draft.enableLowPortHelper)
+            Toggle("启用低端口辅助程序（尚未实现）", isOn: $draft.enableLowPortHelper)
+                .disabled(true)
+            Text("特权端口助手尚未实现；低于 1024 的宿主机端口始终被排除。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         } header: {
             Text("休眠与扫描")
         }
@@ -177,15 +181,17 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
                     .frame(width: 110)
+                    .disabled(app.proxyInstalled)
             }
             LabeledContent("代理端口结束") {
                 TextField("端口", value: $draft.proxyPortEnd, format: .number.grouping(.never))
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
                     .frame(width: 110)
+                    .disabled(app.proxyInstalled)
             }
             if portRangeChanged {
-                Label("端口范围已修改，保存后需要重启代理容器才会生效。", systemImage: "exclamationmark.triangle.fill")
+                Label("代理安装后端口设置会被锁定；修改范围需要先停止代理容器再重新安装。", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -195,12 +201,19 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
                     .frame(width: 110)
+                    .disabled(app.proxyInstalled)
             }
             LabeledContent("Web 端口") {
                 TextField("端口", value: $draft.webPort, format: .number.grouping(.never))
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
                     .frame(width: 110)
+                    .disabled(app.proxyInstalled)
+            }
+            if app.proxyInstalled {
+                Text("代理已安装：端口设置已锁定，需先停止代理容器才能修改。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             LabeledContent("拨号模式") {
@@ -208,6 +221,9 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
             }
+            Text("当前仅支持 published（代理端口发布到 127.0.0.1）。container_ip 需先探测可达，否则保存会被拒绝。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Text("默认 published：通过代理容器已发布的端口拨号。修改前请确认后台支持该模式。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -278,7 +294,7 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.borderless)
                 Spacer()
-                Text("匹配镜像名的容器会被判定为排除，不会出现在接入建议中。")
+                Text("匹配镜像名的容器会被标记为「需确认」，仍需逐项确认后才能接入。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
