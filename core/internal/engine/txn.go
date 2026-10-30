@@ -3,11 +3,11 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/state"
+	"orbsleep/internal/transaction"
 )
 
 // txnPayload is the durable state of an attach transaction. It contains enough
@@ -72,19 +72,7 @@ func (p txnPayload) snapshot(i int) *planSnapshot {
 }
 
 func (e *Engine) startTxn(opID, kind string, payload any) (string, error) {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	txn := state.Transaction{
-		ID: newID("txn"), Kind: kind, OperationID: opID, Status: "running", Phase: "planned",
-		StartedAt: now, UpdatedAt: now, Data: string(raw),
-	}
-	if err := e.store.SaveTransaction(txn); err != nil {
-		return "", err
-	}
-	return txn.ID, nil
+	return e.txns.Start(opID, kind, payload, func() string { return newID("txn") })
 }
 
 func (e *Engine) loadTxn(id string) (state.Transaction, txnPayload, error) {
@@ -102,34 +90,23 @@ func (e *Engine) loadTxn(id string) (state.Transaction, txnPayload, error) {
 	return t, p, nil
 }
 
-// updateTxn mutates and persists the transaction payload.
+// updateTxn mutates and persists the transaction payload through the
+// transaction manager, which enforces legal phase transitions.
 func (e *Engine) updateTxn(id, phase string, mutate func(*txnPayload)) error {
-	t, p, err := e.loadTxn(id)
-	if err != nil {
-		return err
-	}
-	if mutate != nil {
-		mutate(&p)
-	}
-	raw, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	t.Phase = phase
-	t.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	t.Data = string(raw)
-	return e.store.SaveTransaction(t)
+	return e.txns.Update(id, transaction.Phase(phase), func(raw json.RawMessage) (json.RawMessage, error) {
+		var p txnPayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+		if mutate != nil {
+			mutate(&p)
+		}
+		return json.Marshal(p)
+	})
 }
 
 func (e *Engine) finishTxn(id, status string, cause error, phase string) {
-	msg := ""
-	if cause != nil {
-		msg = cause.Error()
-	}
-	if phase == "" {
-		phase = status
-	}
-	_ = e.store.FinishTransaction(id, status, msg, phase)
+	e.txns.Finish(id, status, cause, transaction.Phase(phase))
 }
 
 // finishTxnAtomic commits the transaction and operation terminal states in one
@@ -147,7 +124,7 @@ func (e *Engine) finishTxnAtomic(id, opID, status string, cause error, phase str
 	if status == "committed" {
 		opStatus = "succeeded"
 	}
-	if err := e.store.FinishTransactionWithOperation(id, opID, status, phase, msg, opStatus, msg); err != nil {
+	if err := e.txns.FinishWithOperation(id, opID, status, cause, transaction.Phase(phase), opStatus); err != nil {
 		e.logger.Printf("warn", "原子提交事务终态失败，退回分步提交: %v", err)
 		e.finishTxn(id, status, cause, phase)
 		if opID != "" {

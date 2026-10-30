@@ -63,6 +63,7 @@ type Engine struct {
 	lastRecovery time.Time
 
 	composeLocker *transaction.FileLocker
+	txns          *transaction.Manager
 
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
@@ -100,6 +101,7 @@ func New(version, dataDir string) (*Engine, error) {
 		eventsCh:      make(chan struct{}, 1),
 		stopCh:        make(chan struct{}),
 		composeLocker: transaction.NewFileLocker(filepath.Join(dataDir, "locks")),
+		txns:          transaction.NewManager(store),
 	}
 	if migrateErr != nil {
 		logger.Printf("warn", "迁移旧设置失败: %v", migrateErr)
