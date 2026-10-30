@@ -176,40 +176,41 @@ final class BackgroundService {
     // MARK: - Launchctl helpers (GUI-initiated only)
 
     /// Starts the registered job with launchd.
-    func kickstart() throws {
-        try runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(Self.agentLabel)"])
+    func kickstart() async throws {
+        try await runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(Self.agentLabel)"])
     }
 
     /// Stops the job without unregistering it. The daemon exits successfully,
     /// so `KeepAlive.SuccessfulExit = false` does not restart it.
-    func killJob() {
-        try? runLaunchctl(["kill", "SIGTERM", "gui/\(getuid())/\(Self.agentLabel)"])
+    func killJob() async {
+        try? await runLaunchctl(["kill", "SIGTERM", "gui/\(getuid())/\(Self.agentLabel)"])
     }
 
-    func isJobLoaded() -> Bool {
-        (try? runLaunchctl(["print", "gui/\(getuid())/\(Self.agentLabel)"], allowFailure: true)) != nil
+    func isJobLoaded() async -> Bool {
+        await launchctlPrintSucceeded("gui/\(getuid())/\(Self.agentLabel)")
     }
 
     // MARK: - Legacy fallback (development builds)
 
     /// Registers a user LaunchAgent by running the bundled CLI. Used only when
-    /// `SMAppService` rejects an unsigned development build.
-    func installLegacyAgent(daemon: URL) throws {
+    /// `SMAppService` rejects an unsigned development build; release builds
+    /// must surface the SMAppService error instead of masking it.
+    func installLegacyAgent(daemon: URL) async throws {
         guard let cli = bundledCLIURL else {
             throw BackgroundServiceError.missingBundledExecutable("orbsleepctl")
         }
-        _ = try runProcess(cli, ["install-agent", "--binary", daemon.path])
+        _ = try await runProcess(cli, ["install-agent", "--binary", daemon.path])
     }
 
-    func removeLegacyAgent() {
+    func removeLegacyAgent() async {
         guard let cli = bundledCLIURL else { return }
-        _ = try? runProcess(cli, ["uninstall-agent"])
+        _ = try? await runProcess(cli, ["uninstall-agent"])
     }
 
     // MARK: - 0.1.x migration helpers
 
     /// Detects the old manual install (/usr/local/bin + old LaunchAgent label).
-    func detectLegacy() -> LegacyInstallation {
+    func detectLegacy() async -> LegacyInstallation {
         let fm = FileManager.default
         let daemon = "/usr/local/bin/orbsleepd"
         let ctl = "/usr/local/bin/orbsleepctl"
@@ -226,13 +227,23 @@ final class BackgroundService {
             daemonExists: fm.fileExists(atPath: daemon),
             ctlExists: fm.fileExists(atPath: ctl),
             plistExists: fm.fileExists(atPath: oldPlistURL.path),
-            launchdLoaded: isLegacyJobLoaded(),
+            launchdLoaded: await isLegacyJobLoaded(),
             rootOwned: rootOwned
         )
     }
 
-    func isLegacyJobLoaded() -> Bool {
-        (try? runLaunchctl(["print", "gui/\(getuid())/\(Self.legacyLabel)"], allowFailure: true)) != nil
+    func isLegacyJobLoaded() async -> Bool {
+        await launchctlPrintSucceeded("gui/\(getuid())/\(Self.legacyLabel)")
+    }
+
+    /// `launchctl print <target>` exits non-zero when the job does not exist.
+    /// The exit status is the only reliable answer: the command always prints
+    /// something, so "has output" must never be treated as "job exists".
+    private func launchctlPrintSucceeded(_ target: String) async -> Bool {
+        await ProcessRunner.succeeded(
+            executable: URL(fileURLWithPath: "/bin/launchctl"),
+            arguments: ["print", target]
+        )
     }
 
     /// Terminates a manually-started 0.1.x daemon that is not under launchd.
@@ -245,10 +256,10 @@ final class BackgroundService {
     }
 
     /// Stops the 0.1.x LaunchAgent so the new bundled service can take over.
-    func bootoutLegacyJob() {
-        _ = try? runLaunchctl(["bootout", "gui/\(getuid())/\(Self.legacyLabel)"])
+    func bootoutLegacyJob() async {
+        try? await runLaunchctl(["bootout", "gui/\(getuid())/\(Self.legacyLabel)"])
         if FileManager.default.fileExists(atPath: oldPlistURL.path) {
-            _ = try? runLaunchctl(["bootout", "gui/\(getuid())", oldPlistURL.path])
+            try? await runLaunchctl(["bootout", "gui/\(getuid())", oldPlistURL.path])
         }
     }
 
@@ -258,9 +269,29 @@ final class BackgroundService {
         }
     }
 
+    /// Re-installs a saved copy of the 0.1.x plist (migration rollback path):
+    /// only used when the new bundled service failed to start after the old
+    /// agent was removed, so the user is never left without a daemon.
+    func reinstallLegacyPlist(data: Data) async -> Bool {
+        do {
+            try data.write(to: oldPlistURL, options: .atomic)
+        } catch {
+            return false
+        }
+        return await ProcessRunner.succeeded(
+            executable: URL(fileURLWithPath: "/bin/launchctl"),
+            arguments: ["load", oldPlistURL.path]
+        )
+    }
+
+    /// Reads the 0.1.x plist contents so migration can restore it on failure.
+    func readOldPlistData() -> Data? {
+        try? Data(contentsOf: oldPlistURL)
+    }
+
     /// Removes 0.1.x binaries. User-owned files are deleted directly; root-owned
     /// files go through a one-shot macOS administrator authorization dialog.
-    func cleanupLegacyBinaries() throws -> [String] {
+    func cleanupLegacyBinaries() async throws -> [String] {
         let paths = ["/usr/local/bin/orbsleepd", "/usr/local/bin/orbsleepctl"]
         var removed: [String] = []
         var rootOwned: [String] = []
@@ -274,18 +305,18 @@ final class BackgroundService {
             }
         }
         if !rootOwned.isEmpty {
-            try removeWithAdministrator(paths: rootOwned)
+            try await removeWithAdministrator(paths: rootOwned)
             removed.append(contentsOf: rootOwned)
         }
         return removed
     }
 
-    private func removeWithAdministrator(paths: [String]) throws {
+    private func removeWithAdministrator(paths: [String]) async throws {
         let quoted = paths
             .map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }
             .joined(separator: " ")
         let script = "do shell script \"rm -f \(quoted)\" with administrator privileges"
-        _ = try runProcess(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script])
+        _ = try await runProcess(URL(fileURLWithPath: "/usr/bin/osascript"), ["-e", script])
     }
 
     // MARK: - Command line tools (optional, user-level, no sudo)
@@ -302,6 +333,10 @@ final class BackgroundService {
 
     /// Installs `orbsleepctl` as a symlink in `~/.local/bin`. This is an
     /// optional advanced entry point; the GUI never depends on it.
+    ///
+    /// An existing entry is only replaced when it is an OrbSleep-owned symlink
+    /// pointing at our embedded CLI (or a 0.1.x binary path). The user's own
+    /// file is never overwritten.
     func installCLI() throws {
         guard let cli = bundledCLIURL else {
             throw BackgroundServiceError.missingBundledExecutable("orbsleepctl")
@@ -310,6 +345,14 @@ final class BackgroundService {
         let directory = destination.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         if FileManager.default.fileExists(atPath: destination.path) {
+            let target = try? FileManager.default.destinationOfSymbolicLink(atPath: destination.path)
+            let ours = target == cli.path || target == "/usr/local/bin/orbsleepctl"
+            guard ours else {
+                throw BackgroundServiceError.commandFailed(
+                    destination.path, 0,
+                    "目标位置已存在不属于 OrbSleep 的文件（\(destination.path)），未覆盖"
+                )
+            }
             try FileManager.default.removeItem(at: destination)
         }
         try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: cli)
@@ -330,34 +373,21 @@ final class BackgroundService {
     // MARK: - Process helpers
 
     @discardableResult
-    private func runLaunchctl(_ arguments: [String], allowFailure: Bool = false) throws -> String {
-        try runProcess(URL(fileURLWithPath: "/bin/launchctl"), arguments, allowFailure: allowFailure)
+    private func runLaunchctl(_ arguments: [String], allowFailure: Bool = false) async throws -> String {
+        try await runProcess(URL(fileURLWithPath: "/bin/launchctl"), arguments, allowFailure: allowFailure)
     }
 
     @discardableResult
-    private func runProcess(_ executable: URL, _ arguments: [String], allowFailure: Bool = false) throws -> String {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do {
-            try process.run()
-        } catch {
-            throw BackgroundServiceError.commandFailed(executable.lastPathComponent, -1, error.localizedDescription)
-        }
-        process.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(decoding: data, as: UTF8.self)
-        guard process.terminationStatus == 0 || allowFailure else {
+    private func runProcess(_ executable: URL, _ arguments: [String], allowFailure: Bool = false) async throws -> String {
+        let result = try await ProcessRunner.run(executable: executable, arguments: arguments)
+        guard result.exitStatus == 0 || allowFailure else {
             throw BackgroundServiceError.commandFailed(
                 ([executable.lastPathComponent] + arguments).joined(separator: " "),
-                process.terminationStatus,
-                output
+                result.exitStatus,
+                result.output
             )
         }
-        return output
+        return result.output
     }
 }
 

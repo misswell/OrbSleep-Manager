@@ -822,7 +822,9 @@ struct Health: Codable, Sendable, Hashable {
     var proxy: ProxyStatus?
     var counts: StatusCounts?
     var pendingTransactions: Int?
+    var needsRepairTransactions: Int?
     var runningOperations: Int?
+    var restoreFailed: Bool?
     var launchAgentLoaded: Bool?
     var legacyLaunchAgent: Bool?
     var legacyBinaries: [String]?

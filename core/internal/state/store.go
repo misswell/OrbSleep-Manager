@@ -68,7 +68,8 @@ func (s *Store) migrate() error {
 			last_active_at TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '',
-			excluded_from_sleep INTEGER NOT NULL DEFAULT 0
+			excluded_from_sleep INTEGER NOT NULL DEFAULT 0,
+			docker_socket TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE TABLE IF NOT EXISTS operations (
 			id TEXT PRIMARY KEY,
@@ -107,6 +108,13 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate transactions.operation_id: %w", err)
 		}
 	}
+	// Services are pinned to the Docker socket they were attached on so a
+	// socket switch can never rebind them to a different Docker instance.
+	if _, err := s.db.Exec(`ALTER TABLE services ADD COLUMN docker_socket TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumn(err) {
+			return fmt.Errorf("migrate services.docker_socket: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -122,18 +130,20 @@ func (s *Store) UpsertService(svc model.Service) error {
 	}
 	_, err = s.db.Exec(`INSERT INTO services
 		(id, container_id, container_name, compose_project, compose_service, compose_file, status, bindings,
-		 idle_timeout, start_timeout, active_conns, last_active_at, created_at, last_error, excluded_from_sleep)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 idle_timeout, start_timeout, active_conns, last_active_at, created_at, last_error, excluded_from_sleep, docker_socket)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		 container_id=excluded.container_id, container_name=excluded.container_name,
 		 compose_project=excluded.compose_project, compose_service=excluded.compose_service,
 		 compose_file=excluded.compose_file, status=excluded.status, bindings=excluded.bindings,
 		 idle_timeout=excluded.idle_timeout, start_timeout=excluded.start_timeout,
 		 active_conns=excluded.active_conns, last_active_at=excluded.last_active_at,
-		 last_error=excluded.last_error, excluded_from_sleep=excluded.excluded_from_sleep`,
+		 last_error=excluded.last_error, excluded_from_sleep=excluded.excluded_from_sleep,
+		 docker_socket=CASE WHEN excluded.docker_socket='' THEN services.docker_socket ELSE excluded.docker_socket END`,
 		svc.ID, svc.ContainerID, svc.ContainerName, svc.ComposeProject, svc.ComposeService,
 		svc.ComposeFile, svc.Status, string(bindings), svc.IdleTimeoutSecs, svc.StartTimeoutSecs,
-		svc.ActiveConnections, svc.LastActiveAt, svc.CreatedAt, svc.LastError, boolInt(svc.ExcludedFromSleep))
+		svc.ActiveConnections, svc.LastActiveAt, svc.CreatedAt, svc.LastError, boolInt(svc.ExcludedFromSleep),
+		svc.DockerSocket)
 	return err
 }
 
@@ -141,7 +151,7 @@ func (s *Store) UpsertService(svc model.Service) error {
 func (s *Store) ListServices() ([]model.Service, error) {
 	rows, err := s.db.Query(`SELECT id, container_id, container_name, compose_project, compose_service,
 		compose_file, status, bindings, idle_timeout, start_timeout, active_conns, last_active_at,
-		created_at, last_error, excluded_from_sleep FROM services ORDER BY created_at, id`)
+		created_at, last_error, excluded_from_sleep, docker_socket FROM services ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +164,7 @@ func (s *Store) ListServices() ([]model.Service, error) {
 		if err := rows.Scan(&svc.ID, &svc.ContainerID, &svc.ContainerName, &svc.ComposeProject,
 			&svc.ComposeService, &svc.ComposeFile, &svc.Status, &bindings, &svc.IdleTimeoutSecs,
 			&svc.StartTimeoutSecs, &svc.ActiveConnections, &svc.LastActiveAt, &svc.CreatedAt,
-			&svc.LastError, &excl); err != nil {
+			&svc.LastError, &excl, &svc.DockerSocket); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(bindings), &svc.Bindings)
@@ -353,6 +363,52 @@ func (s *Store) ListRunningTransactions() ([]Transaction, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// ListUnresolvedTransactions returns every transaction that still needs
+// attention: running, plus recoveries that failed (rollback_failed) or need
+// manual repair. The GUI must see all of them, not just the running ones.
+func (s *Store) ListUnresolvedTransactions() ([]Transaction, error) {
+	rows, err := s.db.Query(`SELECT id, kind, operation_id, status, phase, started_at, updated_at, error, data
+		FROM transactions WHERE status IN ('running','rollback_failed','needs_repair') ORDER BY started_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Transaction
+	for rows.Next() {
+		var t Transaction
+		if err := rows.Scan(&t.ID, &t.Kind, &t.OperationID, &t.Status, &t.Phase, &t.StartedAt, &t.UpdatedAt, &t.Error, &t.Data); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// CountUnresolvedTransactions returns how many transactions still need
+// attention, split into running (auto-recoverable) and needing repair.
+func (s *Store) CountUnresolvedTransactions() (running, needsRepair int, err error) {
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM transactions
+		WHERE status IN ('running','rollback_failed','needs_repair') GROUP BY status`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return 0, 0, err
+		}
+		switch status {
+		case "running":
+			running = n
+		default:
+			needsRepair += n
+		}
+	}
+	return running, needsRepair, rows.Err()
 }
 
 // FinishTransaction marks a transaction terminal.

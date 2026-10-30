@@ -185,12 +185,22 @@ enum UpdateStatus: Equatable {
     case failed(String)
 }
 
+/// 自检加载状态：只有真正执行成功才算通过，空结果不能解释为「全部通过」。
+enum DoctorLoadState: Equatable {
+    case idle
+    case loading
+    case succeeded
+    case failed
+}
+
 /// 全局 UI 状态。所有属性都在 MainActor 上，后台请求通过 `CoreClient` 完成。
 @MainActor
 @Observable
 final class AppState {
     private let client: CoreClient
     let backgroundService = BackgroundService()
+    /// 互斥维护操作（卸载 / 迁移 / 恢复 / 升级 / 服务生命周期）共用的串行门闩。
+    @ObservationIgnored private let maintenanceGate = MaintenanceGate()
 
     var section: AppSection = .overview
 
@@ -235,6 +245,7 @@ final class AppState {
     var settings: Settings?
     var scanResult: ScanResult?
     var doctorChecks: [DoctorCheck] = []
+    var doctorLoadState: DoctorLoadState = .idle
     var operations: [Operation] = []
 
     // 连接
@@ -265,6 +276,8 @@ final class AppState {
 
     @ObservationIgnored private var didBootstrap = false
     @ObservationIgnored private var didAutoDoctorAlert = false
+    @ObservationIgnored private var didReportRestoreFailure = false
+    @ObservationIgnored private var didReportNeedsRepair = false
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var operationTask: Task<Void, Never>?
     @ObservationIgnored private var errorDismissTask: Task<Void, Never>?
@@ -316,16 +329,32 @@ final class AppState {
         refreshLocalState()
         loadSigningInfo()
         if await probeDaemon() {
+            // A 0.1.x installation can still answer on the socket; complete the
+            // migration (old agent removal, bundled service registration,
+            // version verification) before trusting the session.
+            await refreshLegacyDetection()
+            if legacyInstallation.isPresent {
+                await migrateLegacyInstall()
+            }
             setupCompleted = true
             await loadCoreState()
             if serviceVersionMismatch {
                 await upgradeService()
             }
             await runAutoDoctor()
+            await completeUpdateHandshake()
         } else {
+            await refreshLegacyDetection()
             prepareSetupSteps()
         }
         startPolling()
+    }
+
+    /// 互斥维护操作的串行入口。
+    private func withMaintenanceLock(_ body: () async -> Void) async {
+        await maintenanceGate.acquire()
+        defer { Task { await maintenanceGate.release() } }
+        await body()
     }
 
     func refreshLocalState() {
@@ -334,7 +363,12 @@ final class AppState {
         serviceNeedsApproval = backgroundService.needsApproval
         cliInstalled = backgroundService.cliInstalled
         launchesGUIAtLogin = backgroundService.launchesAtLogin
-        legacyInstallation = backgroundService.detectLegacy()
+    }
+
+    /// 旧版安装探测要走 `launchctl print`（异步进程调用）。需要旧版信息的
+    /// 调用方显式等待结果，而不是在同步刷新里读一个还没写好的值。
+    func refreshLegacyDetection() async {
+        legacyInstallation = await backgroundService.detectLegacy()
     }
 
     /// 读取本机 codesign / spctl 信息，供设置页「关于」展示。
@@ -412,6 +446,7 @@ final class AppState {
     /// 打开应用后自动运行，只在发现失败项时提示，不要求用户主动执行 doctor。
     private func runAutoDoctor() async {
         await loadDoctor()
+        guard doctorLoadState == .succeeded else { return }
         let failures = doctorChecks.filter { $0.statusValue == .fail }
         guard !failures.isEmpty, !didAutoDoctorAlert else { return }
         didAutoDoctorAlert = true
@@ -801,7 +836,9 @@ final class AppState {
                 do {
                     let value = try await client.call("proxy.setup", as: PlanApplyResult.self)
                     if let operationId = value.operationId {
-                        await waitOperationForUninstall(operationId, timeoutSeconds: 1200)
+                        if !(await waitOperation(operationId, timeoutSeconds: 1200)) {
+                            updateStep("proxy", state: .failed, message: "代理安装操作未成功，请查看操作记录")
+                        }
                     }
                     await refreshStatus(silent: true)
                     if status?.proxy?.running == true {
@@ -820,20 +857,25 @@ final class AppState {
 
         updateStep("doctor", state: .running, message: "正在执行环境检查…")
         await loadDoctor()
-        let failures = doctorChecks.filter { $0.statusValue == .fail }
-        if failures.isEmpty {
+        if doctorPassed {
             updateStep("doctor", state: .done, message: "全部通过")
             setupCompleted = true
             section = .overview
-        } else {
+        } else if doctorLoadState == .succeeded {
+            let failures = doctorChecks.filter { $0.statusValue == .fail }
             updateStep("doctor", state: .failed, message: "\(failures.count) 项需要处理")
             setupCompleted = true
             didAutoDoctorAlert = true
             showError("安装完成，但自检有 \(failures.count) 项需要处理。可在「诊断与修复」中查看并一键修复。")
+        } else {
+            updateStep("doctor", state: .failed, message: "自检执行失败")
+            setupCompleted = true
+            showError("自检未能完成（\(connectionError ?? "请求失败")）。可在「诊断与修复」中重新执行。")
         }
     }
 
-    /// 注册并启动后台服务，必要时回退到用户级 LaunchAgent（开发构建）。
+    /// 注册并启动后台服务。正式版只走 SMAppService；旧式 LaunchAgent 仅作为
+    /// 未签名开发构建（DEBUG）的降级方案，避免用同一 Label 掩盖启动失败。
     func ensureServiceRunning() async throws {
         refreshLocalState()
         if await probeDaemon() { return }
@@ -849,11 +891,15 @@ final class AppState {
                 try backgroundService.register()
                 refreshLocalState()
             } catch {
+                #if DEBUG
                 guard let daemon = backgroundService.bundledDaemonURL else {
                     throw BackgroundServiceError.missingBundledExecutable("orbsleepd")
                 }
-                try backgroundService.installLegacyAgent(daemon: daemon)
+                try await backgroundService.installLegacyAgent(daemon: daemon)
                 refreshLocalState()
+                #else
+                throw error
+                #endif
             }
             if backgroundService.needsApproval {
                 backgroundService.openLoginItemsSettings()
@@ -863,11 +909,13 @@ final class AppState {
             // for the socket itself. Avoid a redundant kill/restart.
             if await waitForDaemon(seconds: 10) { return }
         }
-        try? backgroundService.kickstart()
+        try? await backgroundService.kickstart()
         if await waitForDaemon(seconds: 20) { return }
+        #if DEBUG
         if let daemon = backgroundService.bundledDaemonURL {
-            try? backgroundService.installLegacyAgent(daemon: daemon)
+            try? await backgroundService.installLegacyAgent(daemon: daemon)
         }
+        #endif
         guard await waitForDaemon(seconds: 30) else {
             throw BackgroundServiceError.daemonDidNotStart
         }
@@ -901,14 +949,18 @@ final class AppState {
                 do {
                     try backgroundService.register()
                 } catch {
+                    #if DEBUG
                     if let daemon = backgroundService.bundledDaemonURL {
-                        try? backgroundService.installLegacyAgent(daemon: daemon)
+                        try? await backgroundService.installLegacyAgent(daemon: daemon)
                     }
+                    #else
+                    showError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                    #endif
                 }
             }
         } else {
             try? await backgroundService.unregister()
-            backgroundService.removeLegacyAgent()
+            await backgroundService.removeLegacyAgent()
         }
         refreshLocalState()
         await refreshStatus(silent: true)
@@ -941,9 +993,15 @@ final class AppState {
     }
 
     func startService() async {
-        guard !isBusyService else { return }
-        isBusyService = true
-        defer { isBusyService = false }
+        await withMaintenanceLock {
+            guard !isBusyService else { return }
+            isBusyService = true
+            defer { isBusyService = false }
+            await startServiceLocked()
+        }
+    }
+
+    private func startServiceLocked() async {
         do {
             try await ensureServiceRunning()
             refreshLocalState()
@@ -955,23 +1013,54 @@ final class AppState {
         }
     }
 
+    /// 「停止是否成功」由 stopServiceLocked 记录；重启前必须确认旧进程真的退出了。
+    @ObservationIgnored private var lastStopConfirmed = true
+
     func stopService() async {
-        guard !isBusyService else { return }
-        isBusyService = true
-        defer { isBusyService = false }
-        if daemonReachable {
-            _ = try? await client.call("system.shutdown", as: ShutdownResult.self)
-        } else {
-            backgroundService.killJob()
+        await withMaintenanceLock {
+            guard !isBusyService else { return }
+            isBusyService = true
+            defer { isBusyService = false }
+            await stopServiceLocked()
         }
-        _ = await waitForDaemonToStop(seconds: 15)
+    }
+
+    private func stopServiceLocked() async {
+        lastStopConfirmed = false
+        if daemonReachable {
+            do {
+                let result = try await client.call("system.shutdown", as: ShutdownResult.self)
+                if result.ok == false {
+                    showError("后台服务拒绝了停止请求，未执行后续操作。")
+                    return
+                }
+            } catch {
+                handle(error)
+                return
+            }
+        } else {
+            await backgroundService.killJob()
+        }
+        guard await waitForDaemonToStop(seconds: 15) else {
+            showError("后台服务未能在 15 秒内退出。状态未更新，请稍后在诊断中重试。")
+            return
+        }
         daemonReachable = false
+        lastStopConfirmed = true
+        refreshLocalState()
     }
 
     func restartService() async {
-        guard !isBusyService else { return }
-        await stopService()
-        await startService()
+        await withMaintenanceLock {
+            guard !isBusyService else { return }
+            isBusyService = true
+            defer { isBusyService = false }
+            await stopServiceLocked()
+            // If the old process never exited, "start" would just re-probe the
+            // still-running daemon and report success without a real restart.
+            guard lastStopConfirmed else { return }
+            await startServiceLocked()
+        }
     }
 
     /// 一键修复：确保服务在运行，补装缺失的代理，然后重新自检。
@@ -988,11 +1077,15 @@ final class AppState {
             if status?.proxy?.installed != true {
                 let value = try await client.call("proxy.setup", as: PlanApplyResult.self)
                 if let operationId = value.operationId {
-                    await waitOperationForUninstall(operationId)
+                    _ = await waitOperation(operationId, timeoutSeconds: 600)
                 }
                 await refreshStatus(silent: true)
             }
             await loadDoctor()
+            guard doctorLoadState == .succeeded else {
+                showError("无法完成修复后的自检：\(connectionError ?? "请求失败")。请稍后重试。")
+                return
+            }
             let remaining = doctorChecks.filter { $0.statusValue == .fail }
             if remaining.isEmpty {
                 showNotice("修复完成，所有检查项均已通过。")
@@ -1007,9 +1100,15 @@ final class AppState {
     /// 升级随应用一起进行：后台服务二进制就在应用包内，重启即加载新版本。
     /// SMAppService 建议在可执行文件变化后重新注册，因此升级会先注销再注册。
     func upgradeService() async {
-        guard !isBusyService else { return }
-        isBusyService = true
-        defer { isBusyService = false }
+        await withMaintenanceLock {
+            guard !isBusyService else { return }
+            isBusyService = true
+            defer { isBusyService = false }
+            await upgradeServiceLocked()
+        }
+    }
+
+    private func upgradeServiceLocked() async {
         if daemonReachable {
             _ = try? await client.call("system.shutdown", as: ShutdownResult.self)
         }
@@ -1034,77 +1133,136 @@ final class AppState {
     }
 
     /// 只移除后台服务与开机启动，保留应用本身。
+    /// 严格 fail-closed：后台不可用、恢复失败、代理未停止、停止未确认，
+    /// 任何一步失败都中止，绝不带着无法恢复的托管状态拆掉后台。
     func uninstallBackgroundService() async {
-        guard !isBusyService && !isUninstalling else { return }
-        isBusyService = true
-        defer { isBusyService = false }
-        if daemonReachable {
-            await restoreAllManagedServices()
-            await refreshServices()
-            if !services.isEmpty {
-                showError("仍有 \(services.count) 个托管服务未恢复，已中止。请先在「托管服务」中逐个恢复。")
-                return
-            }
-            _ = try? await client.call("system.shutdown", as: ShutdownResult.self)
-        }
-        _ = await waitForDaemonToStop(seconds: 10)
-        try? await backgroundService.unregister()
-        backgroundService.removeLegacyAgent()
-        daemonReachable = false
-        refreshLocalState()
-        showNotice("已恢复托管服务并移除后台服务与开机启动。再次点击「启动」会重新注册。")
-    }
-
-    /// 应用内一键卸载。先恢复所有托管服务；任何服务恢复失败都会中止卸载。
-    /// `mode = .full` 时还会停止 OrbSleep 自建代理并删除数据目录。
-    func uninstallApplication(mode: UninstallMode = .keepData) async {
-        guard !isUninstalling else { return }
-        isUninstalling = true
-        defer { isUninstalling = false }
-        let directory = dataDir
-
-        if daemonReachable {
-            await restoreAllManagedServices()
-            await refreshServices()
-            if !services.isEmpty {
-                showError("仍有 \(services.count) 个托管服务未恢复，已中止卸载。请先恢复这些服务后再卸载。")
-                return
-            }
-            if mode == .full {
-                if let value = try? await client.call("proxy.stop", as: PlanApplyResult.self),
-                   let operationId = value.operationId {
-                    await waitOperationForUninstall(operationId)
-                }
-            }
-            _ = try? await client.call("system.shutdown", as: ShutdownResult.self)
-        }
-        _ = await waitForDaemonToStop(seconds: 10)
-        try? await backgroundService.unregister()
-        backgroundService.removeLegacyAgent()
-        backgroundService.removeCLI()
-        daemonReachable = false
-        refreshLocalState()
-
-        if mode == .full {
-            try? FileManager.default.removeItem(atPath: directory)
-        }
-
-        let appURL = Bundle.main.bundleURL
-        if appURL.path.hasPrefix("/Applications") {
+        await withMaintenanceLock {
+            guard !isBusyService && !isUninstalling else { return }
+            isBusyService = true
+            defer { isBusyService = false }
+            guard await prepareForRemoval(stopProxy: true) else { return }
             do {
-                try FileManager.default.trashItem(at: appURL, resultingItemURL: nil)
-                NSApp.terminate(nil)
+                _ = try await client.call("system.shutdown", as: ShutdownResult.self)
             } catch {
-                let kept = mode == .full ? "数据与后台服务已移除" : "数据已保留"
-                showError("\(kept)，但移动应用失败：\(error.localizedDescription)。请手动把 OrbSleepManager.app 移到废纸篓。")
+                showError("无法通知后台服务退出：\(errorMessage(error))。已中止。")
+                return
             }
-        } else {
-            let kept = mode == .full ? "数据与后台服务已移除" : "数据已保留"
-            showNotice("\(kept)。请手动把 OrbSleepManager.app 移到废纸篓以完成卸载。")
+            guard await waitForDaemonToStop(seconds: 15) else {
+                showError("后台服务未退出，已中止移除。")
+                return
+            }
+            do {
+                try await backgroundService.unregister()
+            } catch {
+                showError("注销后台服务失败：\(errorMessage(error))。已中止。")
+                return
+            }
+            await backgroundService.removeLegacyAgent()
+            daemonReachable = false
+            refreshLocalState()
+            showNotice("已恢复托管服务并移除后台服务与开机启动。再次点击「启动」会重新注册。")
         }
     }
 
-    private func restoreAllManagedServices() async {
+    /// 应用内一键卸载。fail-closed 状态机：
+    /// 确认后台可用 → 恢复全部托管服务 → 确认为 0 → 停止并确认代理 →
+    /// 优雅停止并确认进程退出 → 注销 LaunchAgent → 最后才允许删除数据。
+    func uninstallApplication(mode: UninstallMode = .keepData) async {
+        await withMaintenanceLock {
+            guard !isUninstalling else { return }
+            isUninstalling = true
+            defer { isUninstalling = false }
+            let directory = dataDir
+
+            guard await prepareForRemoval(stopProxy: true) else { return }
+
+            do {
+                _ = try await client.call("system.shutdown", as: ShutdownResult.self)
+            } catch {
+                showError("无法通知后台服务退出：\(errorMessage(error))。已中止卸载。")
+                return
+            }
+            guard await waitForDaemonToStop(seconds: 15) else {
+                showError("后台服务未退出，已中止卸载（数据未删除）。")
+                return
+            }
+            do {
+                try await backgroundService.unregister()
+            } catch {
+                showError("注销后台服务失败：\(errorMessage(error))。已中止卸载。")
+                return
+            }
+            await backgroundService.removeLegacyAgent()
+            backgroundService.removeCLI()
+            daemonReachable = false
+            refreshLocalState()
+
+            // Only after every protection step passed may data be deleted.
+            if mode == .full {
+                try? FileManager.default.removeItem(atPath: directory)
+            }
+
+            let appURL = Bundle.main.bundleURL
+            if appURL.path.hasPrefix("/Applications") {
+                do {
+                    try FileManager.default.trashItem(at: appURL, resultingItemURL: nil)
+                    NSApp.terminate(nil)
+                } catch {
+                    let kept = mode == .full ? "数据与后台服务已移除" : "数据已保留"
+                    showError("\(kept)，但移动应用失败：\(error.localizedDescription)。请手动把 OrbSleepManager.app 移到废纸篓。")
+                }
+            } else {
+                let kept = mode == .full ? "数据与后台服务已移除" : "数据已保留"
+                showNotice("\(kept)。请手动把 OrbSleepManager.app 移到废纸篓以完成卸载。")
+            }
+        }
+    }
+
+    /// 卸载/移除后台服务前的公共保护链：任何一步失败都返回 false 并中止。
+    private func prepareForRemoval(stopProxy: Bool) async -> Bool {
+        // 1. The daemon must be reachable: without it we cannot see (let alone
+        //    restore) managed services, and deleting state would destroy the
+        //    only recovery material.
+        if !daemonReachable {
+            do {
+                try await ensureServiceRunning()
+            } catch {
+                showError("后台服务不可用（\(errorMessage(error))）。为避免托管服务失去恢复能力，已中止卸载。请先修复后台服务。")
+                return false
+            }
+        }
+
+        // 2. Restore every managed service and require a clean board.
+        if !(await restoreAllManagedServices()) { return false }
+        await refreshServices()
+        if !services.isEmpty {
+            showError("仍有 \(services.count) 个托管服务未恢复，已中止卸载。请先恢复这些服务后再卸载。")
+            return false
+        }
+
+        // 3. Stop OrbSleep's own proxy and verify it really stopped; otherwise
+        //    an unmanaged proxy container would survive the daemon.
+        if stopProxy {
+            do {
+                let value = try await client.call("proxy.stop", as: PlanApplyResult.self)
+                if let operationId = value.operationId {
+                    guard await waitOperation(operationId, timeoutSeconds: 180) else { return false }
+                }
+            } catch {
+                showError("停止 Lazy TCP Proxy 失败：\(errorMessage(error))。已中止卸载。")
+                return false
+            }
+            await refreshStatus(silent: true)
+            if status?.proxy?.running == true {
+                showError("代理容器仍在运行，已中止卸载。请在「诊断与修复」中处理后重试。")
+                return false
+            }
+        }
+        return true
+    }
+
+    /// 恢复全部托管服务；任何一次恢复失败（RPC 失败、操作失败、超时）都中止。
+    private func restoreAllManagedServices() async -> Bool {
         await refreshServices()
         for service in services {
             do {
@@ -1118,25 +1276,47 @@ final class AppState {
                     as: ServiceActionResult.self
                 )
                 if let operationId = value.operationId {
-                    await waitOperationForUninstall(operationId)
+                    guard await waitOperation(operationId) else { return false }
                 }
             } catch {
-                // Keep restoring the remaining services.
+                showError("恢复 \(service.displayName) 失败：\(errorMessage(error))。已中止。")
+                return false
             }
         }
+        return true
     }
 
-    private func waitOperationForUninstall(_ id: String, timeoutSeconds: Int = 60) async {
+    /// 等待操作终结。失败、超时、RPC 异常一律返回 false 并给出原因，
+    /// 绝不静默吞掉后继续删除步骤。
+    @discardableResult
+    private func waitOperation(_ id: String, timeoutSeconds: Int = 120) async -> Bool {
         let attempts = max(1, timeoutSeconds * 2)
         for _ in 0..<attempts {
-            guard let op = try? await client.call(
-                "operation.get",
-                params: ["id": .string(id)],
-                as: Operation.self
-            ) else { return }
-            if op.statusValue.isTerminal { return }
+            do {
+                let op = try await client.call(
+                    "operation.get",
+                    params: ["id": .string(id)],
+                    as: Operation.self
+                )
+                if op.statusValue.isTerminal {
+                    guard op.statusValue == .succeeded || op.statusValue == .rolledBack else {
+                        showError("操作未成功结束（\(op.statusValue.title)）：\(op.error ?? "无详情")。已中止后续步骤。")
+                        return false
+                    }
+                    return true
+                }
+            } catch {
+                showError("无法获取操作状态：\(errorMessage(error))。已中止后续步骤。")
+                return false
+            }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
+        showError("操作在 \(timeoutSeconds) 秒内未完成，已中止后续步骤。")
+        return false
+    }
+
+    private func errorMessage(_ error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
     private func handleServiceError(_ error: Error) {
@@ -1283,16 +1463,31 @@ final class AppState {
         }
     }
 
+    /// 加载自检结果（含 verify=true 的深度校验）。只有请求真正成功才算
+    /// 「已通过」：请求失败时检查列表可能是空的，不能把空列表当成全部通过。
     func loadDoctor() async {
         isLoadingDoctor = true
         defer { isLoadingDoctor = false }
+        doctorLoadState = .loading
         do {
-            let value = try await client.call("system.doctor", as: DoctorResult.self)
+            let value = try await client.call(
+                "system.doctor",
+                params: ["verify": .bool(true)],
+                as: DoctorResult.self
+            )
             doctorChecks = value.checks ?? []
             markReachable()
+            doctorLoadState = .succeeded
         } catch {
+            doctorLoadState = .failed
+            doctorChecks = []
             handle(error)
         }
+    }
+
+    /// 自检是否真正通过（必须加载成功且没有失败项）。
+    var doctorPassed: Bool {
+        doctorLoadState == .succeeded && doctorChecks.allSatisfy { $0.statusValue != .fail }
     }
 
     // MARK: 操作记录
@@ -1364,6 +1559,15 @@ final class AppState {
             let value = try await client.call("system.health", as: Health.self)
             health = value
             markReachable()
+            // Surface recoveries the user must know about, exactly once.
+            if value.restoreFailed == true, !didReportRestoreFailure {
+                didReportRestoreFailure = true
+                showError("上次备份恢复失败，后台已用现有数据库继续启动。恢复证据保留在数据目录（restore-failed-*.json），可在「日志与维护」中查看。")
+            }
+            if (value.needsRepairTransactions ?? 0) > 0, !didReportNeedsRepair {
+                didReportNeedsRepair = true
+                showError("有恢复失败的事务需要人工重试，请在「诊断与修复」中处理。")
+            }
         } catch {
             if !daemonReachable { health = nil } else { handle(error) }
         }
@@ -1407,12 +1611,18 @@ final class AppState {
         }
     }
 
-    func resolveRecovery() async {
+    func resolveRecovery(id: String? = nil) async {
         guard daemonReachable, !isBusyMaintenance else { return }
         isBusyMaintenance = true
         defer { isBusyMaintenance = false }
         do {
-            let value = try await client.call("system.recovery.resolve", as: RecoveryListResult.self)
+            var params: [String: JSONValue] = [:]
+            if let id { params["id"] = .string(id) }
+            let value = try await client.call(
+                "system.recovery.resolve",
+                params: params,
+                as: RecoveryListResult.self
+            )
             recoveryTransactions = value.transactions ?? []
             await refreshHealth()
             showNotice(value.message ?? "恢复处理已执行")
@@ -1449,28 +1659,37 @@ final class AppState {
     }
 
     /// 从备份恢复：后台服务先写恢复标记并退出，随后 GUI 重新启动服务，
-    /// 新进程在打开 SQLite 前应用备份。
+    /// 新进程在打开 SQLite 前应用备份。恢复属于独占维护操作。
     func restoreBackup(_ entry: BackupEntry) async {
-        guard daemonReachable, !isBusyMaintenance else { return }
-        isBusyMaintenance = true
-        defer { isBusyMaintenance = false }
-        do {
-            let result = try await client.call(
-                "backup.restore",
-                params: ["id": .string(entry.id)],
-                as: RestoreResult.self
-            )
-            _ = await waitForDaemonToStop(seconds: 15)
-            try await ensureServiceRunning()
-            refreshLocalState()
-            await refreshStatus()
-            await refreshHealth()
-            await refreshServices()
-            await loadSettings()
-            await loadBackups()
-            showNotice(result.message ?? "已从备份 \(entry.id) 恢复")
-        } catch {
-            handleServiceError(error)
+        await withMaintenanceLock {
+            guard daemonReachable, !isBusyMaintenance else { return }
+            isBusyMaintenance = true
+            defer { isBusyMaintenance = false }
+            do {
+                let result = try await client.call(
+                    "backup.restore",
+                    params: ["id": .string(entry.id)],
+                    as: RestoreResult.self
+                )
+                guard await waitForDaemonToStop(seconds: 15) else {
+                    showError("后台服务未按预期退出，恢复未开始。请在诊断中确认后台状态。")
+                    return
+                }
+                try await ensureServiceRunning()
+                refreshLocalState()
+                await refreshStatus()
+                await refreshHealth()
+                await refreshServices()
+                await loadSettings()
+                await loadBackups()
+                if health?.restoreFailed == true {
+                    showError("恢复失败：已保留恢复失败证据并继续使用现有数据库。")
+                } else {
+                    showNotice(result.message ?? "已从备份 \(entry.id) 恢复")
+                }
+            } catch {
+                handleServiceError(error)
+            }
         }
     }
 
@@ -1512,84 +1731,254 @@ final class AppState {
 
     func downloadAndInstallUpdate() async {
         guard case .available(let update) = updateStatus else { return }
-        updateStatus = .downloading(0)
-        do {
-            let package = try await updateManager.download(update) { [weak self] progress in
-                Task { @MainActor [weak self] in
-                    self?.updateStatus = .downloading(progress)
+        await withMaintenanceLock {
+            guard case .available = updateStatus else { return }
+            // 升级前事务安全检查：接入、恢复、代理配置修改进行中不能换包。
+            if daemonReachable {
+                do {
+                    let prep = try await client.call("system.prepareUpdate", as: ShutdownPreparation.self)
+                    if prep.safe == false {
+                        showError("存在未完成操作或事务，已暂停升级：\(prep.message ?? "")")
+                        return
+                    }
+                } catch {
+                    showError("升级前检查失败（\(errorMessage(error))），已暂停升级。")
+                    return
                 }
             }
-            updateStatus = .installing
-            try await updateManager.install(package: package)
-        } catch {
-            updateStatus = .failed(error.localizedDescription)
-            showError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            updateStatus = .downloading(0)
+            do {
+                let package = try await updateManager.download(update) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        self?.updateStatus = .downloading(progress)
+                    }
+                }
+                updateStatus = .installing
+                try await updateManager.install(package: package)
+            } catch {
+                updateStatus = .failed(error.localizedDescription)
+                showError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            }
         }
+    }
+
+    // MARK: 更新健康握手
+
+    /// 更新后的健康握手：UpdateManager 在替换包之前写入 update-in-progress
+    /// 标记，回滚脚本轮询 update-ok 文件。只有 GUI 正常启动且后台服务版本
+    /// 与 App 一致时才写 update-ok，否则脚本在超时后自动回滚旧版本。
+    private func completeUpdateHandshake() async {
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: dataDir)
+        let inProgress = dir.appendingPathComponent("update-in-progress.json")
+        guard fm.fileExists(atPath: inProgress.path) else { return }
+        struct Marker: Decodable {
+            var expectedVersion: String
+        }
+        guard let data = try? Data(contentsOf: inProgress),
+              let marker = try? JSONDecoder().decode(Marker.self, from: data),
+              marker.expectedVersion == appVersion,
+              status?.daemonVersion == appVersion else {
+            // Mismatched marker: leave it; the rollback script will time out
+            // and restore the old version.
+            return
+        }
+        // Tell the relaunch script the update is healthy, then clean up.
+        if !fm.createFile(atPath: dir.appendingPathComponent("update-ok").path, contents: Data()) {
+            return
+        }
+        try? fm.removeItem(at: inProgress)
+        // Remove the handshake file once the script had a chance to see it.
+        try? await Task.sleep(nanoseconds: 10_000_000_000)
+        try? fm.removeItem(at: dir.appendingPathComponent("update-ok"))
     }
 
     // MARK: 旧版安装迁移
 
-    /// 从 0.1.x 手动安装迁移：备份 → 安全停止旧服务 → 移除旧启动项 →
-    /// 注册包内后台服务 → 验证 → 清理旧二进制。不更换数据目录。
+    /// 从 0.1.x 手动安装迁移。任何一步失败都不会清理旧组件，也不显示
+    /// 「迁移完成」：
+    ///
+    /// 备份（新 API 或退出后直接拷库）→ 事务安全检查 → 停止旧服务 →
+    /// 移除旧 LaunchAgent（内容先留作回滚）→ 注册并启动包内服务 →
+    /// 校验版本与 Socket → 通过后才清理旧二进制。
+    ///
+    /// 0.1.x 没有 backup.create / system.prepareShutdown / system.shutdown，
+    /// 因此旧后台走专用路径：先经 launchd/pkill 停止，再做文件级备份。
     func migrateLegacyInstall() async {
-        guard !isMigrating else { return }
-        isMigrating = true
-        defer { isMigrating = false }
-        refreshLocalState()
+        await withMaintenanceLock {
+            guard !isMigrating else { return }
+            isMigrating = true
+            defer { isMigrating = false }
+            await migrateLegacyInstallLocked()
+        }
+    }
+
+    private func migrateLegacyInstallLocked() async {
+        await refreshLegacyDetection()
         let legacy = legacyInstallation
         guard legacy.isPresent else {
             showNotice("未检测到旧版安装")
             return
         }
-        if daemonReachable {
-            _ = try? await client.call("backup.create", as: BackupCreateResult.self)
-            if let prep = try? await client.call("system.prepareShutdown", as: ShutdownPreparation.self),
-               prep.safe == false {
-                showError("存在未完成事务，已暂停迁移：\(prep.message ?? "")。请先在“诊断与修复”中执行恢复。")
+
+        if await probeDaemon() && legacy.daemonExists {
+            await refreshStatus(silent: true)
+        }
+        let socketRunsNewDaemon = daemonReachable && status?.daemonVersion == appVersion
+
+        // 阶段 1：备份 + 事务安全检查。
+        if socketRunsNewDaemon {
+            // 新版后台在跑：用正式 API 备份并检查事务；失败一律中止。
+            do {
+                _ = try await client.call("backup.create", as: BackupCreateResult.self)
+            } catch {
+                showError("迁移中止：无法创建迁移备份（\(errorMessage(error))）。")
+                return
+            }
+            do {
+                let prep = try await client.call("system.prepareShutdown", as: ShutdownPreparation.self)
+                if prep.safe == false {
+                    showError("存在未完成事务，已暂停迁移：\(prep.message ?? "")。请先在「诊断与修复」中执行恢复。")
+                    return
+                }
+            } catch {
+                showError("迁移中止：安全检查失败（\(errorMessage(error))）。")
                 return
             }
             _ = try? await client.call("system.shutdown", as: ShutdownResult.self)
             if !(await waitForDaemonToStop(seconds: 10)) {
-                // 0.1.x daemons may predate system.shutdown; terminate the
-                // known manual-install binary and stop the old launchd job.
                 backgroundService.terminateLegacyDaemon()
                 _ = await waitForDaemonToStop(seconds: 8)
             }
+        } else {
+            // 0.1.x 或不可达：先停旧服务（旧版没有优雅停止 API），
+            // 退出后做文件级备份——0.1.x 无法通过 API 备份。
+            if await probeDaemon() {
+                backgroundService.terminateLegacyDaemon()
+                if !(await waitForDaemonToStop(seconds: 8)) {
+                    showError("旧后台服务未能退出，已中止迁移。")
+                    return
+                }
+            }
+            await backgroundService.bootoutLegacyJob()
+            if !(await waitForDaemonToStop(seconds: 5)) {
+                showError("旧后台服务仍未退出，已中止迁移。")
+                return
+            }
+            if !backupDataFilesForMigration() {
+                return
+            }
         }
-        backgroundService.bootoutLegacyJob()
-        _ = await waitForDaemonToStop(seconds: 5)
+
+        // 阶段 2：移除旧 LaunchAgent（内容先留作回滚材料）。
+        let savedPlist = backgroundService.readOldPlistData()
+        await backgroundService.bootoutLegacyJob()
         try? backgroundService.removeOldPlist()
+        _ = await waitForDaemonToStop(seconds: 5)
+
+        // 阶段 3：注册并启动包内服务，校验版本。
         do {
             try await ensureServiceRunning()
         } catch {
             handleServiceError(error)
+            if let savedPlist {
+                _ = await backgroundService.reinstallLegacyPlist(data: savedPlist)
+                showNotice("新版后台服务启动失败，已尝试恢复旧 LaunchAgent；旧组件未清理。")
+            } else {
+                showError("新版后台服务启动失败，迁移未完成（旧组件未清理）。")
+            }
+            await refreshLegacyDetection()
             return
         }
+        await refreshStatus(silent: true)
+        guard status?.daemonVersion == appVersion, backgroundService.installed else {
+            showError("新版后台服务版本校验失败（当前 \(status?.daemonVersion ?? "未知")），迁移未完成，旧组件未清理。")
+            return
+        }
+
+        // 阶段 4：校验通过后才允许清理旧二进制。
         var removed: [String] = []
         do {
-            removed = try backgroundService.cleanupLegacyBinaries()
+            removed = try await backgroundService.cleanupLegacyBinaries()
         } catch {
-            showError("旧版二进制清理未完成：\(error.localizedDescription)。可在“诊断与修复”中重试。")
+            showError("旧版二进制清理未完成：\(errorMessage(error))。可在「诊断与修复」中重试。")
         }
-        refreshLocalState()
+        await refreshLegacyDetection()
         await refreshStatus(silent: true)
         let suffix = removed.isEmpty ? "" : "，并移除 \(removed.count) 个旧二进制"
         showNotice("迁移完成：已切换到应用内后台服务\(suffix)。")
     }
 
-    /// 只清理旧版组件（/usr/local/bin 与旧 plist），不迁移服务。
-    func cleanupLegacyComponents() async {
-        guard !isBusyMaintenance else { return }
-        isBusyMaintenance = true
-        defer { isBusyMaintenance = false }
-        backgroundService.bootoutLegacyJob()
-        try? backgroundService.removeOldPlist()
+    /// 迁移前的文件级备份（旧版后台无备份 API）：停机后拷贝数据库与设置，
+    /// 并校验拷贝出的 SQLite 头部，失败即中止迁移。
+    private func backupDataFilesForMigration() -> Bool {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: dataDir)
+        let dest = root
+            .appendingPathComponent("backups", isDirectory: true)
+            .appendingPathComponent("migration", isDirectory: true)
+            .appendingPathComponent("pre-migration-\(Int(Date().timeIntervalSince1970))", isDirectory: true)
         do {
-            let removed = try backgroundService.cleanupLegacyBinaries()
-            refreshLocalState()
-            showNotice(removed.isEmpty ? "没有需要清理的旧组件" : "已清理 \(removed.count) 个旧组件")
+            try fm.createDirectory(at: dest, withIntermediateDirectories: true)
         } catch {
-            showError("清理旧组件失败：\(error.localizedDescription)")
+            showError("无法创建迁移备份目录：\(error.localizedDescription)。已中止迁移。")
+            return false
+        }
+        var dbCopied = false
+        for name in ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm", "settings.json"] {
+            let src = root.appendingPathComponent(name)
+            guard fm.fileExists(atPath: src.path) else { continue }
+            do {
+                try fm.copyItem(at: src, to: dest.appendingPathComponent(name))
+                if name == "state.sqlite" { dbCopied = true }
+            } catch {
+                showError("迁移备份失败（\(name)）：\(error.localizedDescription)。已中止迁移。")
+                return false
+            }
+        }
+        guard dbCopied else {
+            showError("数据目录中没有 state.sqlite，未做迁移备份。已中止迁移。")
+            return false
+        }
+        if let head = try? Data(contentsOf: dest.appendingPathComponent("state.sqlite")).prefix(16),
+           head != Data("SQLite format 3\u{00}".utf8) {
+            showError("迁移备份的数据库头部异常，已中止迁移。")
+            return false
+        }
+        showNotice("已创建迁移备份：\(dest.path)")
+        return true
+    }
+
+    /// 只清理旧版组件。仅当新版后台正常运行、版本一致且没有托管服务时才允许：
+    /// 旧 LaunchAgent 可能还在承担托管职责。
+    func cleanupLegacyComponents() async {
+        await withMaintenanceLock {
+            guard !isBusyMaintenance else { return }
+            isBusyMaintenance = true
+            defer { isBusyMaintenance = false }
+            guard await probeDaemon() else {
+                showError("后台服务未运行，暂不能清理旧组件。")
+                return
+            }
+            await refreshStatus(silent: true)
+            guard status?.daemonVersion == appVersion else {
+                showError("后台服务版本（\(status?.daemonVersion ?? "未知")）与 App（\(appVersion)）不一致，暂不能清理旧组件。")
+                return
+            }
+            await refreshServices()
+            guard services.isEmpty else {
+                showError("仍有 \(services.count) 个托管服务，暂不能清理旧组件。")
+                return
+            }
+            await backgroundService.bootoutLegacyJob()
+            try? backgroundService.removeOldPlist()
+            do {
+                let removed = try await backgroundService.cleanupLegacyBinaries()
+                await refreshLegacyDetection()
+                showNotice(removed.isEmpty ? "没有需要清理的旧组件" : "已清理 \(removed.count) 个旧组件")
+            } catch {
+                showError("清理旧组件失败：\(errorMessage(error))")
+            }
         }
     }
 

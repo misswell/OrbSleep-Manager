@@ -33,6 +33,13 @@ type Server struct {
 	wg        sync.WaitGroup
 	connMu    sync.Mutex
 	conns     map[net.Conn]struct{}
+
+	// baseCtx is canceled by Close so in-flight request handlers stop doing
+	// work instead of running to completion (or their own 10-minute timeout)
+	// while the process is shutting down.
+	baseCtx     context.Context
+	baseCancel  context.CancelFunc
+	baseCtxOnce sync.Once
 }
 
 type request struct {
@@ -120,6 +127,7 @@ func (s *Server) Serve() error {
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closing)
+		s.baseCtxOnce.Do(s.baseCancel)
 		s.ln.Close()
 		// Close idle GUI connections so shutdown cannot hang on a client that
 		// holds the socket open without sending requests.
@@ -187,7 +195,10 @@ func (s *Server) dispatch(req request) response {
 		resp.Error = &apiError{Code: "invalid_request", Message: "未知方法: " + req.Method}
 		return resp
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	s.baseCtxOnce.Do(func() {
+		s.baseCtx, s.baseCancel = context.WithCancel(context.Background())
+	})
+	ctx, cancel := context.WithTimeout(s.baseCtx, 10*time.Minute)
 	defer cancel()
 	result, err := h(ctx, req.Params)
 	if err != nil {
@@ -266,8 +277,14 @@ func (s *Server) handlers() map[string]handler {
 		"system.recovery.list": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return s.eng.RecoveryList(), nil
 		},
-		"system.recovery.resolve": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			return s.eng.RecoveryResolve(), nil
+		"system.recovery.resolve": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				ID string `json:"id"`
+			}
+			if len(params) > 0 {
+				_ = json.Unmarshal(params, &p)
+			}
+			return s.eng.RecoveryResolve(p.ID), nil
 		},
 		"docker.contexts": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return s.eng.DockerContexts(ctx), nil

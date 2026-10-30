@@ -34,12 +34,12 @@ GUI 与后台助手（`orbsleepd`）通过 **Unix Domain Socket** + **换行分�
 | `ping` | `{}` | `{"pong":true,"version":"0.1.0"}` |
 | `system.status` | `{}` | `Status` |
 | `system.health` | `{}` | `Health` |
-| `system.doctor` | `{}` | `{"checks":[DoctorCheck]}` |
+| `system.doctor` | `{"verify":false}`（true 追加深度校验项） | `{"checks":[DoctorCheck]}` |
 | `system.prepareShutdown` | `{}` | `{"safe":true,"runningOperations":[],"pendingTransactions":[],"message":"..."}` |
 | `system.prepareUpdate` | `{}` | `{"safe":true,...}` |
 | `system.shutdown` | `{}` | `{"ok":true,"shuttingDown":true}` |
-| `system.recovery.list` | `{}` | `{"transactions":[RecoveryTransaction],"resolved":0,"message":"..."}` |
-| `system.recovery.resolve` | `{}` | `{"transactions":[...],"resolved":1,"message":"..."}` |
+| `system.recovery.list` | `{}` | `{"transactions":[RecoveryTransaction],"message":"..."}`（含 running 与 rollback_failed/needs_repair） |
+| `system.recovery.resolve` | `{}` 或 `{"id":"txn-..."}`（按 ID 重试失败事务） | `{"transactions":[...],"message":"..."}` |
 | `docker.contexts` | `{}` | `{"contexts":[DockerContext],"selected":"unix://..."}` |
 | `docker.context.select` | `{"name":"OrbStack"}` 或 `{"endpoint":"unix://..."}` | `DockerContexts` |
 | `scan` | `{}` | `ScanResult` |
@@ -207,7 +207,7 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 
 ```json
 {
-  "daemonVersion": "0.2.0",
+  "daemonVersion": "0.2.1",
   "dataDir": "/Users/me/Library/Application Support/OrbSleep",
   "context": {"name":"orbstack","endpoint":"unix:///Users/me/.orbstack/run/docker.sock","kind":"orbstack"},
   "dockerReachable": true,

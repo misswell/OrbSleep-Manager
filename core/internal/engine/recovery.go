@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"orbsleep/internal/compose"
+	"orbsleep/internal/dockerx"
 	"orbsleep/internal/model"
 	"orbsleep/internal/state"
 )
@@ -19,6 +21,9 @@ import (
 // an abrupt process termination. It runs synchronously before the API starts.
 // RecoverTransaction retries exactly one interrupted transaction.
 func (e *Engine) RecoverTransaction(id string) error {
+	// One recovery coordinator lock for single and batch recovery: two
+	// concurrent recoveries could otherwise edit the same Compose file, proxy
+	// config and transaction rows at once.
 	e.recoveryMu.Lock()
 	defer e.recoveryMu.Unlock()
 	txn, ok, err := e.store.GetTransaction(id)
@@ -31,6 +36,7 @@ func (e *Engine) RecoverTransaction(id string) error {
 	if txn.Status != "running" && txn.Status != "rollback_failed" && txn.Status != "needs_repair" {
 		return fmt.Errorf("事务 %s 已是终态 %s", id, txn.Status)
 	}
+	e.lastRecovery = time.Now()
 	switch txn.Kind {
 	case "attach":
 		e.recoverAttachTxn(txn)
@@ -39,14 +45,15 @@ func (e *Engine) RecoverTransaction(id string) error {
 	default:
 		return fmt.Errorf("未知事务类型 %s", txn.Kind)
 	}
-	e.lastRecovery = time.Now()
 	return nil
 }
 
 func (e *Engine) RecoverTransactions() {
+	// Hold the coordinator lock for the whole batch so startup recovery, the
+	// reconcile loop and a GUI-triggered resolve can never run concurrently.
 	e.recoveryMu.Lock()
+	defer e.recoveryMu.Unlock()
 	e.lastRecovery = time.Now()
-	e.recoveryMu.Unlock()
 	txns, err := e.store.ListRunningTransactions()
 	if err != nil {
 		e.logger.Printf("warn", "读取未完成事务失败: %v", err)
@@ -88,6 +95,12 @@ func (e *Engine) recoverAttachTxn(txn state.Transaction) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
+
+	// Serialize against attach/detach, which hold writeMu for their whole run.
+	// Without this a recovery could edit a Compose file an in-flight attach is
+	// also editing. Lock order: recoveryMu → writeMu → per-file Compose lock.
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 
 	// If every item reached committed_item before the crash, the transaction is
 	// effectively committed; only the terminal marker was missing.
@@ -138,97 +151,8 @@ func (e *Engine) recoverAttachTxn(txn state.Transaction) {
 		if it.BackupPath == "" {
 			continue
 		}
-		hasRecord := false
-		if it.ServiceID != "" {
-			if _, ok, _ := e.store.GetService(it.ServiceID); ok {
-				hasRecord = true
-			}
-		}
-		// A previous failed recovery attempt may have left reconcile-created
-		// gateway listeners on the ports we are about to restore.
-		if it.ServiceID != "" {
-			e.gw.RemoveService(it.ServiceID)
-		}
-		current, rerr := os.ReadFile(it.ComposeFile)
-		if rerr != nil {
-			errs = append(errs, fmt.Sprintf("%s: 读取 Compose 失败: %v", it.ContainerName, rerr))
-			continue
-		}
-		expectedManaged := it.ManagedContent
-		if len(expectedManaged) == 0 {
-			// Crash after the atomic rename but before ManagedContent was
-			// persisted: the pending bytes are the new managed content.
-			expectedManaged = it.PendingContent
-		}
-		switch {
-		case len(expectedManaged) > 0 && bytes.Equal(current, expectedManaged):
-			if rerr := compose.RestoreFile(it.ComposeFile, it.BackupPath); rerr != nil {
-				errs = append(errs, fmt.Sprintf("%s: 恢复备份失败: %v", it.ContainerName, rerr))
-				if hasRecord {
-					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
-				}
-				continue
-			}
-			if !e.recoverVerifyOriginal(ctx, cli, it, logger, &errs) {
-				if hasRecord {
-					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
-				}
-				continue
-			}
-			if hasRecord {
-				if derr := e.store.DeleteService(it.ServiceID); derr != nil {
-					errs = append(errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
-					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
-					continue
-				}
-				_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
-			}
+		if e.recoverAttachItem(ctx, cli, txn.ID, it, logger, &errs) {
 			restored = append(restored, it.ContainerName)
-			logger.add("info", it.ContainerName+" 已恢复到接入前状态")
-		case bytes.Equal(current, it.Content):
-			// Compose was never modified (or a previous rollback already
-			// restored it). If a record survived, finish the original-state
-			// restore and verify the ports.
-			if hasRecord {
-				if !e.recoverVerifyOriginal(ctx, cli, it, logger, &errs) {
-					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
-					continue
-				}
-				if derr := e.store.DeleteService(it.ServiceID); derr != nil {
-					errs = append(errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
-					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
-					continue
-				}
-				_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
-			}
-			restored = append(restored, it.ContainerName)
-		case len(expectedManaged) == 0:
-			// Crash before this item wrote the Compose file: no managed or
-			// pending snapshot was ever persisted. Items sharing one Compose
-			// file must not be judged against plan-time Content — earlier
-			// items may already have committed their edits. Only this item's
-			// proxy registration needs undoing.
-			if hasRecord {
-				if !e.recoverVerifyOriginal(ctx, cli, it, logger, &errs) {
-					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
-					continue
-				}
-				if derr := e.store.DeleteService(it.ServiceID); derr != nil {
-					errs = append(errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
-					e.recoverRevertToManaged(ctx, cli, it, logger, &errs)
-					continue
-				}
-				_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
-			}
-			restored = append(restored, it.ContainerName)
-			logger.add("info", it.ContainerName+" 未修改过 Compose 文件，仅撤销其代理注册")
-		default:
-			errs = append(errs, fmt.Sprintf("%s: Compose 文件在事务中断后被外部修改，未覆盖", it.ContainerName))
-			if hasRecord {
-				if gerr := e.ensureGatewayForService(ctx, it.ServiceID); gerr != nil {
-					errs = append(errs, fmt.Sprintf("%s: 重新监听失败: %v", it.ContainerName, gerr))
-				}
-			}
 		}
 	}
 
@@ -264,6 +188,179 @@ func (e *Engine) recoverAttachTxn(txn state.Transaction) {
 	e.finishTxnAtomic(txn.ID, payload.OperationID, "rolled_back", nil, "rolled_back")
 }
 
+// recoverAttachItem rolls back one attach-transaction item. It returns true
+// when the item is back at its pre-attach state. The per-file Compose lock is
+// held for the whole item so a concurrent attach/detach on the same file
+// serializes against this recovery.
+func (e *Engine) recoverAttachItem(ctx context.Context, cli composeCLI, txnID string, it txnItem, logger *opLogger, errs *[]string) bool {
+	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
+	lock, lerr := e.composeLocker.Acquire(lockCtx, it.ComposeFile)
+	lockCancel()
+	if lerr != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: 获取 Compose 文件锁失败: %v", it.ContainerName, lerr))
+		return false
+	}
+	defer lock.Release()
+
+	hasRecord := false
+	if it.ServiceID != "" {
+		if _, ok, _ := e.store.GetService(it.ServiceID); ok {
+			hasRecord = true
+		}
+	}
+	// A previous failed recovery attempt may have left reconcile-created
+	// gateway listeners on the ports we are about to restore.
+	if it.ServiceID != "" {
+		e.gw.RemoveService(it.ServiceID)
+	}
+	current, rerr := os.ReadFile(it.ComposeFile)
+	if rerr != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: 读取 Compose 失败: %v", it.ContainerName, rerr))
+		return false
+	}
+	expectedManaged := it.ManagedContent
+	if len(expectedManaged) == 0 {
+		// Crash after the atomic rename but before ManagedContent was
+		// persisted: the pending bytes are the new managed content.
+		expectedManaged = it.PendingContent
+	}
+	switch {
+	case len(expectedManaged) > 0 && bytes.Equal(current, expectedManaged):
+		if rerr := compose.RestoreFile(it.ComposeFile, it.BackupPath); rerr != nil {
+			*errs = append(*errs, fmt.Sprintf("%s: 恢复备份失败: %v", it.ContainerName, rerr))
+			if hasRecord {
+				e.recoverRevertToManaged(ctx, cli, it, logger, errs)
+			}
+			return false
+		}
+		if !e.recoverVerifyOriginal(ctx, cli, it, logger, errs) {
+			if hasRecord {
+				e.recoverRevertToManaged(ctx, cli, it, logger, errs)
+			}
+			return false
+		}
+		if hasRecord {
+			if derr := e.store.DeleteService(it.ServiceID); derr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
+				e.recoverRevertToManaged(ctx, cli, it, logger, errs)
+				return false
+			}
+			_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+		}
+		logger.add("info", it.ContainerName+" 已恢复到接入前状态")
+		return true
+	case bytes.Equal(current, it.Content):
+		// Compose was never modified (or a previous rollback already
+		// restored it). If a record survived, finish the original-state
+		// restore and verify the ports.
+		if hasRecord {
+			if !e.recoverVerifyOriginal(ctx, cli, it, logger, errs) {
+				e.recoverRevertToManaged(ctx, cli, it, logger, errs)
+				return false
+			}
+			if derr := e.store.DeleteService(it.ServiceID); derr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
+				e.recoverRevertToManaged(ctx, cli, it, logger, errs)
+				return false
+			}
+			_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+		}
+		return true
+	case len(expectedManaged) == 0:
+		// Crash before this item wrote the Compose file: no managed or
+		// pending snapshot was ever persisted. Items sharing one Compose
+		// file must not be judged against plan-time Content — earlier
+		// items may already have committed their edits. Only this item's
+		// proxy registration needs undoing.
+		if hasRecord {
+			if !e.recoverVerifyOriginal(ctx, cli, it, logger, errs) {
+				e.recoverRevertToManaged(ctx, cli, it, logger, errs)
+				return false
+			}
+			if derr := e.store.DeleteService(it.ServiceID); derr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
+				e.recoverRevertToManaged(ctx, cli, it, logger, errs)
+				return false
+			}
+			_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+		}
+		logger.add("info", it.ContainerName+" 未修改过 Compose 文件，仅撤销其代理注册")
+		return true
+	default:
+		*errs = append(*errs, fmt.Sprintf("%s: Compose 文件在事务中断后被外部修改，未覆盖", it.ContainerName))
+		if hasRecord {
+			if gerr := e.ensureGatewayForService(ctx, it.ServiceID); gerr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 重新监听失败: %v", it.ContainerName, gerr))
+			}
+			return false
+		}
+		// No service record survived the crash, but the interrupted attach may
+		// already have removed the container's published ports. Without a
+		// repair route the workload is unreachable even though the proxy
+		// mapping is still in place. Rebuild availability from the payload.
+		if gerr := e.ensureGatewayRoutesForTxnItem(ctx, txnID, it); gerr != nil {
+			*errs = append(*errs, fmt.Sprintf("%s: 临时恢复监听失败: %v", it.ContainerName, gerr))
+		} else {
+			logger.add("warn", it.ContainerName+" 已按事务记录重建临时端口监听（服务记录缺失，接入已撤销）")
+		}
+		return false
+	}
+}
+
+// ensureGatewayRoutesForTxnItem installs host gateway listeners for an attach
+// item whose service record is gone: for every original binding the container
+// no longer publishes itself, route 127.0.0.1:host → proxy.
+func (e *Engine) ensureGatewayRoutesForTxnItem(ctx context.Context, txnID string, it txnItem) error {
+	s := e.settings.Get()
+	ins, err := e.inspectContainerBestEffort(ctx, it.ContainerName)
+	if err != nil {
+		return err
+	}
+	proxyIP := ""
+	if s.ProxyDialMode == "container_ip" {
+		proxyIP = e.proxyContainerIP(ctx)
+	}
+	routeID := it.ServiceID
+	if routeID == "" {
+		routeID = "recover-" + txnID
+	}
+	var lastErr error
+	for _, b := range it.Bindings {
+		pb := model.PortBinding{HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol}
+		if ins != nil && containerPublishes(ins, pb) {
+			// The container serves the host port itself again; adding a
+			// gateway listener would conflict.
+			continue
+		}
+		route, rerr := gatewayRouteFor(routeID, it.ContainerName, b, s, proxyIP)
+		if rerr != nil {
+			lastErr = rerr
+			continue
+		}
+		if err := e.gw.Ensure(route); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// inspectContainerBestEffort inspects a container by name; a missing container
+// returns (nil, nil) so callers can distinguish "gone" from "query failed".
+func (e *Engine) inspectContainerBestEffort(ctx context.Context, name string) (*dockerx.ContainerInspect, error) {
+	c, err := e.dockerClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ins, err := c.InspectContainer(ctx, name)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return ins, nil
+}
+
 // recoverDetachTxn restores the managed state for an interrupted restore/remove
 // operation, because the managed record still exists.
 func (e *Engine) recoverDetachTxn(txn state.Transaction) {
@@ -274,6 +371,20 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	// Same coordination as attach recovery: recoveryMu is already held by the
+	// caller; writeMu serializes against attach/detach, the per-file lock
+	// against anything else touching this Compose file.
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
+	lock, lerr := e.composeLocker.Acquire(lockCtx, p.Service.ComposeFile)
+	lockCancel()
+	if lerr != nil {
+		_ = e.store.FinishTransaction(txn.ID, "rollback_failed", "获取 Compose 文件锁失败: "+lerr.Error(), "rollback_failed")
+		e.setLastError("恢复操作未完成：获取 Compose 文件锁失败（事务保留，可重试）")
+		return
+	}
+	defer lock.Release()
 	e.logger.Printf("warn", "恢复未完成的恢复操作: %s", p.Service.ContainerName)
 	_, svcExists, _ := e.store.GetService(p.Service.ID)
 	if !svcExists {
@@ -282,7 +393,8 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 		e.finishTxnAtomic(txn.ID, p.OperationID, "committed", nil, "committed")
 		return
 	}
-	if _, err := e.dockerClient(ctx); err != nil {
+	c, err := e.dockerClient(ctx)
+	if err != nil {
 		e.logger.Printf("error", "未完成恢复操作：Docker 不可用: %v（事务保留）", err)
 		return
 	}
@@ -324,7 +436,10 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 		current = managed
 		rebuilt = true
 	}
+	_ = rebuilt
 	e.gw.RemoveService(p.Service.ID)
+	// External-modification protection applies only to a file that already
+	// exists: a rebuilt file is, by construction, the managed content.
 	if !rebuilt && !bytes.Equal(current, p.ManagedContent) {
 		if len(p.ManagedContent) == 0 {
 			fail("缺少托管 Compose 快照")
@@ -346,6 +461,17 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 			fail("恢复托管 Compose 失败: " + werr.Error())
 			return
 		}
+	}
+	// The Compose file now carries the managed content, but the container may
+	// still be in its pre-manage state (ports published) or gone entirely when
+	// the crash happened before UpService. Decide from the real container
+	// state, not from whether the file was rewritten.
+	needUp, derr := e.detachRecoveryNeedsUp(ctx, c, p.Service)
+	if derr != nil {
+		fail("检查容器状态失败: " + derr.Error())
+		return
+	}
+	if needUp {
 		workDir := p.WorkingDir
 		if workDir == "" {
 			workDir = filepath.Dir(p.Service.ComposeFile)
@@ -371,6 +497,29 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 	}
 	e.finishTxnAtomic(txn.ID, p.OperationID, "rolled_back", nil, "rolled_back")
 	e.logger.Printf("info", "未完成的恢复操作已回退到托管状态: %s", p.Service.ContainerName)
+}
+
+// detachRecoveryNeedsUp reports whether the container must be (re)created from
+// the managed Compose content: it is missing, or it still publishes one of the
+// service's original host ports (pre-manage state left by the interruption).
+func (e *Engine) detachRecoveryNeedsUp(ctx context.Context, c *dockerx.Client, svc model.Service) (bool, error) {
+	ins, err := c.InspectContainer(ctx, svc.ContainerName)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such") {
+			return true, nil // container gone: recreate it managed
+		}
+		return false, err
+	}
+	for _, b := range svc.Bindings {
+		if containerPublishes(ins, model.PortBinding{
+			HostPort:      b.HostPort,
+			ContainerPort: b.ContainerPort,
+			Protocol:      b.Protocol,
+		}) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // rebuildManagedCompose reconstructs managed Compose content for a service

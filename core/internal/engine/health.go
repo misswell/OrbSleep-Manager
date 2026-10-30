@@ -3,6 +3,7 @@ package engine
 import (
 	"archive/zip"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,29 +20,33 @@ import (
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/settings"
 	"orbsleep/internal/state"
+
+	_ "modernc.org/sqlite" // register the pure-Go driver for integrity checks
 )
 
 // Health returns the compact runtime health payload for the GUI.
 func (e *Engine) Health() model.Health {
 	st := e.Status()
-	txns, _ := e.store.ListRunningTransactions()
+	running, needsRepair, _ := e.store.CountUnresolvedTransactions()
 	ops, _ := e.store.ListRunningOperations()
 	return model.Health{
-		DaemonVersion:       e.version,
-		ProtocolVersion:     1,
-		DataDir:             e.dataDir,
-		SocketPath:          settings.SocketPath(e.dataDir),
-		UptimeSecs:          int64(time.Since(e.startedAt).Seconds()),
-		DockerReachable:     st.DockerReachable,
-		DockerContext:       st.Context,
-		Proxy:               st.Proxy,
-		Counts:              st.Counts,
-		PendingTransactions: len(txns),
-		RunningOperations:   len(ops),
-		LaunchAgentLoaded:   launchagent.Loaded(),
-		LegacyLaunchAgent:   launchagent.LegacyLoaded() || launchagent.LegacyInstalled(),
-		LegacyBinaries:      e.legacyBinaries(),
-		LastError:           st.LastError,
+		DaemonVersion:           e.version,
+		ProtocolVersion:         1,
+		DataDir:                 e.dataDir,
+		SocketPath:              settings.SocketPath(e.dataDir),
+		UptimeSecs:              int64(time.Since(e.startedAt).Seconds()),
+		DockerReachable:         st.DockerReachable,
+		DockerContext:           st.Context,
+		Proxy:                   st.Proxy,
+		Counts:                  st.Counts,
+		PendingTransactions:     running,
+		NeedsRepairTransactions: needsRepair,
+		RunningOperations:       len(ops),
+		RestoreFailed:           restoreFailedMarkerExists(e.dataDir),
+		LaunchAgentLoaded:       launchagent.Loaded(),
+		LegacyLaunchAgent:       launchagent.LegacyLoaded() || launchagent.LegacyInstalled(),
+		LegacyBinaries:          e.legacyBinaries(),
+		LastError:               st.LastError,
 	}
 }
 
@@ -86,29 +91,36 @@ func (e *Engine) PrepareUpdate() model.ShutdownPreparation {
 	return p
 }
 
-// RecoveryList returns pending durable transactions.
+// RecoveryList returns every unresolved transaction: running ones (auto
+// recovery candidates) plus rollback_failed / needs_repair ones that need a
+// manual retry. Hiding failed recoveries would make the GUI report "no
+// pending transactions" while ports are still detached.
 func (e *Engine) RecoveryList() model.RecoveryList {
-	txns, _ := e.store.ListRunningTransactions()
+	txns, _ := e.store.ListUnresolvedTransactions()
+	_, needsRepair, _ := e.store.CountUnresolvedTransactions()
+	msg := fmt.Sprintf("%d 个未完成事务", len(txns))
+	if needsRepair > 0 {
+		msg = fmt.Sprintf("%d 个未完成事务，其中 %d 个恢复失败需人工重试", len(txns), needsRepair)
+	}
 	return model.RecoveryList{
 		Transactions: mapRecoveryTransactions(txns),
-		Message:      fmt.Sprintf("%d 个未完成事务", len(txns)),
+		Message:      msg,
 	}
 }
 
-// RecoveryResolve tries to roll back/complete pending transactions and reports
-// what remains.
-func (e *Engine) RecoveryResolve() model.RecoveryList {
-	before, _ := e.store.ListRunningTransactions()
-	e.RecoverTransactions()
-	after, _ := e.store.ListRunningTransactions()
-	resolved := len(before) - len(after)
-	if resolved < 0 {
-		resolved = 0
+// RecoveryResolve retries recovery. With an empty id it re-runs batch
+// recovery for running transactions; with an id it retries that specific
+// transaction, including rollback_failed / needs_repair ones.
+func (e *Engine) RecoveryResolve(id string) model.RecoveryList {
+	if id != "" {
+		_ = e.RecoverTransaction(id)
+	} else {
+		e.RecoverTransactions()
 	}
+	txns, _ := e.store.ListUnresolvedTransactions()
 	return model.RecoveryList{
-		Transactions: mapRecoveryTransactions(after),
-		Resolved:     resolved,
-		Message:      fmt.Sprintf("已处理 %d 个，剩余 %d 个", resolved, len(after)),
+		Transactions: mapRecoveryTransactions(txns),
+		Message:      fmt.Sprintf("剩余 %d 个未解决事务", len(txns)),
 	}
 }
 
@@ -225,6 +237,23 @@ func (e *Engine) SelectDockerContext(ctx context.Context, nameOrEndpoint string)
 	if !chosen.Reachable {
 		return list, fmt.Errorf("该 Docker 上下文不可达: %s", chosen.Endpoint)
 	}
+	current := strings.TrimPrefix(strings.TrimSpace(e.settings.Get().DockerSocket), "unix://")
+	chosenEndpoint := strings.TrimPrefix(chosen.Endpoint, "unix://")
+	if chosenEndpoint != current {
+		// Managed services and in-flight transactions are pinned to the
+		// Docker instance they were created on; switching instances under
+		// them can attach wrong containers or corrupt Compose state.
+		services, serr := e.store.ListServices()
+		if serr != nil {
+			return list, fmt.Errorf("读取托管服务失败: %w", serr)
+		}
+		if len(services) > 0 {
+			return list, fmt.Errorf("仍有 %d 个托管服务，请先恢复后再切换 Docker 环境", len(services))
+		}
+		if _, running, _ := e.store.CountUnresolvedTransactions(); running > 0 {
+			return list, fmt.Errorf("存在未完成事务，请先完成恢复后再切换 Docker 环境")
+		}
+	}
 	s := e.settings.Get()
 	s.DockerSocket = strings.TrimPrefix(chosen.Endpoint, "unix://")
 	if err := e.settings.Save(s); err != nil {
@@ -245,25 +274,35 @@ func unixReachable(path string, timeout time.Duration) bool {
 	return true
 }
 
+// uniqueStamp returns a second-precision timestamp plus a random suffix so
+// two backups (or log exports) created in the same second never collide.
+func uniqueStamp() string {
+	rand := strings.TrimPrefix(newID(""), "-")
+	if len(rand) > 8 {
+		rand = rand[:8]
+	}
+	return fmt.Sprintf("%s-%s", time.Now().Format("20060102-150405"), rand)
+}
+
 // CreateBackup writes a consistent SQLite snapshot plus settings into a zip.
 func (e *Engine) CreateBackup() (model.BackupEntry, error) {
 	dir := filepath.Join(e.settings.Get().BackupDir, "export")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return model.BackupEntry{}, err
 	}
-	ts := time.Now().Format("20060102-150405")
-	snapshot := filepath.Join(dir, ".state-"+ts+".sqlite")
+	stamp := uniqueStamp()
+	snapshot := filepath.Join(dir, ".state-"+stamp+".sqlite")
 	if err := e.store.BackupTo(snapshot); err != nil {
 		return model.BackupEntry{}, fmt.Errorf("备份数据库失败: %w", err)
 	}
 	defer os.Remove(snapshot)
-	target := filepath.Join(dir, "OrbSleep-backup-"+ts+".zip")
+	target := filepath.Join(dir, "OrbSleep-backup-"+stamp+".zip")
 	if err := writeBackupZip(target, snapshot, e.settings.Get(), e.version); err != nil {
 		return model.BackupEntry{}, err
 	}
 	info, _ := os.Stat(target)
 	entry := model.BackupEntry{
-		ID:        "backup-" + ts,
+		ID:        "backup-" + stamp,
 		Path:      target,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		Kind:      "manual",
@@ -277,7 +316,7 @@ func (e *Engine) CreateBackup() (model.BackupEntry, error) {
 }
 
 func writeBackupZip(target, dbPath string, s model.Settings, version string) error {
-	f, err := os.Create(target)
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -290,25 +329,48 @@ func writeBackupZip(target, dbPath string, s model.Settings, version string) err
 		_, err = w.Write(data)
 		return err
 	}
-	dbData, err := os.ReadFile(dbPath)
+	dbFile, err := os.Open(dbPath)
 	if err != nil {
 		zw.Close()
 		f.Close()
 		return err
 	}
-	if err := write("state.sqlite", dbData); err != nil {
+	defer dbFile.Close()
+	dbEntry, err := zw.Create("state.sqlite")
+	if err != nil {
 		zw.Close()
 		f.Close()
 		return err
 	}
-	settingsData, _ := json.MarshalIndent(s, "", "  ")
-	_ = write("settings.json", settingsData)
-	manifest, _ := json.MarshalIndent(map[string]any{
+	// Stream instead of loading the whole database into memory.
+	if _, err := io.Copy(dbEntry, dbFile); err != nil {
+		zw.Close()
+		f.Close()
+		return err
+	}
+	dbFile.Close()
+	settingsData, err := json.MarshalIndent(s, "", "  ")
+	if err == nil {
+		err = write("settings.json", settingsData)
+	}
+	if err != nil {
+		zw.Close()
+		f.Close()
+		return fmt.Errorf("写入备份条目失败: %w", err)
+	}
+	manifest, err := json.MarshalIndent(map[string]any{
 		"version":   version,
 		"createdAt": time.Now().UTC().Format(time.RFC3339),
 		"dataDir":   s.DataDir,
 	}, "", "  ")
-	_ = write("manifest.json", manifest)
+	if err == nil {
+		err = write("manifest.json", manifest)
+	}
+	if err != nil {
+		zw.Close()
+		f.Close()
+		return fmt.Errorf("写入备份条目失败: %w", err)
+	}
 	if err := zw.Close(); err != nil {
 		f.Close()
 		return err
@@ -354,7 +416,7 @@ func (e *Engine) ExportLogs(limit int) (model.LogsExportResult, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return model.LogsExportResult{}, err
 	}
-	path := filepath.Join(dir, "logs-"+time.Now().Format("20060102-150405")+".log")
+	path := filepath.Join(dir, "logs-"+uniqueStamp()+".log")
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
 		return model.LogsExportResult{}, err
 	}
@@ -423,6 +485,10 @@ func validateBackupZip(path string) error {
 // ApplyPendingRestore is called by orbsleepd before opening SQLite. It replaces
 // state.sqlite with the snapshot from a previously requested backup, preserving
 // the current database as state.sqlite.pre-restore-<ts>.
+//
+// Any failure quarantines the marker as restore-failed-<ts>.json and returns a
+// *RestoreError. The caller must keep starting with the existing database:
+// the daemon must never enter a launchd restart loop over a broken backup.
 func ApplyPendingRestore(dataDir string) error {
 	marker := filepath.Join(dataDir, "restore-request.json")
 	raw, err := os.ReadFile(marker)
@@ -432,17 +498,27 @@ func ApplyPendingRestore(dataDir string) error {
 		}
 		return err
 	}
+	fail := func(format string, args ...any) error {
+		cause := fmt.Sprintf(format, args...)
+		stamp := time.Now().Format("20060102-150405")
+		quarantine := filepath.Join(dataDir, "restore-failed-"+stamp+".json")
+		if qerr := os.Rename(marker, quarantine); qerr != nil {
+			_ = os.Remove(marker)
+			cause += "（恢复标记已删除，证据丢失于 " + qerr.Error() + "）"
+		}
+		return &RestoreError{Cause: cause}
+	}
 	var req struct {
 		BackupPath string `json:"backupPath"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil || req.BackupPath == "" {
-		_ = os.Remove(marker)
-		return fmt.Errorf("恢复请求无效: %v", err)
+		return fail("恢复请求无效: %v", err)
 	}
 	r, err := zip.OpenReader(req.BackupPath)
 	if err != nil {
-		return fmt.Errorf("打开备份失败: %w", err)
+		return fail("打开备份失败: %v", err)
 	}
+	defer r.Close()
 	var src *zip.File
 	for _, f := range r.File {
 		if f.Name == "state.sqlite" {
@@ -451,57 +527,81 @@ func ApplyPendingRestore(dataDir string) error {
 		}
 	}
 	if src == nil {
-		r.Close()
-		return fmt.Errorf("备份缺少 state.sqlite")
+		return fail("备份缺少 state.sqlite")
 	}
 	rc, err := src.Open()
 	if err != nil {
-		r.Close()
-		return err
+		return fail("读取备份条目失败: %v", err)
 	}
 	temp := filepath.Join(dataDir, ".restore-state.tmp")
 	out, err := os.OpenFile(temp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		rc.Close()
-		r.Close()
-		return err
+		return fail("写入临时数据库失败: %v", err)
 	}
 	if _, err := io.Copy(out, rc); err != nil {
 		out.Close()
 		rc.Close()
-		r.Close()
-		return err
+		return fail("解压备份数据库失败: %v", err)
 	}
 	out.Close()
 	rc.Close()
-	r.Close()
 
-	header := make([]byte, 16)
-	f, err := os.Open(temp)
-	if err != nil {
-		return err
-	}
-	n, _ := f.Read(header)
-	f.Close()
-	if n < 16 || string(header[:16]) != "SQLite format 3\x00" {
-		return fmt.Errorf("备份中的 state.sqlite 不是有效的 SQLite 文件")
+	// A matching file header is not enough: verify the database actually
+	// opens and passes integrity_check before replacing the live one.
+	if err := sqliteIntegrityCheck(temp); err != nil {
+		return fail("备份数据库完整性校验失败: %v", err)
 	}
 
 	dbPath := filepath.Join(dataDir, "state.sqlite")
 	if _, err := os.Stat(dbPath); err == nil {
 		backup := filepath.Join(dataDir, "state.sqlite.pre-restore-"+time.Now().Format("20060102-150405"))
 		if err := copyFile(dbPath, backup); err != nil {
-			return fmt.Errorf("备份当前数据库失败: %w", err)
+			return fail("备份当前数据库失败: %v", err)
 		}
 	}
 	_ = os.Remove(dbPath + "-wal")
 	_ = os.Remove(dbPath + "-shm")
 	if err := os.Rename(temp, dbPath); err != nil {
-		return fmt.Errorf("替换数据库失败: %w", err)
+		return fail("替换数据库失败: %v", err)
 	}
 	_ = os.Remove(marker)
 	fmt.Fprintf(os.Stderr, "已从备份恢复数据库: %s\n", req.BackupPath)
 	return nil
+}
+
+// RestoreError marks a failed backup restore. The daemon continues starting
+// with the existing database instead of exiting into a launchd restart loop.
+type RestoreError struct {
+	Cause string
+}
+
+func (e *RestoreError) Error() string { return e.Cause }
+
+// sqliteIntegrityCheck opens path with the project's pure-Go SQLite driver
+// and runs PRAGMA integrity_check.
+func sqliteIntegrityCheck(path string) error {
+	dsn := "file:" + path + "?_pragma=busy_timeout(3000)&_pragma=journal_mode(DELETE)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var result string
+	if err := db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("integrity_check: %s", result)
+	}
+	return nil
+}
+
+// restoreFailedMarkerExists reports whether a quarantined restore marker is
+// present, so the GUI can tell the user a restore attempt failed.
+func restoreFailedMarkerExists(dataDir string) bool {
+	matches, _ := filepath.Glob(filepath.Join(dataDir, "restore-failed-*.json"))
+	return len(matches) > 0
 }
 
 func copyFile(src, dst string) error {

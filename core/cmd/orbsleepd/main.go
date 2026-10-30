@@ -15,7 +15,7 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	// Keep state, logs and backups readable by the current user only.
@@ -44,10 +44,17 @@ func main() {
 		sock = settings.SocketPath(dir)
 	}
 	// A previous backup.restore request is applied before SQLite is opened, so
-	// the engine starts from the restored database.
+	// the engine starts from the restored database. A failed restore must NOT
+	// exit non-zero: launchd (KeepAlive.SuccessfulExit=false) would restart us
+	// into the same failure forever. The marker is quarantined by
+	// ApplyPendingRestore; the daemon keeps running on the existing database.
 	if err := engine.ApplyPendingRestore(dir); err != nil {
-		fmt.Fprintln(os.Stderr, "恢复备份失败:", err)
-		os.Exit(1)
+		var restoreErr *engine.RestoreError
+		if errors.As(err, &restoreErr) {
+			fmt.Fprintf(os.Stderr, "恢复备份失败（保留现有数据库继续启动）: %s\n", restoreErr.Cause)
+		} else {
+			fmt.Fprintln(os.Stderr, "读取恢复请求失败，继续启动:", err)
+		}
 	}
 	eng, err := engine.New(version, dir)
 	if err != nil {

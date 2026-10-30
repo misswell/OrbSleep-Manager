@@ -90,9 +90,45 @@ func (l *FileLocker) acquireLocal(ctx context.Context, key string) error {
 		l.mu.Unlock()
 		select {
 		case <-ctx.Done():
+			// Leave the queue only after losing a race with a release signal;
+			// otherwise the transfer below would hand ownership to us and
+			// we would drop it on the floor.
+			l.mu.Lock()
+			_, stillQueued := l.waiterIndex(key, ch)
+			if stillQueued {
+				l.removeWaiterLocked(key, ch)
+				l.mu.Unlock()
+				return ctx.Err()
+			}
+			l.mu.Unlock()
+			// A release already transferred ownership to us; pass it on.
+			l.releaseLocal(key)
 			return ctx.Err()
 		case <-ch:
+			if err := ctx.Err(); err != nil {
+				l.releaseLocal(key)
+				return err
+			}
 		}
+	}
+}
+
+func (l *FileLocker) waiterIndex(key string, ch chan struct{}) (int, bool) {
+	for i, c := range l.waitQ[key] {
+		if c == ch {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+func (l *FileLocker) removeWaiterLocked(key string, ch chan struct{}) {
+	if i, ok := l.waiterIndex(key, ch); ok {
+		q := l.waitQ[key]
+		l.waitQ[key] = append(q[:i:i], q[i+1:]...)
+	}
+	if len(l.waitQ[key]) == 0 {
+		delete(l.waitQ, key)
 	}
 }
 
@@ -123,7 +159,10 @@ func (f *FileLock) Release() {
 	f.once.Do(func() {
 		_ = syscall.Flock(int(f.file.Fd()), syscall.LOCK_UN)
 		_ = f.file.Close()
-		_ = os.Remove(f.path)
+		// The lock file is deliberately kept: removing it lets a third process
+		// create a new inode while a second process is still flock-waiting on
+		// the old one, breaking cross-process mutual exclusion. Stale lock
+		// files are harmless.
 		f.locker.releaseLocal(f.key)
 	})
 }

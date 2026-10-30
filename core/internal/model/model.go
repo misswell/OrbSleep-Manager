@@ -169,6 +169,11 @@ type Service struct {
 	CreatedAt         string    `json:"createdAt"`
 	LastError         string    `json:"lastError"`
 	ExcludedFromSleep bool      `json:"excludedFromSleep"`
+	// DockerSocket pins the service to the Docker instance it was attached on
+	// (unix socket path without the unix:// prefix). Empty for records created
+	// before this field existed; reconcile never rebinds a record to a
+	// different socket by name.
+	DockerSocket string `json:"dockerSocket,omitempty"`
 }
 
 // Range is an inclusive port range.
@@ -262,11 +267,15 @@ type Health struct {
 	Proxy               ProxyStatus `json:"proxy"`
 	Counts              Counts      `json:"counts"`
 	PendingTransactions int         `json:"pendingTransactions"`
-	RunningOperations   int         `json:"runningOperations"`
-	LaunchAgentLoaded   bool        `json:"launchAgentLoaded"`
-	LegacyLaunchAgent   bool        `json:"legacyLaunchAgent"`
-	LegacyBinaries      []string    `json:"legacyBinaries"`
-	LastError           LastError   `json:"lastError"`
+	// Transactions whose recovery failed (rollback_failed / needs_repair):
+	// invisible to auto-recovery, must surface in the GUI and block uninstall.
+	NeedsRepairTransactions int       `json:"needsRepairTransactions"`
+	RunningOperations       int       `json:"runningOperations"`
+	RestoreFailed           bool      `json:"restoreFailed"`
+	LaunchAgentLoaded       bool      `json:"launchAgentLoaded"`
+	LegacyLaunchAgent       bool      `json:"legacyLaunchAgent"`
+	LegacyBinaries          []string  `json:"legacyBinaries"`
+	LastError               LastError `json:"lastError"`
 }
 
 // RecoveryTransaction is a durable in-flight transaction exposed to the GUI.

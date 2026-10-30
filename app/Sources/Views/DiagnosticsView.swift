@@ -384,7 +384,7 @@ struct DiagnosticsView: View {
                     ForEach(app.recoveryTransactions) { txn in
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(txn.status == "rollback_failed" || txn.status == "needs_repair" ? Color.red : Color.orange)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("\(txn.kind ?? "事务") · \(txn.id)")
                                     .font(.callout.weight(.medium))
@@ -396,6 +396,13 @@ struct DiagnosticsView: View {
                                 }
                             }
                             Spacer()
+                            if txn.status == "rollback_failed" || txn.status == "needs_repair" {
+                                Button("重试恢复") {
+                                    Task { await app.resolveRecovery(id: txn.id) }
+                                }
+                                .disabled(app.isBusyMaintenance)
+                                .controlSize(.small)
+                            }
                         }
                     }
                 }

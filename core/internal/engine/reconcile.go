@@ -97,6 +97,7 @@ func (e *Engine) reconcile() {
 	e.activityMu.Unlock()
 
 	keep := map[string]bool{}
+	clientSocket := c.Socket()
 	for i := range services {
 		orig := services[i]
 		svc := &services[i]
@@ -107,7 +108,11 @@ func (e *Engine) reconcile() {
 				summary = &s
 			}
 		}
-		if summary == nil {
+		if summary == nil && (svc.DockerSocket == "" || svc.DockerSocket == clientSocket) {
+			// Rebind by name only on the Docker instance the service was
+			// attached on (or a legacy record without a pin). Two Docker
+			// instances can run same-named containers; adopting one from
+			// the wrong instance would sleep/restore the wrong workload.
 			if s, ok := byName[svc.ContainerName]; ok {
 				summary = &s
 				svc.ContainerID = s.ID
@@ -115,7 +120,11 @@ func (e *Engine) reconcile() {
 		}
 		status := "missing"
 		if summary == nil {
-			lastErr = "容器不存在（可能已被删除）"
+			if svc.DockerSocket != "" && svc.DockerSocket != clientSocket {
+				lastErr = "容器不在当前 Docker 实例（服务绑定于 " + svc.DockerSocket + "）"
+			} else {
+				lastErr = "容器不存在（可能已被删除）"
+			}
 		} else {
 			svc.ContainerID = summary.ID
 			switch {

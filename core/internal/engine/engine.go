@@ -471,10 +471,12 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 	var c *dockerx.Client
 	var err error
 	if selected := strings.TrimSpace(e.settings.Get().DockerSocket); selected != "" {
+		// The user pinned a Docker instance. Never silently fall back to
+		// another one: attach/recovery would then run against the wrong
+		// containers. Report the failure instead.
 		c, err = dockerx.New(detectCtx, strings.TrimPrefix(selected, "unix://"))
 		if err != nil {
-			e.logger.Printf("warn", "选定的 Docker Socket 不可用（%s）：%v；回退自动检测", selected, err)
-			c, err = dockerx.Detect(detectCtx)
+			err = fmt.Errorf("选定的 Docker Socket 不可用（%s）: %w；不回退到其他 Docker 实例，请在设置中检查或更换", selected, err)
 		}
 	} else {
 		c, err = dockerx.Detect(detectCtx)

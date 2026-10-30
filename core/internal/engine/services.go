@@ -168,6 +168,17 @@ func (e *Engine) startDetach(svc model.Service, remove bool) (string, error) {
 }
 
 func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Operation, remove bool, done func()) {
+	// done() (and therefore txnWG.Done) must run on every exit path, including
+	// the early lock-failure return: beginOperation already incremented the
+	// counter before this goroutine started.
+	defer done()
+
+	// Same lock order as runAttach: writeMu first, then the per-file Compose
+	// lock. Acquiring them the other way around deadlocks against a concurrent
+	// attach on the same file.
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
 	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
 	lock, lerr := e.composeLocker.Acquire(lockCtx, svc.ComposeFile)
 	lockCancel()
@@ -177,9 +188,6 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 		return
 	}
 	defer lock.Release()
-	defer done()
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
 	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("开始恢复 %s 的原始端口映射", svc.ContainerName))
 	composeFile := svc.ComposeFile

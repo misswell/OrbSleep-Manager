@@ -7,9 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (for example v0.1.5)"
+        description: "Tag to build (for example v0.2.1)"
         required: true
-        default: "v0.1.5"
         type: string
       ref:
         description: "Optional git ref to build (defaults to the tag)"
@@ -133,6 +132,8 @@ jobs:
         run: |
           set -euo pipefail
           security unlock-keychain -p "$(cat "$SIGNING_KEYCHAIN_PASSWORD_FILE")" "$SIGNING_KEYCHAIN"
+          version="$(awk '/MARKETING_VERSION:/ {print $2; exit}' app/project.yml)"
+          export UPDATE_BASE_URL="https://github.com/misswell/OrbSleep-Manager/releases/download/v${version}"
           ./scripts/package-release.sh
 
       - name: Verify release artifacts
@@ -205,6 +206,7 @@ jobs:
             dist/*.dmg
             dist/*.zip
             dist/SHA256SUMS
+            dist/appcast.json
 
       - name: Verify tag matches source
         if: github.event_name == 'push'
@@ -226,10 +228,14 @@ jobs:
           dmg="dist/OrbSleepManager-$version-macos-universal.dmg"
           zip="dist/OrbSleepManager-$version-macos-universal.zip"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$dmg" "$zip" dist/SHA256SUMS \
+            args=("$dmg" "$zip" dist/SHA256SUMS)
+            [[ -f dist/appcast.json ]] && args+=(dist/appcast.json)
+            gh release upload "$RELEASE_TAG" "${args[@]}" \
               --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$RELEASE_TAG" "$dmg" "$zip" dist/SHA256SUMS \
+            args=("$dmg" "$zip" dist/SHA256SUMS)
+            [[ -f dist/appcast.json ]] && args+=(dist/appcast.json)
+            gh release create "$RELEASE_TAG" "${args[@]}" \
               --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "OrbSleep Manager $RELEASE_TAG" --generate-notes
           fi

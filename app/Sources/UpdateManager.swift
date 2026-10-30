@@ -40,9 +40,16 @@ private struct UpdateFeed: Decodable {
 
 /// 应用内更新：检查源、下载、校验、替换 App Bundle，并在新版本启动失败时回滚。
 ///
-/// 不依赖 Shell 字符串拼接；所有外部命令都以固定参数通过 `Process` 调用。
+/// 安全要求：更新包必须带 SHA256、下载地址必须 HTTPS、新包必须通过
+/// codesign 与 Gatekeeper 校验，且 Team Identifier / Bundle ID 必须是
+/// OrbSleep 自己的——任何一项不满足都拒绝安装。
+/// 不依赖 Shell 字符串拼接；所有外部命令都以固定参数通过 `ProcessRunner` 调用。
 @MainActor
 final class UpdateManager {
+    /// 只接受本团队的签名。
+    static let expectedTeamID = "U8U443D7ZL"
+    static let expectedBundleID = "com.misswell.orbsleepmanager"
+
     static var feedURL: URL? {
         if let value = ProcessInfo.processInfo.environment["ORBSLEEP_UPDATE_FEED"],
            let url = URL(string: value) {
@@ -79,6 +86,14 @@ final class UpdateManager {
         guard Self.compareVersions(decoded.version, currentVersion) > 0 else {
             return nil
         }
+        guard let sha = decoded.sha256, !sha.isEmpty else {
+            throw UpdateError.invalidFeed("更新源缺少 SHA256，拒绝安装")
+        }
+        let downloadURL = decoded.downloadURL
+        guard let url = URL(string: downloadURL),
+              url.scheme == "https" || Self.isLocal(url) else {
+            throw UpdateError.invalidFeed("下载地址必须是 HTTPS")
+        }
         return AppUpdate(
             version: decoded.version,
             notes: decoded.notes,
@@ -89,6 +104,10 @@ final class UpdateManager {
         )
     }
 
+    private static func isLocal(_ url: URL) -> Bool {
+        url.host == "localhost" || url.host == "127.0.0.1"
+    }
+
     func download(
         _ update: AppUpdate,
         progress: @escaping @Sendable (Double) -> Void
@@ -96,22 +115,27 @@ final class UpdateManager {
         guard let string = update.downloadURL, let url = URL(string: string) else {
             throw UpdateError.invalidFeed("downloadURL 无效")
         }
+        guard let expected = update.sha256, !expected.isEmpty else {
+            throw UpdateError.invalidFeed("更新源缺少 SHA256，拒绝下载安装")
+        }
+        guard url.scheme == "https" || Self.isLocal(url) else {
+            throw UpdateError.invalidFeed("下载地址必须是 HTTPS")
+        }
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbSleepUpdate-\(UUID().uuidString)")
             .appendingPathExtension(url.pathExtension.isEmpty ? "zip" : url.pathExtension)
         let loader = DownloadLoader(progress: progress, destination: destination)
         try await loader.start(url: url)
-        if let expected = update.sha256, !expected.isEmpty {
-            let actual = try Self.sha256(of: destination)
-            guard actual.caseInsensitiveCompare(expected) == .orderedSame else {
-                try? FileManager.default.removeItem(at: destination)
-                throw UpdateError.checksumMismatch
-            }
+        let actual = try Self.sha256(of: destination)
+        guard actual.caseInsensitiveCompare(expected) == .orderedSame else {
+            try? FileManager.default.removeItem(at: destination)
+            throw UpdateError.checksumMismatch
         }
         return destination
     }
 
-    /// 替换当前 App Bundle，保留旧版本；若新版本在 12 秒内未运行则自动回滚。
+    /// 替换当前 App Bundle，保留旧版本；新版本必须在 45 秒内通过健康握手
+    /// （GUI 正常启动且后台服务版本一致后写入 update-ok），否则自动回滚。
     func install(package: URL) async throws {
         let appURL = Bundle.main.bundleURL
         let work = FileManager.default.temporaryDirectory
@@ -120,10 +144,11 @@ final class UpdateManager {
         defer { try? FileManager.default.removeItem(at: work) }
 
         let newApp = try await extractApp(from: package, into: work)
-        try verifySignature(newApp)
+        try await verifySignature(newApp)
 
-        let backupRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/OrbSleep/app-backup", isDirectory: true)
+        let supportDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/OrbSleep", isDirectory: true)
+        let backupRoot = supportDir.appendingPathComponent("app-backup", isDirectory: true)
         try FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
         let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
         let oldApp = backupRoot.appendingPathComponent("OrbSleepManager-\(currentVersion)-\(timestamp).app")
@@ -140,17 +165,36 @@ final class UpdateManager {
             throw UpdateError.installFailed("替换应用失败：\(error.localizedDescription)")
         }
 
+        // Health handshake markers: the GUI writes `update-ok` after it has
+        // booted AND verified the bundled daemon version; the script rolls
+        // back if it never appears. Stale state from a previous update is
+        // cleared first.
+        let okMarker = supportDir.appendingPathComponent("update-ok")
+        let inProgress = supportDir.appendingPathComponent("update-in-progress.json")
+        try? FileManager.default.removeItem(at: okMarker)
+        let markerPayload: [String: String] = [
+            "expectedVersion": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "",
+            "startedAt": ISO8601DateFormatter().string(from: Date()),
+        ]
+        if let payload = try? JSONSerialization.data(withJSONObject: markerPayload, options: [.sortedKeys]) {
+            try? payload.write(to: inProgress, options: .atomic)
+        }
+
         let helper = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbSleep-relaunch-\(UUID().uuidString).sh")
         let script = """
         #!/bin/bash
         set -u
-        APP="$1"; OLD="$2"; OLDPID="$3"
+        APP="$1"; OLD="$2"; OLDPID="$3"; OKMARK="$4"
+        rm -f "$OKMARK"
         sleep 3
         open -n "$APP" >/dev/null 2>&1
-        sleep 12
-        NEW=$(pgrep -f "$APP/Contents/MacOS/OrbSleepManager" | grep -v "^$OLDPID$" | head -1)
-        if [ -n "$NEW" ]; then exit 0; fi
+        # Wait for the health handshake instead of a bare process check: a GUI
+        # that starts but never reaches a healthy daemon still counts as failed.
+        for _ in $(seq 1 45); do
+            if [ -f "$OKMARK" ]; then exit 0; fi
+            sleep 1
+        done
         rm -rf "$APP"
         mv "$OLD" "$APP"
         open -n "$APP" >/dev/null 2>&1
@@ -160,7 +204,7 @@ final class UpdateManager {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [helper.path, appURL.path, oldApp.path, "\(ProcessInfo.processInfo.processIdentifier)"]
+        process.arguments = [helper.path, appURL.path, oldApp.path, "\(ProcessInfo.processInfo.processIdentifier)", okMarker.path]
         try process.run()
         NSApp.terminate(nil)
     }
@@ -176,25 +220,25 @@ final class UpdateManager {
         if ext == "dmg" {
             let mount = work.appendingPathComponent("mnt", isDirectory: true)
             try fm.createDirectory(at: mount, withIntermediateDirectories: true)
-            try run("/usr/bin/hdiutil", ["attach", package.path, "-nobrowse", "-quiet", "-mountpoint", mount.path])
-            defer { try? run("/usr/bin/hdiutil", ["detach", mount.path, "-quiet"]) }
+            try await run("/usr/bin/hdiutil", ["attach", package.path, "-nobrowse", "-quiet", "-mountpoint", mount.path])
+            defer { Task { try? await run("/usr/bin/hdiutil", ["detach", mount.path, "-quiet"]) } }
             guard let app = try fm.contentsOfDirectory(at: mount, includingPropertiesForKeys: nil)
                 .first(where: { $0.pathExtension == "app" }) else {
                 throw UpdateError.invalidPackage("DMG 中没有 .app")
             }
             let copy = extractDir.appendingPathComponent(app.lastPathComponent)
-            try run("/usr/bin/ditto", [app.path, copy.path])
+            try await run("/usr/bin/ditto", [app.path, copy.path])
             return copy
         }
 
         if ext == "zip" {
-            try run("/usr/bin/ditto", ["-x", "-k", package.path, extractDir.path])
+            try await run("/usr/bin/ditto", ["-x", "-k", package.path, extractDir.path])
             if let app = findApp(in: extractDir) { return app }
             throw UpdateError.invalidPackage("ZIP 中没有 .app")
         }
         if ext == "app" {
             let copy = extractDir.appendingPathComponent(package.lastPathComponent)
-            try run("/usr/bin/ditto", [package.path, copy.path])
+            try await run("/usr/bin/ditto", [package.path, copy.path])
             return copy
         }
         throw UpdateError.invalidPackage("仅支持 .zip / .dmg / .app")
@@ -212,30 +256,46 @@ final class UpdateManager {
         return nil
     }
 
-    private func verifySignature(_ app: URL) throws {
+    /// 签名与身份校验：结构有效（codesign --verify）之外，还必须是我们
+    /// 自己的 Developer ID 签名、自己的 Bundle ID，并通过 Gatekeeper。
+    private func verifySignature(_ app: URL) async throws {
         do {
-            try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+            try await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
         } catch {
             throw UpdateError.signatureInvalid(error.localizedDescription)
         }
+        let display = try await run("/usr/bin/codesign", ["-dv", "--verbose=4", app.path])
+        guard display.contains("TeamIdentifier=\(Self.expectedTeamID)") else {
+            throw UpdateError.signatureInvalid("签名身份不是 \(Self.expectedTeamID)")
+        }
+        guard let info = Bundle(url: app)?.infoDictionary,
+              info["CFBundleIdentifier"] as? String == Self.expectedBundleID else {
+            throw UpdateError.signatureInvalid("Bundle ID 不是 \(Self.expectedBundleID)")
+        }
+        // The new package must actually be newer than what is running.
+        if let version = Bundle(url: app)?.infoDictionary?["CFBundleShortVersionString"] as? String {
+            guard Self.compareVersions(version, currentVersion) > 0 else {
+                throw UpdateError.signatureInvalid("新包版本 \(version) 不高于当前 \(currentVersion)")
+            }
+        }
+        do {
+            // Notarized builds pass; a rejected Gatekeeper assessment means
+            // unsigned or tampered code.
+            try await run("/usr/sbin/spctl", ["--assess", "--type", "execute", app.path])
+        } catch {
+            throw UpdateError.signatureInvalid("Gatekeeper 校验未通过")
+        }
     }
 
-    @discardableResult
-    private func run(_ executable: String, _ arguments: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(decoding: data, as: UTF8.self)
-        guard process.terminationStatus == 0 else {
-            throw UpdateError.installFailed(output.trimmingCharacters(in: .whitespacesAndNewlines))
+    private func run(_ executable: String, _ arguments: [String]) async throws -> String {
+        let result = try await ProcessRunner.run(
+            executable: URL(fileURLWithPath: executable),
+            arguments: arguments
+        )
+        guard result.succeeded else {
+            throw UpdateError.installFailed(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        return output
+        return result.output
     }
 
     // MARK: - 版本与校验
@@ -252,9 +312,15 @@ final class UpdateManager {
         return 0
     }
 
+    /// 流式 SHA256：不把整个更新包读进内存。
     static func sha256(of url: URL) throws -> String {
-        let data = try Data(contentsOf: url)
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
 

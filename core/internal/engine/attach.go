@@ -354,6 +354,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 			StartTimeoutSecs: s.StartTimeoutSecs,
 			LastActiveAt:     now,
 			CreatedAt:        now,
+			DockerSocket:     c.Socket(),
 		})
 	}
 	fail := func(cause error) (*appliedItem, error) {
