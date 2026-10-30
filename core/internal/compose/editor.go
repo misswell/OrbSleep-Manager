@@ -95,14 +95,10 @@ func RemoveBindings(content []byte, service string, remove []model.PortBinding) 
 	return removeBindings(content, service, remove)
 }
 
-// ClearServicePorts removes every port declaration of a service, including the
-// now-empty ports key. It tolerates a missing service or a missing ports key
-// (the service may not exist in the reconstructed file) but fails on port
-// lists it cannot safely edit, so stale declarations are never left behind.
-// It is used when rebuilding a deleted shared Compose file: managed services
-// must not republish any port, including stale ones an old backup still
-// contains that no longer match the service's current bindings.
-func ClearServicePorts(content []byte, service string) ([]byte, error) {
+// ClearServiceTCPPorts removes every TCP port declaration of a service,
+// including the ports key only when no declarations remain. UDP and other
+// protocols are left untouched: OrbSleep only manages TCP.
+func ClearServiceTCPPorts(content []byte, service string) ([]byte, error) {
 	decls, err := ReadDecls(content, service)
 	if err != nil {
 		if errors.Is(err, ErrServiceNotFound) {
@@ -110,19 +106,21 @@ func ClearServicePorts(content []byte, service string) ([]byte, error) {
 		}
 		return nil, err
 	}
-	if len(decls) == 0 {
-		return content, nil
-	}
-	remove := make([]model.PortBinding, 0, len(decls))
+	var remove []model.PortBinding
 	for _, d := range decls {
-		remove = append(remove, d.Binding)
+		if d.Binding.Protocol == "tcp" {
+			remove = append(remove, d.Binding)
+		}
+	}
+	if len(remove) == 0 {
+		return content, nil
 	}
 	out, removed, err := removeBindings(content, service, remove)
 	if err != nil {
 		return nil, err
 	}
-	if len(removed) != len(decls) {
-		return nil, fmt.Errorf("服务 %s 的端口声明清除不完整（%d/%d）", service, len(removed), len(decls))
+	if len(removed) != len(remove) {
+		return nil, fmt.Errorf("服务 %s 的 TCP 端口声明清除不完整（%d/%d）", service, len(removed), len(remove))
 	}
 	return out, nil
 }
@@ -557,7 +555,17 @@ func RestoreFile(file, backup string) error {
 
 // WriteAtomic writes data to a temp file in the same directory and renames it.
 func WriteAtomic(file string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(file)
+	target := file
+	if fi, err := os.Lstat(file); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		// Renaming over a symlink would replace the link itself. Write to the
+		// resolved target so the user's link relationship is preserved.
+		resolved, rerr := filepath.EvalSymlinks(file)
+		if rerr != nil {
+			return fmt.Errorf("解析 Compose 符号链接失败，拒绝覆盖: %w", rerr)
+		}
+		target = resolved
+	}
+	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -581,7 +589,7 @@ func WriteAtomic(file string, data []byte, mode os.FileMode) error {
 	if err := os.Chmod(name, mode); err != nil {
 		return err
 	}
-	return os.Rename(name, file)
+	return os.Rename(name, target)
 }
 
 // ValidateEffective compares two `docker compose config --format json` outputs

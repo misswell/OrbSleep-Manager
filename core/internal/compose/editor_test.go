@@ -1,6 +1,8 @@
 package compose
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -296,41 +298,77 @@ func TestAddBindingsLongSyntax(t *testing.T) {
 	}
 }
 
-func TestClearServicePorts(t *testing.T) {
-	out, err := ClearServicePorts([]byte(fixture), "api")
+func TestClearServiceTCPPortsKeepsUDP(t *testing.T) {
+	content := []byte(`services:
+  web:
+    image: alpine
+    ports:
+      - "18080:80"
+      - "18081:81/tcp"
+      - "19090:9090/udp"
+  api:
+    image: alpine
+    ports:
+      - "18082:82"
+`)
+	out, err := ClearServiceTCPPorts(content, "web")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(out), "18082") {
-		t.Fatalf("api ports were not cleared:\n%s", out)
+	if strings.Contains(string(out), "18080") || strings.Contains(string(out), "18081") {
+		t.Fatalf("TCP ports were not cleared:\n%s", out)
 	}
-	if !strings.Contains(string(out), "api:\n    image: alpine\n") {
-		t.Fatalf("api service block must survive:\n%s", out)
+	if !strings.Contains(string(out), "19090:9090/udp") {
+		t.Fatalf("UDP port must be preserved:\n%s", out)
 	}
-	if !strings.Contains(string(out), "18080") || !strings.Contains(string(out), "19090") {
-		t.Fatalf("web ports must be untouched:\n%s", out)
-	}
-	decls, err := ReadDecls(out, "web")
-	if err != nil || len(decls) != 3 {
-		t.Fatalf("web decls=%d err=%v", len(decls), err)
+	if !strings.Contains(string(out), "api:") || !strings.Contains(string(out), "18082") {
+		t.Fatalf("other services must be untouched:\n%s", out)
 	}
 
 	// A service without ports, or one that does not exist at all, is a no-op.
-	if out, err = ClearServicePorts(out, "api"); err != nil {
-		t.Fatal(err)
-	}
-	unchanged, err := ClearServicePorts([]byte(fixture), "missing")
+	out, err = ClearServiceTCPPorts(out, "web")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(unchanged) != fixture {
+	unchanged, err := ClearServiceTCPPorts(content, "missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unchanged) != string(content) {
 		t.Fatalf("missing service must be a no-op:\n%s", unchanged)
 	}
 
-	// Port lists the editor cannot safely rewrite must fail the rebuild
-	// instead of leaving stale declarations behind.
 	flow := []byte("services:\n  api: {image: alpine, ports: [\"18082:82\"]}\n")
-	if _, err := ClearServicePorts(flow, "api"); err == nil {
+	if _, err := ClearServiceTCPPorts(flow, "api"); err == nil {
 		t.Fatal("flow-style ports must be rejected")
+	}
+}
+
+func TestWriteAtomicPreservesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real-compose.yml")
+	link := filepath.Join(dir, "docker-compose.yml")
+	if err := os.WriteFile(target, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteAtomic(link, []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("WriteAtomic replaced the symlink with a regular file")
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "new\n" {
+		t.Fatalf("target content = %q", raw)
 	}
 }

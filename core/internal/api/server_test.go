@@ -114,19 +114,19 @@ func TestDaemonAPIRoundTrip(t *testing.T) {
 	if len(checks.Checks) == 0 {
 		t.Fatal("expected doctor checks")
 	}
-	foundDockerFail := false
+	dockerOK := false
 	for _, ch := range checks.Checks {
-		if ch.ID == "docker" && ch.Status == "fail" {
-			foundDockerFail = true
+		if ch.ID == "docker" && ch.Status == "ok" {
+			dockerOK = true
 		}
 	}
-	if !foundDockerFail {
-		t.Fatalf("expected docker check to fail without OrbStack: %+v", checks.Checks)
-	}
-
-	// Scanning without Docker must return a protocol error, not crash.
-	var ignored any
-	if err := c.Call(ctx, "scan", nil, &ignored); err == nil {
-		t.Fatal("expected scan to fail without Docker")
+	if !dockerOK {
+		// Scanning without Docker must return a protocol error, not crash.
+		var ignored any
+		if err := c.Call(ctx, "scan", nil, &ignored); err == nil {
+			t.Fatal("expected scan to fail without Docker")
+		}
+	} else {
+		t.Log("Docker is available; skipping no-Docker assertions")
 	}
 }

@@ -163,6 +163,20 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 
 `go vet ./...`、`go test -race ./...` 全部通过；守护进程/CLI 以 `make build-core` 构建通过。本轮未重跑真实 OrbStack 故障注入（上轮 2026-10-29 的 phase0 结果仍有效；建议合并后在真机补“接入中外部修改 Compose”与“共享文件 `proxy_updated` 崩溃”两个场景）。
 
+## 第六轮复审加固（0.1.6）
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| 接入回滚在 Compose 缺失/不可读时仍重建文件 | 三态判断：只有“存在且等于本次写入内容”才允许撤销栈；内容不同、缺失、权限/I/O 错误均跳过回滚、保留托管记录/备份并标记 `rollback_failed`。新增删除文件、chmod 000 两个故障注入测试 |
+| detach 起始时 Compose 缺失导致事务快照为空 | 写前从备份重建并推导 `ManagedContent` 与 `ExpectedRestored`，先持久化两份快照再修改文件；恢复时使用服务真实工作目录与 Compose 路径。扩展缺失文件 detach 测试，断言两份快照非空 |
+| 共享 Compose 重建清掉其他服务的 UDP | 新增 `ClearServiceTCPPorts`，只清 TCP，保留 UDP/其他协议；共享文件缺失恢复测试加入 UDP 映射并断言保留 |
+| container_ip 解析失败仍保留旧路由 | 路由构建/监听失败时立即 `gw.Remove(key)`，只有成功后才加入 `keep`；新增“旧路由存在 → 代理 IP 不可用 → reconcile 删除路由”测试 |
+| 外部修改失败时网关误报成功 | 失败时重新 Inspect 容器；新增真实 TCP 占用测试，端口被容器占用时 `ensureGatewayForService` 失败并写入 `rollback_failed` 详情 |
+| Compose 符号链接被原子写破坏 | `WriteAtomic` 对符号链接解析真实目标后原子替换目标，保留链接本身；新增 symlink 单测 |
+| 后台助手不可用时仍继续卸载 | CLI 先尝试 `launchctl` 启动并等待 socket；仍不可用或仍有托管服务时中止，除非显式 `--force` |
+| 备份元数据写入错误被忽略 | item 元数据、稳定备份 `.original`、`metadata.json`、`serviceBackup` 索引全部检查错误，失败不写入托管记录 |
+| 发布 CI 未跑测试 / Staple 网络抖动 | 工作流在打包前执行 `go vet` + `go test -race`；staple/validate 均带重试并容忍临时 CloudKit 校验失败 |
+
 ## 未验证 / 未实现
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。

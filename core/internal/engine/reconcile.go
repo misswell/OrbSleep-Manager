@@ -122,7 +122,6 @@ func (e *Engine) reconcile() {
 		// the container sleeps: the first connection wakes it through the proxy.
 		for _, b := range svc.Bindings {
 			key := fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)
-			keep[key] = true
 			// Build routes through the shared helper: in container_ip mode an
 			// unresolvable proxy IP must surface as an error and skip the
 			// listener, never fall back to 127.0.0.1.
@@ -133,6 +132,11 @@ func (e *Engine) reconcile() {
 			if rerr != nil {
 				status = "warning"
 				lastErr = rerr.Error()
+				// A stale route may still point at the old proxy container IP.
+				// Remove it instead of keeping it via keep[key].
+				e.gw.Remove(key)
+			} else {
+				keep[key] = true
 			}
 			if ins != nil && containerPublishes(ins, model.PortBinding{
 				HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,

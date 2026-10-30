@@ -77,6 +77,14 @@ jobs:
         shell: bash
         run: brew install xcodegen
 
+      - name: Run Go vet and race tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd core
+          go vet ./...
+          go test -race ./...
+
       - name: Import Developer ID certificate
         shell: bash
         run: |

@@ -948,7 +948,8 @@ func TestRestoreMissingSharedComposeRemovesOtherManagedPorts(t *testing.T) {
 	aProxy, bProxy := freePort(t), freePort(t)
 	aBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, ProxyPort: aProxy, Protocol: "tcp"}}
 	bBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: bPort, ContainerPort: 80, ProxyPort: bProxy, Protocol: "tcp"}}
-	backup := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n", aPort, bPort))
+	udpPort := freePort(t)
+	backup := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n      - \"127.0.0.1:%d:9090/udp\"\n", aPort, bPort, udpPort))
 	backupDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(backupDir, "docker-compose.yml"), backup, 0o644); err != nil {
 		t.Fatal(err)
@@ -1006,7 +1007,10 @@ func TestRestoreMissingSharedComposeRemovesOtherManagedPorts(t *testing.T) {
 		t.Fatalf("this service's port was not restored:\n%s", raw)
 	}
 	if strings.Contains(string(raw), fmt.Sprintf("%d:80", bPort)) {
-		t.Fatalf("other managed service's port was reintroduced:\n%s", raw)
+		t.Fatalf("other managed service's TCP port was reintroduced:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), fmt.Sprintf("%d:9090/udp", udpPort)) {
+		t.Fatalf("other managed service's UDP port was dropped:\n%s", raw)
 	}
 	if _, ok, _ := e.store.GetService(svc.ID); ok {
 		t.Fatal("restored service record must be deleted")
@@ -1081,7 +1085,8 @@ func TestRunDetachRebuildsMissingCompose(t *testing.T) {
 	aProxy, bProxy := freePort(t), freePort(t)
 	aBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: aPort, ContainerPort: 80, ProxyPort: aProxy, Protocol: "tcp"}}
 	bBindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: bPort, ContainerPort: 80, ProxyPort: bProxy, Protocol: "tcp"}}
-	backup := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n", aPort, bPort))
+	udpPort := freePort(t)
+	backup := []byte(fmt.Sprintf("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n  api:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:%d:80\"\n      - \"127.0.0.1:%d:9090/udp\"\n", aPort, bPort, udpPort))
 	backupDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(backupDir, "docker-compose.yml"), backup, 0o644); err != nil {
 		t.Fatal(err)
@@ -1156,7 +1161,10 @@ func TestRunDetachRebuildsMissingCompose(t *testing.T) {
 		t.Fatalf("this service's port was not rebuilt:\n%s", raw)
 	}
 	if strings.Contains(string(raw), fmt.Sprintf("%d:80", bPort)) {
-		t.Fatalf("other managed service's port was reintroduced:\n%s", raw)
+		t.Fatalf("other managed service's TCP port was reintroduced:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), fmt.Sprintf("%d:9090/udp", udpPort)) {
+		t.Fatalf("other managed service's UDP port was dropped:\n%s", raw)
 	}
 	if _, ok, _ := e.store.GetService(web.ID); ok {
 		t.Fatal("restored service record must be deleted")
@@ -1170,6 +1178,27 @@ func TestRunDetachRebuildsMissingCompose(t *testing.T) {
 	}
 	if _, ok := cfg.Service(api.ContainerName); !ok {
 		t.Fatalf("other managed service's proxy entry must be kept: %+v", cfg.Services)
+	}
+	txns, err := e.store.ListTransactions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tx := range txns {
+		if tx.Kind != "detach" {
+			continue
+		}
+		var p detachPayload
+		if err := json.Unmarshal([]byte(tx.Data), &p); err != nil {
+			t.Fatal(err)
+		}
+		if len(p.ManagedContent) == 0 || len(p.ExpectedRestored) == 0 {
+			t.Fatalf("detach transaction lacks pre-write snapshots: managed=%d expected=%d", len(p.ManagedContent), len(p.ExpectedRestored))
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("detach transaction record missing")
 	}
 }
 
@@ -1247,5 +1276,137 @@ func TestRestoreMissingSharedComposeRemovesStalePorts(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), fmt.Sprintf("%d:80", aPort)) {
 		t.Fatalf("this service's port was not restored:\n%s", raw)
+	}
+}
+
+func attachExternalEditDelete(t *testing.T, chmod bool) {
+	t.Helper()
+	hostPort := freePort(t)
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	bindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}
+	snap := makeSnapshot(t, hostPort, bindings)
+	docker.setPorts(snap.removals, true)
+	e.cli.(*fakeCLI).configFn = composeConfigFor(snap.removals)
+	e.cli.(*fakeCLI).upFn = func(file string) error {
+		if chmod {
+			if err := os.Chmod(file, 0); err != nil {
+				return err
+			}
+		} else if err := os.Remove(file); err != nil {
+			return err
+		}
+		return errors.New("simulated recreate failure")
+	}
+	adminClient := proxy.NewAdminClient(admin.hostPort(t), "test-key")
+	txnID, err := e.startTxn("op-missing", "attach", txnFromPlan("op-missing", proxy.Config{}, []planSnapshot{*snap}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.attachOne(context.Background(), logger, 0, snap, map[string][]byte{}, adminClient, txnID)
+	if err == nil {
+		t.Fatal("expected attach to fail")
+	}
+	var ae *attachError
+	if !errors.As(err, &ae) || !ae.RollbackFailed {
+		t.Fatalf("expected rollback_failed, got %v", err)
+	}
+	if !strings.Contains(ae.Detail, "缺失或无法读取") {
+		t.Fatalf("unexpected detail: %s", ae.Detail)
+	}
+	services, _ := e.store.ListServices()
+	if len(services) != 1 || services[0].Status != "warning" {
+		t.Fatalf("managed warning record missing: %+v", services)
+	}
+	if _, ok := e.store.GetMeta("serviceBackup:" + services[0].ID); !ok {
+		t.Fatal("backup metadata must be retained")
+	}
+	if chmod {
+		raw, rerr := os.ReadFile(snap.composeFile)
+		if rerr == nil {
+			t.Fatalf("file must remain unreadable, got %q", raw)
+		}
+		_ = os.Chmod(snap.composeFile, 0o644)
+	} else {
+		if _, serr := os.Stat(snap.composeFile); !os.IsNotExist(serr) {
+			t.Fatal("deleted Compose file must not be recreated")
+		}
+	}
+}
+
+func TestAttachFailureDoesNotRecreateDeletedCompose(t *testing.T) {
+	attachExternalEditDelete(t, false)
+}
+
+func TestAttachFailureDoesNotReplaceUnreadableCompose(t *testing.T) {
+	attachExternalEditDelete(t, true)
+}
+
+func TestAttachExternalEditDoesNotClaimGatewayWhenPortBusy(t *testing.T) {
+	hostPort := freePort(t)
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	bindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}
+	snap := makeSnapshot(t, hostPort, bindings)
+	docker.setPorts(snap.removals, true)
+	e.cli.(*fakeCLI).configFn = composeConfigFor(snap.removals)
+	e.cli.(*fakeCLI).upFn = func(file string) error {
+		_ = os.WriteFile(file, []byte("services:\n  web:\n    image: nginx:alpine\n    # user edit\n"), 0o644)
+		return errors.New("simulated recreate failure")
+	}
+	// A real listener simulates the container still publishing the host port.
+	ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	adminClient := proxy.NewAdminClient(admin.hostPort(t), "test-key")
+	txnID, err := e.startTxn("op-busy", "attach", txnFromPlan("op-busy", proxy.Config{}, []planSnapshot{*snap}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.attachOne(context.Background(), logger, 0, snap, map[string][]byte{}, adminClient, txnID)
+	if err == nil {
+		t.Fatal("expected attach to fail")
+	}
+	var ae *attachError
+	if !errors.As(err, &ae) || !ae.RollbackFailed {
+		t.Fatalf("expected rollback_failed, got %v", err)
+	}
+	if !strings.Contains(ae.Detail, "重建网关监听失败") {
+		t.Fatalf("busy port must be reported, detail=%s", ae.Detail)
+	}
+	if len(e.gw.RouteKeys()) != 0 {
+		t.Fatalf("no gateway listener may be claimed, got %v", e.gw.RouteKeys())
+	}
+}
+
+func TestReconcileRemovesStaleContainerIPRoute(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	svc, _, _, _ := managedServiceFixture(t, e, admin, docker, e.cli)
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("fixture route missing: %v", e.gw.RouteKeys())
+	}
+	s := e.settings.Get()
+	s.ProxyDialMode = "container_ip"
+	if err := e.settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	// The fake Docker has no proxy container, so proxyIP is empty and the old
+	// route must not survive reconcile.
+	e.reconcile()
+	if keys := e.gw.RouteKeys(); len(keys) != 0 {
+		t.Fatalf("stale container_ip route retained: %v", keys)
+	}
+	got, ok, err := e.store.GetService(svc.ID)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if got.Status != "warning" || !strings.Contains(got.LastError, "container_ip") {
+		t.Fatalf("service status = %s, error = %s", got.Status, got.LastError)
 	}
 }

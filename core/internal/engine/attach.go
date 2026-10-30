@@ -277,8 +277,13 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		"bindings":       snap.bindings,
 		"createdAt":      time.Now().UTC().Format(time.RFC3339),
 	}
-	metaRaw, _ := json.MarshalIndent(meta, "", "  ")
-	_ = os.WriteFile(filepath.Join(itemDir, "metadata.json"), metaRaw, 0o600)
+	metaRaw, merr := json.MarshalIndent(meta, "", "  ")
+	if merr != nil {
+		return nil, &attachError{Err: fmt.Errorf("序列化备份元数据失败: %w", merr)}
+	}
+	if werr := os.WriteFile(filepath.Join(itemDir, "metadata.json"), metaRaw, 0o600); werr != nil {
+		return nil, &attachError{Err: fmt.Errorf("写入备份元数据失败: %w", werr)}
+	}
 	if err := e.updateTxn(txnID, "prepared", func(p *txnPayload) {
 		p.Items[idx].BackupPath = backupPath
 		p.Items[idx].ServiceID = svcID
@@ -309,11 +314,20 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 			return err
 		}
 		// Keep the pre-attach content too (for audit and emergency recovery).
-		_ = os.WriteFile(filepath.Join(stableDir, filepath.Base(backupPath)+".original"), snap.content, 0o600)
+		if werr := os.WriteFile(filepath.Join(stableDir, filepath.Base(backupPath)+".original"), snap.content, 0o600); werr != nil {
+			return fmt.Errorf("写入原始 Compose 备份失败: %w", werr)
+		}
 		meta["serviceId"] = svcID
-		metaRaw, _ := json.MarshalIndent(meta, "", "  ")
-		_ = os.WriteFile(filepath.Join(stableDir, "metadata.json"), metaRaw, 0o600)
-		_ = e.store.SetMeta("serviceBackup:"+svcID, stableDir)
+		metaRaw, merr := json.MarshalIndent(meta, "", "  ")
+		if merr != nil {
+			return fmt.Errorf("序列化稳定备份元数据失败: %w", merr)
+		}
+		if werr := os.WriteFile(filepath.Join(stableDir, "metadata.json"), metaRaw, 0o600); werr != nil {
+			return fmt.Errorf("写入稳定备份元数据失败: %w", werr)
+		}
+		if err := e.store.SetMeta("serviceBackup:"+svcID, stableDir); err != nil {
+			return fmt.Errorf("写入备份索引失败: %w", err)
+		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		return e.store.UpsertService(model.Service{
 			ID:               svcID,
@@ -338,11 +352,26 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		// listeners, proxy entry) while the file no longer matches it. Keep
 		// the managed state and require manual attention instead.
 		if composeWritten {
-			if current, rerr := os.ReadFile(snap.composeFile); rerr == nil && !bytes.Equal(current, out) {
-				logger.add("error", "Compose 文件在接入过程中被外部修改，已跳过自动回滚并保留托管状态")
-				detail := "Compose 文件在接入过程中被外部修改，为避免覆盖用户编辑未自动回滚；已保留托管状态，备份位于 " + backupPath
+			// Treat a missing/unreadable file exactly like an external edit:
+			// the on-disk state is unknown, so neither restoring the backup nor
+			// running the undo stack is safe. Keep the managed wiring and let
+			// the user resolve the Compose file.
+			current, rerr := os.ReadFile(snap.composeFile)
+			if rerr != nil || !bytes.Equal(current, out) {
+				reason := "Compose 文件在接入过程中被外部修改"
+				if rerr != nil {
+					reason = "Compose 文件在接入过程中缺失或无法读取（" + rerr.Error() + "）"
+				}
+				logger.add("error", reason+"，已跳过自动回滚并保留托管状态")
+				detail := reason + "，为避免覆盖或重建用户文件未自动回滚；已保留托管状态，备份位于 " + backupPath
+				freshIns := ins
+				if c, cerr := e.dockerClient(context.Background()); cerr == nil {
+					if ii, ierr := c.InspectContainer(context.Background(), snap.containerName); ierr == nil {
+						freshIns = ii
+					}
+				}
 				if _, ok, gerr := e.store.GetService(svcID); gerr == nil && !ok {
-					if perr := persistManagedState(ins, "warning", "接入中断：Compose 文件被外部修改，自动回滚已跳过"); perr != nil {
+					if perr := persistManagedState(freshIns, "warning", "接入中断："+reason+"，自动回滚已跳过"); perr != nil {
 						detail += "；创建托管记录失败: " + perr.Error()
 					} else {
 						detail += "；已创建托管记录以保留网关监听与代理配置"

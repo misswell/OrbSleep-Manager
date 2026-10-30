@@ -21,7 +21,7 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.1.5"
+const version = "0.1.6"
 
 type globals struct {
 	socket  string
@@ -556,16 +556,29 @@ func uninstall(dataDir, sock string, args []string) {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "确认执行（必须显式指定）")
 	keepProxy := fs.Bool("keep-proxy", false, "保留代理容器与数据目录")
+	force := fs.Bool("force", false, "后台助手无法启动时仍然卸载（可能导致服务中断）")
 	fs.Parse(args)
 	if !*yes {
 		fail(fmt.Errorf("卸载会停止并恢复所有托管服务。确认请加 --yes"))
 	}
-	if c, err := client.Dial(sock); err == nil {
+	c := connectDaemonForUninstall(sock, *force)
+	if c != nil {
 		restoreAll(c)
+		var out struct {
+			Services []model.Service `json:"services"`
+		}
+		must(c.Call(context.Background(), "services.list", nil, &out))
 		c.Close()
-	} else {
-		fmt.Println("后台助手未运行，跳过托管服务恢复（请确认没有仍需恢复的服务）。")
+		if len(out.Services) > 0 {
+			if !*force {
+				fail(fmt.Errorf("仍有 %d 个托管服务未恢复，已中止卸载；请重试恢复或使用 --force", len(out.Services)))
+			}
+			fmt.Fprintf(os.Stderr, "警告：仍有 %d 个托管服务未恢复，--force 继续卸载。\n", len(out.Services))
+		}
+	} else if !*force {
+		fail(fmt.Errorf("后台助手不可用，无法确认托管服务已恢复；请先启动 orbsleepd，或使用 --force"))
 	}
+
 	if err := launchagent.Uninstall(); err != nil {
 		fmt.Fprintln(os.Stderr, "移除 LaunchAgent 失败:", err)
 	} else {
@@ -586,6 +599,29 @@ func uninstall(dataDir, sock string, args []string) {
 	}
 	fmt.Printf("OrbSleep 数据（数据库、日志、备份）保留在: %s\n", dataDir)
 	fmt.Println("如确认不再需要，可在备份后手动删除该目录。")
+}
+
+func connectDaemonForUninstall(sock string, force bool) *client.Client {
+	if c, err := client.Dial(sock); err == nil {
+		return c
+	}
+	if launchagent.Installed() {
+		if err := launchagent.Restart(); err != nil {
+			fmt.Fprintln(os.Stderr, "尝试启动后台助手失败:", err)
+		}
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		if c, err := client.Dial(sock); err == nil {
+			return c
+		}
+	}
+	if !force {
+		return nil
+	}
+	fmt.Println("警告：后台助手仍不可用，--force 继续卸载；请自行确认没有仍需恢复的服务。")
+	return nil
 }
 
 func findDockerLocal() (string, error) {
