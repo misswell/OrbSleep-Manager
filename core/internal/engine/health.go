@@ -385,7 +385,7 @@ func (e *Engine) RestoreBackup(idOrPath string) (model.RestoreResult, error) {
 	}
 	marker := filepath.Join(e.dataDir, "restore-request.json")
 	payload, _ := json.Marshal(map[string]string{
-		"backupPath": target,
+		"backupPath":  target,
 		"requestedAt": time.Now().UTC().Format(time.RFC3339),
 	})
 	if err := os.WriteFile(marker, payload, 0o600); err != nil {
