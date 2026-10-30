@@ -12,7 +12,7 @@ func TestPhaseTransitions(t *testing.T) {
 	if err := ValidateTransition(PhaseCommitted, PhaseApplying); err == nil {
 		t.Fatal("committed must be terminal")
 	}
-	if err := ValidateTransition(PhaseApplying, PhaseNeedsRepair); err != nil {
+	if err := ValidateTransition(PhaseRollbackPending, PhaseNeedsRepair); err != nil {
 		t.Fatal(err)
 	}
 }

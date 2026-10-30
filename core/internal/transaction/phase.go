@@ -6,21 +6,24 @@ import "fmt"
 type Phase string
 
 const (
-	PhasePlanned         Phase = "planned"
-	PhasePrepared        Phase = "prepared"
-	PhaseApplying        Phase = "applying"
-	PhaseComposeWrite    Phase = "compose_write_pending"
-	PhaseComposeWritten  Phase = "compose_written"
-	PhaseProxyUpdated    Phase = "proxy_updated"
-	PhaseContainerReady  Phase = "container_ready"
-	PhaseGatewayReady    Phase = "gateway_ready"
-	PhaseVerifying       Phase = "verifying"
-	PhaseVerified        Phase = "verified"
-	PhaseCommitted       Phase = "committed"
-	PhaseRollbackPending Phase = "rollback_pending"
-	PhaseRolledBack      Phase = "rolled_back"
-	PhaseRollbackFailed  Phase = "rollback_failed"
-	PhaseNeedsRepair     Phase = "needs_repair"
+	PhasePlanned            Phase = "planned"
+	PhasePrepared           Phase = "prepared"
+	PhaseApplying           Phase = "applying"
+	PhaseProxyUpdated       Phase = "proxy_updated"
+	PhaseComposeWrite       Phase = "compose_write_pending"
+	PhaseComposeWritten     Phase = "compose_written"
+	PhaseComposeUpdated     Phase = "compose_updated"
+	PhaseContainerReady     Phase = "container_ready"
+	PhaseContainerRecreated Phase = "container_recreated"
+	PhaseGatewayReady       Phase = "gateway_ready"
+	PhaseVerifying          Phase = "verifying"
+	PhaseVerified           Phase = "verified"
+	PhaseCommittedItem      Phase = "committed_item"
+	PhaseCommitted          Phase = "committed"
+	PhaseRollbackPending    Phase = "rollback_pending"
+	PhaseRolledBack         Phase = "rolled_back"
+	PhaseRollbackFailed     Phase = "rollback_failed"
+	PhaseNeedsRepair        Phase = "needs_repair"
 )
 
 // CanTransition reports whether phase b is a legal successor of a. Recovery
@@ -43,19 +46,27 @@ func CanTransition(a, b Phase) bool {
 	case PhaseApplying:
 		return b == PhaseProxyUpdated || b == PhaseComposeWrite || b == PhaseVerifying
 	case PhaseProxyUpdated:
-		return b == PhaseComposeWrite || b == PhaseVerifying
+		return b == PhaseComposeWrite || b == PhaseVerifying || b == PhaseComposeUpdated
 	case PhaseComposeWrite:
-		return b == PhaseComposeWritten || b == PhaseVerifying || b == PhaseRollbackPending
+		return b == PhaseComposeWritten || b == PhaseComposeUpdated || b == PhaseVerifying || b == PhaseRollbackPending
 	case PhaseComposeWritten:
-		return b == PhaseContainerReady || b == PhaseGatewayReady || b == PhaseVerifying || b == PhaseRollbackPending
+		return b == PhaseContainerReady || b == PhaseContainerRecreated || b == PhaseGatewayReady || b == PhaseVerifying || b == PhaseRollbackPending
+	case PhaseComposeUpdated:
+		return b == PhaseContainerReady || b == PhaseContainerRecreated || b == PhaseGatewayReady || b == PhaseRollbackPending
 	case PhaseContainerReady:
-		return b == PhaseGatewayReady || b == PhaseVerifying
+		return b == PhaseGatewayReady || b == PhaseVerified || b == PhaseRollbackPending
+	case PhaseContainerRecreated:
+		return b == PhaseGatewayReady || b == PhaseVerified || b == PhaseRollbackPending
 	case PhaseGatewayReady:
-		return b == PhaseVerifying || b == PhaseVerified
+		return b == PhaseVerifying || b == PhaseVerified || b == PhaseRollbackPending
 	case PhaseVerifying:
 		return b == PhaseVerified || b == PhaseRollbackPending
 	case PhaseVerified:
-		return b == PhaseCommitted
+		return b == PhaseCommittedItem || b == PhaseCommitted || b == PhaseRollbackPending
+	case PhaseCommittedItem:
+		return false
+	case PhaseRollbackPending:
+		return b == PhaseRolledBack || b == PhaseRollbackFailed || b == PhaseNeedsRepair
 	default:
 		return false
 	}
