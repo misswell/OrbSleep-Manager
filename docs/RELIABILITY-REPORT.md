@@ -133,3 +133,18 @@ eb17e72aebddf7985a0eeeec202822875e08dc96f1bc4ff11b172d81cffdac37  OrbSleepManage
 ```
 - CI 对 CloudKit `stapler validate` 临时网络抖动采用 3 次重试；staple 成功与 `spctl` 作为最终判定。
 - 前一次 CI run 40984938692 因验证步骤在线 validate 网络中断失败，未发布；修复后 40985620473 成功。
+
+## 6. Transaction manager integration (0.1.8)
+
+- `core/internal/transaction/manager.go` centralizes durable transaction persistence with phase validation.
+- `startTxn`, `updateTxn`, `finishTxn/finishTxnAtomic` now route through the manager; illegal transitions rejected by `CanTransition`.
+- All existing unit tests, fault injection E2E (9 phases), and real OrbStack reliability scenarios continue to pass after migration.
+- Additional test fixtures in recovery_test updated to use valid transition paths.
+- Phase model includes 17 states with explicit allowed transitions and terminal states; recovery can jump from any non-terminal to recovery branches.
+
+### Verification (local, 0.1.8 build)
+
+- Go vet/race: passing on macOS with 10+ packages.
+- Unit: full engine/engine tests (2.9s).
+- Real environments: phase0 (✓), reliability E2E (5 scenarios ✓), SIGKILL fault injection (9 hook levels ✓).
+- Docker network cleanup done (`docker network prune -f`) to allow subsequent runs.
