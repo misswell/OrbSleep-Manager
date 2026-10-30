@@ -165,13 +165,12 @@ jobs:
           codesign --verify --deep --strict "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
           xcrun stapler validate "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
 
-          hdiutil attach -readonly -nobrowse "$dmg" > "$tmp/mount.txt"
-          mount="$(awk '/\/Volumes\// {for (i=1;i<=NF;i++) if ($i ~ /^\/Volumes\//) {print; exit}}' "$tmp/mount.txt")"
-          [[ -n "$mount" ]]
-          codesign --verify --deep --strict "$mount/OrbSleepManager.app"
-          xcrun stapler validate "$mount/OrbSleepManager.app"
-          spctl --assess --type execute --verbose "$mount/OrbSleepManager.app"
-          hdiutil detach "$mount" >/dev/null
+          mkdir -p "$tmp/mount"
+          hdiutil attach -readonly -nobrowse -mountpoint "$tmp/mount" "$dmg" >/dev/null
+          codesign --verify --deep --strict "$tmp/mount/OrbSleepManager.app"
+          xcrun stapler validate "$tmp/mount/OrbSleepManager.app"
+          spctl --assess --type execute --verbose "$tmp/mount/OrbSleepManager.app"
+          hdiutil detach "$tmp/mount" >/dev/null
 
           (cd dist && shasum -a 256 -c SHA256SUMS)
 
