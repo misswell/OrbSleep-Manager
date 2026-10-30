@@ -32,7 +32,7 @@ concurrency:
 jobs:
   release:
     name: Build, sign, notarize
-    runs-on: macos-15
+    runs-on: macos-26
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}

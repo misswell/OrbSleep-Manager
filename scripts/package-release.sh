@@ -35,10 +35,16 @@ mkdir -p "$STAGE"
 echo "==> building Release app (universal, binaries embedded in the bundle)"
 rm -rf "$WORK/DerivedData" "$WORK/app-build"
 (cd app && xcodegen generate >/dev/null)
-xcodebuild -project app/OrbSleepManager.xcodeproj -scheme OrbSleepManager \
+if ! xcodebuild -project app/OrbSleepManager.xcodeproj -scheme OrbSleepManager \
   -configuration Release -destination 'platform=macOS' \
   -derivedDataPath "$WORK/DerivedData" SYMROOT="$WORK/app-build" \
-  CODE_SIGNING_ALLOWED=NO ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO build >/dev/null
+  CODE_SIGNING_ALLOWED=NO ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO build \
+  > "$WORK/xcodebuild.log" 2>&1; then
+  echo "==> xcodebuild failed; last diagnostics:" >&2
+  grep -E '\.swift:[0-9]+:[0-9]+: (error|warning)|error:' "$WORK/xcodebuild.log" | head -40 >&2
+  tail -n 40 "$WORK/xcodebuild.log" >&2
+  exit 1
+fi
 APP="$WORK/app-build/Release/OrbSleepManager.app"
 [ -d "$APP" ] || { echo "Missing built app at $APP" >&2; exit 1; }
 
