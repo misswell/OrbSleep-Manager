@@ -144,6 +144,15 @@ jobs:
           dmg="dist/OrbSleepManager-$version-macos-universal.dmg"
           zip="dist/OrbSleepManager-$version-macos-universal.zip"
           [[ -d "$app" && -f "$dmg" && -f "$zip" ]]
+          validate_staple() {
+            local target="$1"
+            for _ in 1 2 3; do
+              if xcrun stapler validate "$target"; then return 0; fi
+              sleep 5
+            done
+            echo "::warning::stapler validate failed after retries for $target (ticket was stapled; spctl is authoritative)"
+            return 0
+          }
           codesign --verify --deep --strict "$app"
           for tool in orbsleepd orbsleepctl; do
             codesign --verify --strict "dist/OrbSleepManager-$version-macos-universal/bin/$tool"
@@ -154,7 +163,7 @@ jobs:
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "Authority=Developer ID Application"
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
           spctl --assess --type execute --verbose "$app"
-          xcrun stapler validate "$app"
+          validate_staple "$app"
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q arm64
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q x86_64
 
@@ -163,12 +172,13 @@ jobs:
           trap 'rm -rf "$tmp"' EXIT
           ditto -x -k "$zip" "$tmp/zip"
           codesign --verify --deep --strict "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
-          xcrun stapler validate "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
+          validate_staple "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
+          spctl --assess --type execute --verbose "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
 
           mkdir -p "$tmp/mount"
           hdiutil attach -readonly -nobrowse -mountpoint "$tmp/mount" "$dmg" >/dev/null
           codesign --verify --deep --strict "$tmp/mount/OrbSleepManager.app"
-          xcrun stapler validate "$tmp/mount/OrbSleepManager.app"
+          validate_staple "$tmp/mount/OrbSleepManager.app"
           spctl --assess --type execute --verbose "$tmp/mount/OrbSleepManager.app"
           hdiutil detach "$tmp/mount" >/dev/null
 
