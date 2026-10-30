@@ -789,6 +789,14 @@ func TestRestoreRevertsWhenDeletingManagedRecordFails(t *testing.T) {
 	originalDelete := deleteServiceRecord
 	deleteServiceRecord = func(e *Engine, id string) error {
 		holder.close()
+		for i := 0; i < 200; i++ {
+			ln, lerr := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
+			if lerr == nil {
+				_ = ln.Close()
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		return errors.New("simulated sqlite failure")
 	}
 	t.Cleanup(func() {
@@ -865,6 +873,14 @@ func TestRollbackAppliedRevertsWhenRecordDeletionFails(t *testing.T) {
 	originalDelete := deleteServiceRecord
 	deleteServiceRecord = func(e *Engine, id string) error {
 		holder.close()
+		for i := 0; i < 200; i++ {
+			ln, lerr := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
+			if lerr == nil {
+				_ = ln.Close()
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		return errors.New("simulated sqlite failure")
 	}
 	t.Cleanup(func() {
