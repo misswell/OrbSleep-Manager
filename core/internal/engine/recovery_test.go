@@ -768,3 +768,43 @@ func TestReconcileContainerIPMissingProxyIPSkipsListener(t *testing.T) {
 		t.Fatalf("no fallback listener may be created, got %v", keys)
 	}
 }
+
+func TestRecoverDetachMissingComposeRecreatesManagedState(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
+	if err := os.Remove(snap.composeFile); err != nil {
+		t.Fatal(err)
+	}
+	docker.setPorts(snap.removals, true)
+	workDir := t.TempDir()
+	txnID, err := e.startTxn("op-detach-missing", "detach", detachPayload{
+		OperationID: "op-detach-missing", Service: svc, WorkingDir: workDir,
+		ManagedContent: managed, Phase: "prepared_missing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.RecoverTransactions()
+	got, _, _ := e.store.GetTransaction(txnID)
+	if got.Status != "rolled_back" {
+		t.Fatalf("status = %s error=%s", got.Status, got.Error)
+	}
+	raw, err := os.ReadFile(snap.composeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != string(managed) {
+		t.Fatalf("managed Compose was not rebuilt:\n%s", raw)
+	}
+	if len(e.gw.RouteKeys()) != 1 {
+		t.Fatalf("gateway listener missing: %v", e.gw.RouteKeys())
+	}
+	if _, ok, _ := e.store.GetService(svc.ID); !ok {
+		t.Fatal("managed record must be kept")
+	}
+	if _, ok := e.store.GetMeta("serviceBackup:" + svc.ID); !ok {
+		t.Fatal("backup metadata must be kept")
+	}
+}
