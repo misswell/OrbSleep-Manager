@@ -39,3 +39,9 @@ uninstall-agent:
 
 clean:
 	rm -rf "$(BIN)" app/build app/OrbSleepManager.xcodeproj
+
+reliability-e2e: build-core
+	python3 scripts/reliability_e2e.py
+
+fault-injection-e2e: build-core
+	python3 scripts/fault_injection_e2e.py

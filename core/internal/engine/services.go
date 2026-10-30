@@ -368,6 +368,7 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 
 	// 2. Release the host ports.
 	e.gw.RemoveService(svc.ID)
+	failpoint.Hit("detach_gateway_removed")
 	logger.add("info", "已停止端口网关监听")
 
 	removals := bindingsFor(svc)

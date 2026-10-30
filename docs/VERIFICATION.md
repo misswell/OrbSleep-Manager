@@ -177,6 +177,21 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 | 备份元数据写入错误被忽略 | item 元数据、稳定备份 `.original`、`metadata.json`、`serviceBackup` 索引全部检查错误，失败不写入托管记录 |
 | 发布 CI 未跑测试 / Staple 网络抖动 | 工作流在打包前执行 `go vet` + `go test -race`；staple/validate 均带重试并容忍临时 CloudKit 校验失败 |
 
+## 第七轮可靠性改造（0.1.7）
+
+| 领域 | 实现与验证 |
+|---|---|
+| Compose 文件级快照 | Original / LastKnownGood + SHA256/权限/所有者/类型；attach/detach 更新；缺失文件恢复回退 |
+| 安全合并 | `RestoreManagedBindings` 保留其他服务/UDP/外部修改，宿主机端口冲突拒绝 |
+| 原子写 | 同目录临时文件、fsync、父目录同步、权限/所有者、符号链接目标写入 |
+| 并发 | 按规范化 Compose 路径的进程内 + flock 跨进程锁 |
+| Reconcile | 单次容器列表、增量 Upsert、`Gateway.Matches` 目标/归属校验、失效路由移除 |
+| 诊断 | `doctor --verify` 检查事务/备份/快照/网关；`recover [--transaction]`；强制卸载导出恢复包 |
+| 故障注入 | 真实 daemon SIGKILL：5 个 attach 阶段 + 4 个 detach 阶段全部恢复通过 |
+| 真实环境 | phase0 + 5 个可靠性场景（UDP、外部修改、文件删除、权限、容器删除、daemon SIGKILL） |
+
+已知边界见 `docs/RELIABILITY-REPORT.md`。
+
 ## 未验证 / 未实现
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。
