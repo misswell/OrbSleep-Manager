@@ -103,9 +103,9 @@ orbsleepctl recover
 | 22 | Go Vet/Race 通过 | 通过 | 本地 + CI |
 | 23 | 故障注入全部通过 | 部分 | 9 个关键阶段；非所有分支 |
 | 24 | OrbStack 真实集成测试 | 通过 | phase0 + 5 场景 + 9 故障注入 |
-| 25 | Universal Binary | 待 CI | v0.1.7 CI 构建验证 |
-| 26 | 签名/公证/Staple | 待 CI | v0.1.7 CI 构建验证 |
-| 27 | Release 资产/SHA | 待 CI | v0.1.7 CI 构建验证 |
+| 25 | Universal Binary | 通过 | CI app/daemon/CLI 均验证 arm64+x86_64 |
+| 26 | 签名/公证/Staple | 通过 | Developer ID、Accepted、staple、spctl Notarized Developer ID |
+| 27 | Release 资产/SHA | 通过 | ZIP/DMG/SHA256SUMS 下载后逐字节校验 |
 
 ## 4. 未解决问题
 
@@ -120,4 +120,16 @@ orbsleepctl recover
 
 ## 5. CI 记录
 
-待 v0.1.7 发布后补充。
+- Release：https://github.com/misswell/OrbSleep-Manager/releases/tag/v0.1.7
+- CI run：https://github.com/misswell/OrbSleep-Manager/actions/runs/40985620473
+- Tag source commit：`f4fbf69`
+- gofmt / vet / race：通过
+- App/`orbsleepd`/`orbsleepctl`：Developer ID Team `U8U443D7ZL`，安全时间戳，arm64+x86_64
+- App/DMG：Apple 公证 Accepted，已 staple；`spctl=Notarized Developer ID`
+- 资产：
+```text
+eb17e72aebddf7985a0eeeec202822875e08dc96f1bc4ff11b172d81cffdac37  OrbSleepManager-0.1.7-macos-universal.zip
+3e4e9c45f26da2592bca0e6675e383e6f462e6413401b31373ae8111a6caa024  OrbSleepManager-0.1.7-macos-universal.dmg
+```
+- CI 对 CloudKit `stapler validate` 临时网络抖动采用 3 次重试；staple 成功与 `spctl` 作为最终判定。
+- 前一次 CI run 40984938692 因验证步骤在线 validate 网络中断失败，未发布；修复后 40985620473 成功。
