@@ -709,8 +709,21 @@ func (e *Engine) ensureGatewayForService(ctx context.Context, serviceID string) 
 		if err != nil {
 			return err
 		}
-		if err := e.gw.Ensure(route); err != nil {
-			return err
+		// A container that has just been recreated may hold the host port for a
+		// short moment after Docker reports it running. Retry briefly on
+		// address-in-use before declaring the managed state unreachable.
+		var lastErr error
+		for attempt := 0; attempt < 6; attempt++ {
+			if lastErr = e.gw.Ensure(route); lastErr == nil {
+				break
+			}
+			if !strings.Contains(lastErr.Error(), "address already in use") {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if lastErr != nil {
+			return lastErr
 		}
 	}
 	return nil
@@ -773,7 +786,7 @@ func splitPortKey(key string) (int, string) {
 // accepting TCP connections on its original port.
 var bindingProbeTimeout = 10 * time.Second
 
-func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) error {
+var serviceConnectivityProbe = func(ctx context.Context, bindings []model.Binding) error {
 	for _, b := range bindings {
 		host := b.HostIP
 		if host == "" || host == "0.0.0.0" {
@@ -805,6 +818,10 @@ func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) err
 		}
 	}
 	return nil
+}
+
+func (e *Engine) testBindings(ctx context.Context, bindings []model.Binding) error {
+	return serviceConnectivityProbe(ctx, bindings)
 }
 
 // gatewayRouteFor builds a gateway route from an already-resolved proxy IP.

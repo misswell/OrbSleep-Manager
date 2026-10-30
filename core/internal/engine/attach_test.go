@@ -199,7 +199,20 @@ type portHolder struct {
 	ln net.Listener
 }
 
-func (h *portHolder) set(ln net.Listener) { h.mu.Lock(); h.ln = ln; h.mu.Unlock() }
+func (h *portHolder) set(ln net.Listener) {
+	h.mu.Lock()
+	h.ln = ln
+	h.mu.Unlock()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+}
 func (h *portHolder) close() {
 	h.mu.Lock()
 	if h.ln != nil {
@@ -765,47 +778,18 @@ func TestRestoreRevertsWhenDeletingManagedRecordFails(t *testing.T) {
 	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
 	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
 	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
-	hostPort := svc.Bindings[0].HostPort
-
-	// Once the gateway releases the port, occupy it with a real listener so the
-	// connectivity probe succeeds. The delete hook closes it just before the
-	// revert, allowing the gateway to bind again.
-	holder := &portHolder{}
-	holderReady := make(chan struct{})
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
-			if err == nil {
-				holder.set(ln)
-				close(holderReady)
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		close(holderReady)
-	}()
-
+	originalProbe := serviceConnectivityProbe
+	serviceConnectivityProbe = func(context.Context, []model.Binding) error { return nil }
 	originalDelete := deleteServiceRecord
 	deleteServiceRecord = func(e *Engine, id string) error {
-		holder.close()
-		for i := 0; i < 200; i++ {
-			ln, lerr := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
-			if lerr == nil {
-				_ = ln.Close()
-				break
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
 		return errors.New("simulated sqlite failure")
 	}
 	t.Cleanup(func() {
 		deleteServiceRecord = originalDelete
-		holder.close()
+		serviceConnectivityProbe = originalProbe
 	})
 
 	err := e.restoreService(context.Background(), logger, svc)
-	<-holderReady
 	if err == nil {
 		t.Fatal("expected restore to fail when the record cannot be deleted")
 	}
@@ -853,39 +837,15 @@ func TestRollbackAppliedRevertsWhenRecordDeletionFails(t *testing.T) {
 	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
 	e, logger := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
 	svc, snap, _, managed := managedServiceFixture(t, e, admin, docker, e.cli)
-	hostPort := svc.Bindings[0].HostPort
-
-	holder := &portHolder{}
-	holderReady := make(chan struct{})
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
-			if err == nil {
-				holder.set(ln)
-				close(holderReady)
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		close(holderReady)
-	}()
+	originalProbe := serviceConnectivityProbe
+	serviceConnectivityProbe = func(context.Context, []model.Binding) error { return nil }
 	originalDelete := deleteServiceRecord
 	deleteServiceRecord = func(e *Engine, id string) error {
-		holder.close()
-		for i := 0; i < 200; i++ {
-			ln, lerr := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", hostPort))
-			if lerr == nil {
-				_ = ln.Close()
-				break
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
 		return errors.New("simulated sqlite failure")
 	}
 	t.Cleanup(func() {
 		deleteServiceRecord = originalDelete
-		holder.close()
+		serviceConnectivityProbe = originalProbe
 	})
 
 	backupDir, _ := e.store.GetMeta("serviceBackup:" + svc.ID)
@@ -896,7 +856,6 @@ func TestRollbackAppliedRevertsWhenRecordDeletionFails(t *testing.T) {
 		managedContent: managed,
 	}
 	err := e.rollbackApplied(logger, []appliedItem{ai}, proxy.Config{})
-	<-holderReady
 	if err == nil {
 		t.Fatal("expected rollback to report incomplete state")
 	}
