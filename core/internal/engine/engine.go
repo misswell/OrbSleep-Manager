@@ -21,6 +21,7 @@ import (
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/settings"
 	"orbsleep/internal/state"
+	"orbsleep/internal/transaction"
 )
 
 // Engine is the daemon's application core.
@@ -61,6 +62,8 @@ type Engine struct {
 	recoveryMu   sync.Mutex
 	lastRecovery time.Time
 
+	composeLocker *transaction.FileLocker
+
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -85,17 +88,18 @@ func New(version, dataDir string) (*Engine, error) {
 	settingsMgr := settings.New(store, dataDir)
 	migrated, migrateErr := settingsMgr.MigrateLegacy()
 	e := &Engine{
-		version:    version,
-		dataDir:    dataDir,
-		store:      store,
-		settings:   settingsMgr,
-		logger:     logger,
-		gw:         gateway.New(func(level, format string, args ...any) { logger.Printf(level, format, args...) }),
-		plans:      map[string]*planEntry{},
-		activity:   map[string]time.Time{},
-		txnCancels: map[string]context.CancelFunc{},
-		eventsCh:   make(chan struct{}, 1),
-		stopCh:     make(chan struct{}),
+		version:       version,
+		dataDir:       dataDir,
+		store:         store,
+		settings:      settingsMgr,
+		logger:        logger,
+		gw:            gateway.New(func(level, format string, args ...any) { logger.Printf(level, format, args...) }),
+		plans:         map[string]*planEntry{},
+		activity:      map[string]time.Time{},
+		txnCancels:    map[string]context.CancelFunc{},
+		eventsCh:      make(chan struct{}, 1),
+		stopCh:        make(chan struct{}),
+		composeLocker: transaction.NewFileLocker(filepath.Join(dataDir, "locks")),
 	}
 	if migrateErr != nil {
 		logger.Printf("warn", "迁移旧设置失败: %v", migrateErr)

@@ -53,6 +53,20 @@ func newFakeDocker(t *testing.T, name, id string, ports []model.PortBinding) *fa
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"Version": "fake", "ApiVersion": "1.47"})
 	})
+	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		summary := dockerx.ContainerSummary{ID: f.id, Names: []string{"/" + f.name}, State: "running"}
+		for _, p := range f.ports {
+			if !f.published[p.HostPort] {
+				continue
+			}
+			summary.Ports = append(summary.Ports, dockerx.PortSummary{
+				IP: p.HostIP, PrivatePort: uint16(p.ContainerPort), PublicPort: uint16(p.HostPort), Type: p.Protocol,
+			})
+		}
+		json.NewEncoder(w).Encode([]dockerx.ContainerSummary{summary})
+	})
 	mux.HandleFunc("/containers/", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()

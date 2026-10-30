@@ -193,3 +193,26 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+func TestMatchesDetectsTargetChange(t *testing.T) {
+	port := freePort(t)
+	g := New(nil)
+	defer g.RemoveService("svc")
+	r := Route{Key: "svc|127.0.0.1|port", ServiceID: "svc", BindHost: "127.0.0.1", BindPort: port, TargetHost: "172.18.0.2", TargetPort: 41000}
+	if err := g.Ensure(r); err != nil {
+		t.Fatal(err)
+	}
+	if !g.Matches(r) {
+		t.Fatal("route should match")
+	}
+	changed := r
+	changed.TargetHost = "172.18.0.3"
+	if g.Matches(changed) {
+		t.Fatal("route with changed target must not match")
+	}
+	changed = r
+	changed.ServiceID = "other"
+	if g.Matches(changed) {
+		t.Fatal("route with changed owner must not match")
+	}
+}

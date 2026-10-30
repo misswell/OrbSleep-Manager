@@ -20,7 +20,9 @@ type Route struct {
 	BindPort   int
 	TargetHost string
 	TargetPort int
+	Protocol   string
 	Label      string
+	CreatedAt  time.Time
 }
 
 type route struct {
@@ -79,6 +81,15 @@ func (g *Gateway) Ensure(r Route) error {
 		return fmt.Errorf("gateway 已关闭")
 	}
 	if existing, ok := g.routes[r.Key]; ok {
+		existing.mu.Lock()
+		existing.ServiceID = r.ServiceID
+		existing.BindHost = r.BindHost
+		existing.BindPort = r.BindPort
+		existing.Protocol = r.Protocol
+		if existing.CreatedAt.IsZero() {
+			existing.CreatedAt = time.Now()
+		}
+		existing.mu.Unlock()
 		existing.setTarget(r.TargetHost, r.TargetPort, r.Label)
 		return nil
 	}
@@ -86,6 +97,12 @@ func (g *Gateway) Ensure(r Route) error {
 	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		return fmt.Errorf("无法监听 %s: %w", addr, err)
+	}
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = time.Now()
+	}
+	if r.Protocol == "" {
+		r.Protocol = "tcp"
 	}
 	rt := &route{Route: r, ln: ln}
 	g.routes[r.Key] = rt
@@ -119,6 +136,27 @@ func (g *Gateway) RemoveService(serviceID string) {
 	for _, k := range keys {
 		g.Remove(k)
 	}
+}
+
+// Matches reports whether the existing route has the same ownership, bind
+// address and target as r. A key alone is not enough: the proxy target may
+// have changed to a different container IP.
+func (g *Gateway) Matches(r Route) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	rt, ok := g.routes[r.Key]
+	if !ok {
+		return false
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	proto := r.Protocol
+	if proto == "" {
+		proto = "tcp"
+	}
+	return rt.ServiceID == r.ServiceID && rt.BindHost == r.BindHost &&
+		rt.BindPort == r.BindPort && rt.TargetHost == r.TargetHost &&
+		rt.TargetPort == r.TargetPort && rt.Protocol == proto
 }
 
 // Prune removes routes whose keys are not in keep.

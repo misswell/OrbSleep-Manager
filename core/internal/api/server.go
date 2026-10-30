@@ -211,8 +211,38 @@ func (s *Server) handlers() map[string]handler {
 		"system.status": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return s.eng.Status(), nil
 		},
-		"system.doctor": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			return map[string]any{"checks": s.eng.Doctor()}, nil
+		"system.doctor": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				Verify bool `json:"verify"`
+			}
+			if len(params) > 0 {
+				if err := decode(params, &p); err != nil {
+					return nil, err
+				}
+			}
+			checks := s.eng.Doctor()
+			if p.Verify {
+				checks = append(checks, s.eng.DoctorVerify()...)
+			}
+			return map[string]any{"checks": checks}, nil
+		},
+		"system.recover": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				Transaction string `json:"transaction"`
+			}
+			if len(params) > 0 {
+				if err := decode(params, &p); err != nil {
+					return nil, err
+				}
+			}
+			if p.Transaction != "" {
+				if err := s.eng.RecoverTransaction(p.Transaction); err != nil {
+					return nil, err
+				}
+				return map[string]any{"recovered": true, "transaction": p.Transaction}, nil
+			}
+			s.eng.RecoverTransactions()
+			return map[string]any{"recovered": true}, nil
 		},
 		"scan": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return s.eng.Scan(ctx)

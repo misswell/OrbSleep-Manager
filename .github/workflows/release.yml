@@ -77,11 +77,12 @@ jobs:
         shell: bash
         run: brew install xcodegen
 
-      - name: Run Go vet and race tests
+      - name: Run Go format, vet and race tests
         shell: bash
         run: |
           set -euo pipefail
           cd core
+          test -z "$(gofmt -l .)"
           go vet ./...
           go test -race ./...
 
@@ -144,12 +145,35 @@ jobs:
           zip="dist/OrbSleepManager-$version-macos-universal.zip"
           [[ -d "$app" && -f "$dmg" && -f "$zip" ]]
           codesign --verify --deep --strict "$app"
-          codesign --verify --strict "dist/OrbSleepManager-$version-macos-universal/bin/orbsleepd"
+          for tool in orbsleepd orbsleepctl; do
+            codesign --verify --strict "dist/OrbSleepManager-$version-macos-universal/bin/$tool"
+            codesign --display --verbose=4 "dist/OrbSleepManager-$version-macos-universal/bin/$tool" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
+            lipo -archs "dist/OrbSleepManager-$version-macos-universal/bin/$tool" | grep -q arm64
+            lipo -archs "dist/OrbSleepManager-$version-macos-universal/bin/$tool" | grep -q x86_64
+          done
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "Authority=Developer ID Application"
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
           spctl --assess --type execute --verbose "$app"
+          xcrun stapler validate "$app"
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q arm64
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q x86_64
+
+          # Verify the ZIP and DMG actually contain the stapled, signed app.
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          ditto -x -k "$zip" "$tmp/zip"
+          codesign --verify --deep --strict "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
+          xcrun stapler validate "$tmp/zip/OrbSleepManager-$version-macos-universal/OrbSleepManager.app"
+
+          hdiutil attach -readonly -nobrowse "$dmg" > "$tmp/mount.txt"
+          mount="$(awk '/\/Volumes\// {for (i=1;i<=NF;i++) if ($i ~ /^\/Volumes\//) {print; exit}}' "$tmp/mount.txt")"
+          [[ -n "$mount" ]]
+          codesign --verify --deep --strict "$mount/OrbSleepManager.app"
+          xcrun stapler validate "$mount/OrbSleepManager.app"
+          spctl --assess --type execute --verbose "$mount/OrbSleepManager.app"
+          hdiutil detach "$mount" >/dev/null
+
+          (cd dist && shasum -a 256 -c SHA256SUMS)
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -159,6 +183,17 @@ jobs:
             dist/*.dmg
             dist/*.zip
             dist/SHA256SUMS
+
+      - name: Verify tag matches source
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          described="$(git describe --tags --exact-match HEAD)"
+          [[ "$described" == "$RELEASE_TAG" ]] || {
+            echo "::error::Tag $RELEASE_TAG does not point at checked-out HEAD ($described)"
+            exit 1
+          }
 
       - name: Publish GitHub Release
         if: github.event_name == 'push' || inputs.publish

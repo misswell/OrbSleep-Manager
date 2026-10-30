@@ -2,10 +2,13 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,7 +66,26 @@ func main() {
 	case "status":
 		withClient(sock, func(c *client.Client) { printStatus(c, rest) })
 	case "doctor":
-		withClient(sock, func(c *client.Client) { printDoctor(c) })
+		withClient(sock, func(c *client.Client) { printDoctor(c, rest) })
+	case "recover":
+		withClient(sock, func(c *client.Client) {
+			var args struct {
+				Transaction string `json:"transaction"`
+			}
+			for i := 0; i < len(rest); i++ {
+				if rest[i] == "--transaction" && i+1 < len(rest) {
+					args.Transaction = rest[i+1]
+					i++
+				}
+			}
+			params := map[string]any{}
+			if args.Transaction != "" {
+				params["transaction"] = args.Transaction
+			}
+			var out map[string]any
+			must(c.Call(context.Background(), "system.recover", params, &out))
+			fmt.Println("恢复流程已完成；请运行 orbsleepctl doctor --verify 复查。")
+		})
 	case "scan":
 		withClient(sock, func(c *client.Client) { printScan(c, rest) })
 	case "plan":
@@ -169,11 +191,21 @@ func printStatus(c *client.Client, args []string) {
 	}
 }
 
-func printDoctor(c *client.Client) {
+func printDoctor(c *client.Client, args []string) {
+	verify := false
+	for _, a := range args {
+		if a == "--verify" {
+			verify = true
+		}
+	}
 	var out struct {
 		Checks []model.DoctorCheck `json:"checks"`
 	}
-	must(c.Call(context.Background(), "system.doctor", nil, &out))
+	params := map[string]any{}
+	if verify {
+		params["verify"] = true
+	}
+	must(c.Call(context.Background(), "system.doctor", params, &out))
 	for _, ch := range out.Checks {
 		icon := "✔"
 		switch ch.Status {
@@ -561,6 +593,13 @@ func uninstall(dataDir, sock string, args []string) {
 	if !*yes {
 		fail(fmt.Errorf("卸载会停止并恢复所有托管服务。确认请加 --yes"))
 	}
+	if *force {
+		path, err := exportRecoveryArchive(dataDir)
+		if err != nil {
+			fail(fmt.Errorf("导出恢复材料失败，已中止 --force 卸载: %w", err))
+		}
+		fmt.Fprintln(os.Stderr, "警告：--force 可能中断仍托管服务；恢复材料已导出到", path)
+	}
 	c := connectDaemonForUninstall(sock, *force)
 	if c != nil {
 		restoreAll(c)
@@ -571,7 +610,8 @@ func uninstall(dataDir, sock string, args []string) {
 		c.Close()
 		if len(out.Services) > 0 {
 			if !*force {
-				fail(fmt.Errorf("仍有 %d 个托管服务未恢复，已中止卸载；请重试恢复或使用 --force", len(out.Services)))
+				path, _ := exportRecoveryArchive(dataDir)
+				fail(fmt.Errorf("仍有 %d 个托管服务未恢复，已中止卸载；恢复材料: %s", len(out.Services), path))
 			}
 			fmt.Fprintf(os.Stderr, "警告：仍有 %d 个托管服务未恢复，--force 继续卸载。\n", len(out.Services))
 		}
@@ -599,6 +639,62 @@ func uninstall(dataDir, sock string, args []string) {
 	}
 	fmt.Printf("OrbSleep 数据（数据库、日志、备份）保留在: %s\n", dataDir)
 	fmt.Println("如确认不再需要，可在备份后手动删除该目录。")
+}
+
+func exportRecoveryArchive(dataDir string) (string, error) {
+	stamp := time.Now().Format("20060102-150405")
+	path := filepath.Join(dataDir, "recovery-export-"+stamp+".tar.gz")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	err = filepath.Walk(dataDir, func(p string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(filepath.Base(p), "recovery-export-") || strings.HasSuffix(p, ".sock") {
+			return nil
+		}
+		rel, rerr := filepath.Rel(dataDir, p)
+		if rerr != nil {
+			return rerr
+		}
+		hdr, herr := tar.FileInfoHeader(info, "")
+		if herr != nil {
+			return herr
+		}
+		hdr.Name = rel
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		rf, oerr := os.Open(p)
+		if oerr != nil {
+			return oerr
+		}
+		_, cerr := io.Copy(tw, rf)
+		_ = rf.Close()
+		return cerr
+	})
+	if err != nil {
+		tw.Close()
+		gz.Close()
+		os.Remove(path)
+		return "", err
+	}
+	if err := tw.Close(); err != nil {
+		gz.Close()
+		return "", err
+	}
+	if err := gz.Close(); err != nil {
+		return "", err
+	}
+	return path, f.Close()
 }
 
 func connectDaemonForUninstall(sock string, force bool) *client.Client {
@@ -741,7 +837,8 @@ func usage() {
 
 命令:
   status [--json]                 概览状态
-  doctor                          安装与连通性检查
+  doctor [--verify]               安装与连通性检查；--verify 做深度一致性检查
+  recover [--transaction ID]       恢复未完成事务/指定事务
   scan [--json]                   扫描全部容器
   plan <id|name>... [--allow-lan] [--apply]
                                   生成接入计划

@@ -108,3 +108,18 @@ func TestDuplicateColumnDetection(t *testing.T) {
 		t.Fatal("unrelated migration errors must not be ignored")
 	}
 }
+
+func TestSQLiteSynchronousFull(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var mode int
+	if err := s.db.QueryRow("PRAGMA synchronous").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 { // 2 = FULL
+		t.Fatalf("synchronous = %d, want FULL(2)", mode)
+	}
+}

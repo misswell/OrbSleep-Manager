@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"orbsleep/internal/compose"
+	"orbsleep/internal/failpoint"
 	"orbsleep/internal/model"
 )
 
@@ -166,6 +168,15 @@ func (e *Engine) startDetach(svc model.Service, remove bool) (string, error) {
 }
 
 func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Operation, remove bool, done func()) {
+	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
+	lock, lerr := e.composeLocker.Acquire(lockCtx, svc.ComposeFile)
+	lockCancel()
+	if lerr != nil {
+		logger := e.newOpLogger(op)
+		logger.finish("failed", "获取 Compose 文件锁失败，已中止（未做修改）: "+lerr.Error())
+		return
+	}
+	defer lock.Release()
 	defer done()
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
@@ -203,9 +214,12 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 	payload := detachPayload{OperationID: op.ID, Service: detachSvc, WorkingDir: workDir, Phase: "prepared"}
 	if readErr == nil {
 		payload.ManagedContent = managedContent
-		if expected, _, aerr := compose.AddBindings(managedContent, svc.ComposeService, bindingsFor(svc)); aerr == nil {
-			payload.ExpectedRestored = expected
+		expected, cerrs := compose.RestoreManagedBindings(managedContent, svc.ComposeService, bindingsFor(svc))
+		if len(cerrs) > 0 {
+			logger.finish("failed", "恢复端口冲突，已中止（未做修改）: "+joinErrors(cerrs))
+			return
 		}
+		payload.ExpectedRestored = expected
 	} else {
 		if backupFile == "" {
 			logger.finish("failed", "Compose 文件缺失且没有可用备份，已中止")
@@ -251,6 +265,11 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 			}
 		}
 	}
+	if raw, rerr := os.ReadFile(composeFile); rerr == nil {
+		if merr := e.markComposeLastKnownGood(composeFile, raw); merr != nil {
+			logger.add("warn", "保存 Compose 最后可信快照失败: "+merr.Error())
+		}
+	}
 	logger.add("info", "原始端口映射已恢复；OrbSleep 已停止管理该服务")
 	if err := e.syncProxyConfig(ctx, true); err != nil {
 		logger.add("warn", "同步代理配置失败: "+err.Error())
@@ -267,7 +286,11 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 func (e *Engine) rebuildMissingCompose(svc model.Service, backupFile string) ([]byte, error) {
 	content, err := os.ReadFile(backupFile)
 	if err != nil {
-		return nil, err
+		if good, ok := e.composeLastKnownGood(svc.ComposeFile); ok {
+			content = good
+		} else {
+			return nil, err
+		}
 	}
 	services, err := e.store.ListServices()
 	if err != nil {
@@ -288,9 +311,9 @@ func (e *Engine) rebuildMissingCompose(svc model.Service, backupFile string) ([]
 	}
 	// Ensure this service's own ports are present (the backup may have been
 	// taken before the container was last edited).
-	out, _, aerr := compose.AddBindings(content, svc.ComposeService, bindingsFor(svc))
-	if aerr != nil {
-		return nil, fmt.Errorf("补回本服务端口失败: %w", aerr)
+	out, cerrs := compose.RestoreManagedBindings(content, svc.ComposeService, bindingsFor(svc))
+	if len(cerrs) > 0 {
+		return nil, fmt.Errorf("补回本服务端口失败: %s", joinErrors(cerrs))
 	}
 	return out, nil
 }
@@ -424,14 +447,15 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 		if err := compose.WriteAtomic(composeFile, rebuilt, mode); err != nil {
 			return failWithRevert(fmt.Errorf("重建 Compose 文件失败: %w", err))
 		}
+		failpoint.Hit("detach_compose_written")
 		logger.add("warn", "Compose 文件缺失，已按共享服务当前状态重建")
 	} else {
-		out, added, err := compose.AddBindings(current, svc.ComposeService, removals)
-		if err != nil {
-			return failWithRevert(fmt.Errorf("无法安全地定点恢复端口（未覆盖原文件）: %w；请手动将 %s 加回 %s",
-				err, portsText(removals), composeFile))
+		out, cerrs := compose.RestoreManagedBindings(current, svc.ComposeService, removals)
+		if len(cerrs) > 0 {
+			return failWithRevert(fmt.Errorf("无法安全地定点恢复端口（未覆盖原文件）: %s；请手动将 %s 加回 %s",
+				joinErrors(cerrs), portsText(removals), composeFile))
 		}
-		if len(added) > 0 {
+		if !bytes.Equal(out, current) {
 			mode := os.FileMode(0o644)
 			if st, statErr := os.Stat(composeFile); statErr == nil {
 				mode = st.Mode()
@@ -439,6 +463,7 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 			if err := compose.WriteAtomic(composeFile, out, mode); err != nil {
 				return failWithRevert(fmt.Errorf("写入 Compose 文件失败: %w", err))
 			}
+			failpoint.Hit("detach_compose_written")
 			logger.add("info", fmt.Sprintf("已恢复端口声明: %s", portsText(removals)))
 		} else {
 			logger.add("info", "Compose 中已存在原始端口声明，无需修改")
@@ -453,6 +478,7 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 	if err != nil {
 		return failWithRevert(fmt.Errorf("服务未恢复运行: %w", err))
 	}
+	failpoint.Hit("detach_container_ready")
 	for _, b := range svc.Bindings {
 		if !containerPublishes(ins, model.PortBinding{
 			HostIP: b.HostIP, HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
@@ -464,6 +490,7 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 		return failWithRevert(fmt.Errorf("原端口连通性测试失败: %w", err))
 	}
 	logger.add("info", "原端口连通性测试通过")
+	failpoint.Hit("detach_before_record_delete")
 
 	if err := deleteServiceRecord(e, svc.ID); err != nil {
 		// The record must not outlive the managed wiring. Put the service back

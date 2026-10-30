@@ -17,6 +17,32 @@ import (
 
 // RecoverTransactions rolls back attach transactions that were interrupted by
 // an abrupt process termination. It runs synchronously before the API starts.
+// RecoverTransaction retries exactly one interrupted transaction.
+func (e *Engine) RecoverTransaction(id string) error {
+	e.recoveryMu.Lock()
+	defer e.recoveryMu.Unlock()
+	txn, ok, err := e.store.GetTransaction(id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("事务 %s 不存在", id)
+	}
+	if txn.Status != "running" && txn.Status != "rollback_failed" && txn.Status != "needs_repair" {
+		return fmt.Errorf("事务 %s 已是终态 %s", id, txn.Status)
+	}
+	switch txn.Kind {
+	case "attach":
+		e.recoverAttachTxn(txn)
+	case "detach":
+		e.recoverDetachTxn(txn)
+	default:
+		return fmt.Errorf("未知事务类型 %s", txn.Kind)
+	}
+	e.lastRecovery = time.Now()
+	return nil
+}
+
 func (e *Engine) RecoverTransactions() {
 	e.recoveryMu.Lock()
 	e.lastRecovery = time.Now()
@@ -354,6 +380,9 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 func (e *Engine) rebuildManagedCompose(svc model.Service, managedContent []byte) ([]byte, error) {
 	if len(managedContent) > 0 {
 		return managedContent, nil
+	}
+	if good, ok := e.composeLastKnownGood(svc.ComposeFile); ok {
+		return good, nil
 	}
 	backupDir, ok := e.store.GetMeta("serviceBackup:" + svc.ID)
 	if !ok {

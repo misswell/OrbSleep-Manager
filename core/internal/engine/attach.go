@@ -15,6 +15,7 @@ import (
 
 	"orbsleep/internal/compose"
 	"orbsleep/internal/dockerx"
+	"orbsleep/internal/failpoint"
 	"orbsleep/internal/gateway"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
@@ -196,6 +197,16 @@ func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSna
 }
 
 func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, fileStates map[string][]byte, admin *proxy.AdminClient, txnID string) (*appliedItem, error) {
+	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
+	lock, lerr := e.composeLocker.Acquire(lockCtx, snap.composeFile)
+	lockCancel()
+	if lerr != nil {
+		return nil, &attachError{Err: fmt.Errorf("获取 Compose 文件锁失败: %w", lerr)}
+	}
+	defer lock.Release()
+	if _, serr := e.ensureComposeSnapshot(snap.composeFile); serr != nil {
+		return nil, &attachError{Err: serr}
+	}
 	s := e.settings.Get()
 	cli, err := e.cliRunner()
 	if err != nil {
@@ -428,6 +439,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	if err := e.verifyProxyService(ctx, admin, sc); err != nil {
 		return fail(fmt.Errorf("确认代理配置失败: %w", err))
 	}
+	failpoint.Hit("proxy_updated")
 	if err := e.updateTxn(txnID, "proxy_updated", func(p *txnPayload) { p.Items[idx].Phase = "proxy_updated" }); err != nil {
 		return fail(fmt.Errorf("写入事务日志失败: %w", err))
 	}
@@ -462,6 +474,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	if err := compose.WriteAtomic(snap.composeFile, out, info.Mode()); err != nil {
 		return fail(fmt.Errorf("写入 Compose 文件失败: %w", err))
 	}
+	failpoint.Hit("compose_written")
 	composeWritten = true
 	fileStates[snap.composeFile] = out
 	undos = append(undos, undoStep{name: "恢复 Compose 并重建", fn: func() error {
@@ -507,6 +520,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 			return fail(fmt.Errorf("容器重建后仍然发布 %d/tcp（代理无法接管）", r.HostPort))
 		}
 	}
+	failpoint.Hit("container_ready")
 	if err := e.updateTxn(txnID, "container_recreated", func(p *txnPayload) { p.Items[idx].Phase = "container_recreated" }); err != nil {
 		return fail(fmt.Errorf("写入事务日志失败: %w", err))
 	}
@@ -527,6 +541,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 			return fail(fmt.Errorf("启动端口网关失败（%s:%d）: %w", hostLabel(b.HostIP), b.HostPort, err))
 		}
 	}
+	failpoint.Hit("gateway_ready")
 	if err := e.updateTxn(txnID, "gateway_ready", func(p *txnPayload) { p.Items[idx].Phase = "gateway_ready" }); err != nil {
 		return fail(fmt.Errorf("写入事务日志失败: %w", err))
 	}
@@ -541,6 +556,10 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}
 	logger.add("info", "原端口连通性测试通过")
 
+	failpoint.Hit("before_database_commit")
+	if err := e.markComposeLastKnownGood(snap.composeFile, out); err != nil {
+		return fail(fmt.Errorf("保存 Compose 最后可信快照失败: %w", err))
+	}
 	if err := persistManagedState(newIns, "managed_running", ""); err != nil {
 		return fail(fmt.Errorf("保存托管状态失败: %w", err))
 	}

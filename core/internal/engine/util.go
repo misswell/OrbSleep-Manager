@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -30,4 +31,14 @@ func copyFileSimple(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+func joinErrors(errs []error) string {
+	parts := make([]string, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			parts = append(parts, err.Error())
+		}
+	}
+	return strings.Join(parts, "；")
 }

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 
@@ -569,6 +570,15 @@ func WriteAtomic(file string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	var uid, gid = -1, -1
+	if fi, err := os.Stat(target); err == nil {
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("拒绝原子写入非普通文件 %s（%s）", target, fi.Mode().Type())
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			uid, gid = int(st.Uid), int(st.Gid)
+		}
+	}
 	tmp, err := os.CreateTemp(dir, ".orbsleep-*.tmp")
 	if err != nil {
 		return err
@@ -589,7 +599,23 @@ func WriteAtomic(file string, data []byte, mode os.FileMode) error {
 	if err := os.Chmod(name, mode); err != nil {
 		return err
 	}
-	return os.Rename(name, target)
+	if uid >= 0 && gid >= 0 {
+		// Preserve ownership when the caller has permission; a failure here
+		// must not silently change the file's owner, so retry only when the
+		// process is not already the owner.
+		if cerr := os.Chown(name, uid, gid); cerr != nil && !errors.Is(cerr, os.ErrPermission) && !errors.Is(cerr, syscall.EPERM) {
+			return cerr
+		}
+	}
+	if err := os.Rename(name, target); err != nil {
+		return err
+	}
+	// Rename is atomic, but the directory entry itself must be durable too.
+	if df, derr := os.Open(dir); derr == nil {
+		_ = df.Sync()
+		_ = df.Close()
+	}
+	return nil
 }
 
 // ValidateEffective compares two `docker compose config --format json` outputs

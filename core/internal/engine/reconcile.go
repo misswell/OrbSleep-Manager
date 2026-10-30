@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"orbsleep/internal/dockerx"
@@ -67,6 +68,20 @@ func (e *Engine) reconcile() {
 	}
 	s := e.settings.Get()
 
+	summaries, lerr := c.ListContainers(ctx)
+	if lerr != nil {
+		e.logger.Printf("warn", "reconcile 列出容器失败: %v", lerr)
+		return
+	}
+	byID := make(map[string]dockerx.ContainerSummary, len(summaries))
+	byName := make(map[string]dockerx.ContainerSummary, len(summaries))
+	for _, s := range summaries {
+		byID[s.ID] = s
+		for _, name := range s.Names {
+			byName[strings.TrimPrefix(name, "/")] = s
+		}
+	}
+
 	proxyIns, proxyErr := c.InspectContainer(ctx, proxy.ContainerName)
 	proxyRunning := proxyErr == nil && proxyIns.State.Running
 	proxyIP := ""
@@ -83,36 +98,39 @@ func (e *Engine) reconcile() {
 
 	keep := map[string]bool{}
 	for i := range services {
+		orig := services[i]
 		svc := &services[i]
-		var ins *dockerx.ContainerInspect
+		var summary *dockerx.ContainerSummary
 		var lastErr string
 		if svc.ContainerID != "" {
-			ii, err := c.InspectContainer(ctx, svc.ContainerID)
-			if err == nil {
-				ins = ii
+			if s, ok := byID[svc.ContainerID]; ok {
+				summary = &s
 			}
 		}
-		if ins == nil {
-			if ii, err := c.InspectContainer(ctx, svc.ContainerName); err == nil {
-				ins = ii
-				svc.ContainerID = ii.ID
+		if summary == nil {
+			if s, ok := byName[svc.ContainerName]; ok {
+				summary = &s
+				svc.ContainerID = s.ID
 			}
 		}
 		status := "missing"
-		if ins == nil {
+		if summary == nil {
 			lastErr = "容器不存在（可能已被删除）"
 		} else {
-			svc.ContainerID = ins.ID
+			svc.ContainerID = summary.ID
 			switch {
-			case ins.State.Running && ins.State.Paused:
-				status = "warning"
-				lastErr = "容器处于暂停状态"
-			case ins.State.Running:
+			case strings.EqualFold(summary.State, "running"):
 				if e.gw.ActiveConns(svc.ID) > 0 {
 					status = "managed_running"
 				} else {
 					status = "managed_idle"
 				}
+			case strings.EqualFold(summary.State, "paused"):
+				status = "warning"
+				lastErr = "容器处于暂停状态"
+			case strings.EqualFold(summary.State, "restarting") || strings.EqualFold(summary.State, "dead"):
+				status = "warning"
+				lastErr = "容器状态异常: " + summary.State
 			default:
 				status = "managed_stopped"
 			}
@@ -132,13 +150,17 @@ func (e *Engine) reconcile() {
 			if rerr != nil {
 				status = "warning"
 				lastErr = rerr.Error()
-				// A stale route may still point at the old proxy container IP.
-				// Remove it instead of keeping it via keep[key].
-				e.gw.Remove(key)
+				// If a healthy route is already correct, keep it. Otherwise
+				// remove the stale route so it cannot forward to the wrong IP.
+				if e.gw.Matches(route) {
+					keep[key] = true
+				} else {
+					e.gw.Remove(key)
+				}
 			} else {
 				keep[key] = true
 			}
-			if ins != nil && containerPublishes(ins, model.PortBinding{
+			if summary != nil && containerSummaryPublishes(*summary, model.PortBinding{
 				HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
 			}) {
 				status = "warning"
@@ -151,8 +173,10 @@ func (e *Engine) reconcile() {
 		}
 		svc.Status = status
 		svc.LastError = lastErr
-		if err := e.store.UpsertService(*svc); err != nil {
-			e.logger.Printf("warn", "更新服务状态失败: %v", err)
+		if serviceRuntimeChanged(orig, *svc) {
+			if err := e.store.UpsertService(*svc); err != nil {
+				e.logger.Printf("warn", "更新服务状态失败: %v", err)
+			}
 		}
 	}
 	e.gw.Prune(keep)
@@ -265,4 +289,35 @@ func sleepOrStop(stop <-chan struct{}, d time.Duration) bool {
 	case <-time.After(d):
 		return true
 	}
+}
+
+func serviceRuntimeChanged(a, b model.Service) bool {
+	return a.ContainerID != b.ContainerID || a.Status != b.Status || a.LastError != b.LastError ||
+		a.ActiveConnections != b.ActiveConnections || a.LastActiveAt != b.LastActiveAt
+}
+
+func containerSummaryPublishes(s dockerx.ContainerSummary, b model.PortBinding) bool {
+	for _, p := range s.Ports {
+		if int(p.PublicPort) == 0 || int(p.PublicPort) != b.HostPort {
+			continue
+		}
+		if int(p.PrivatePort) != b.ContainerPort {
+			continue
+		}
+		proto := p.Type
+		if proto == "" {
+			proto = "tcp"
+		}
+		want := b.Protocol
+		if want == "" {
+			want = "tcp"
+		}
+		if proto != want {
+			continue
+		}
+		if b.HostIP == "" || b.HostIP == "0.0.0.0" || p.IP == "" || p.IP == b.HostIP {
+			return true
+		}
+	}
+	return false
 }
