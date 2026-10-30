@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"orbsleep/internal/engine"
+	"orbsleep/internal/model"
 )
 
 // Version is the protocol version.
@@ -208,6 +209,15 @@ func (s *Server) handlers() map[string]handler {
 		"ping": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return map[string]any{"pong": true, "version": s.eng.Version()}, nil
 		},
+		"system.shutdown": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			// Respond first, then let Serve() unwind and main finish the
+			// in-flight transactions before the process exits.
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				s.Close()
+			}()
+			return map[string]any{"ok": true, "shuttingDown": true}, nil
+		},
 		"system.status": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return s.eng.Status(), nil
 		},
@@ -243,6 +253,84 @@ func (s *Server) handlers() map[string]handler {
 			}
 			s.eng.RecoverTransactions()
 			return map[string]any{"recovered": true}, nil
+		},
+		"system.health": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.Health(), nil
+		},
+		"system.prepareShutdown": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.PrepareShutdown(), nil
+		},
+		"system.prepareUpdate": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.PrepareUpdate(), nil
+		},
+		"system.recovery.list": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.RecoveryList(), nil
+		},
+		"system.recovery.resolve": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.RecoveryResolve(), nil
+		},
+		"docker.contexts": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.DockerContexts(ctx), nil
+		},
+		"docker.context.select": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				Name     string `json:"name"`
+				Endpoint string `json:"endpoint"`
+			}
+			if err := decode(params, &p); err != nil {
+				return nil, err
+			}
+			target := p.Name
+			if target == "" {
+				target = p.Endpoint
+			}
+			if target == "" {
+				return nil, badRequest("缺少 name 或 endpoint")
+			}
+			return s.eng.SelectDockerContext(ctx, target)
+		},
+		"backup.create": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			entry, err := s.eng.CreateBackup()
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"backup": entry}, nil
+		},
+		"backup.list": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.ListBackups(), nil
+		},
+		"backup.restore": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				ID   string `json:"id"`
+				Path string `json:"path"`
+			}
+			if err := decode(params, &p); err != nil {
+				return nil, err
+			}
+			target := p.ID
+			if target == "" {
+				target = p.Path
+			}
+			if target == "" {
+				return nil, badRequest("缺少备份 id 或 path")
+			}
+			result, err := s.eng.RestoreBackup(target)
+			if err != nil {
+				return nil, err
+			}
+			// Respond first, then stop so the next launch applies the restore.
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				s.Close()
+			}()
+			return result, nil
+		},
+		"logs.export": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				Limit int `json:"limit"`
+			}
+			_ = decode(params, &p)
+			return s.eng.ExportLogs(p.Limit)
 		},
 		"scan": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return s.eng.Scan(ctx)
@@ -351,18 +439,6 @@ func (s *Server) handlers() map[string]handler {
 			}
 			return map[string]any{"operationId": id}, nil
 		},
-		"agent.install": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			if err := s.eng.InstallAgent(); err != nil {
-				return nil, err
-			}
-			return map[string]any{"installed": true}, nil
-		},
-		"agent.uninstall": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			if err := s.eng.UninstallAgent(); err != nil {
-				return nil, err
-			}
-			return map[string]any{"installed": false}, nil
-		},
 		"proxy.setup": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			id, err := s.eng.ProxySetup()
 			if err != nil {
@@ -370,16 +446,32 @@ func (s *Server) handlers() map[string]handler {
 			}
 			return map[string]any{"operationId": id}, nil
 		},
+		"logs.sources": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return map[string]any{"sources": s.eng.LogSources()}, nil
+		},
 		"logs.tail": func(ctx context.Context, params json.RawMessage) (any, error) {
 			var p struct {
-				Limit int `json:"limit"`
+				Limit  int    `json:"limit"`
+				Source string `json:"source"`
 			}
 			_ = decode(params, &p)
-			lines, err := s.eng.Logs(p.Limit)
+			source := p.Source
+			if source == "" {
+				source = "daemon"
+			}
+			var (
+				lines []model.LogEntry
+				err   error
+			)
+			if source == "proxy" {
+				lines, err = s.eng.ProxyLogs(ctx, p.Limit)
+			} else {
+				lines, err = s.eng.Logs(p.Limit)
+			}
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"lines": lines}, nil
+			return map[string]any{"lines": lines, "source": source}, nil
 		},
 	}
 }

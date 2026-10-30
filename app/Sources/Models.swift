@@ -754,6 +754,22 @@ struct AgentStatusResult: Codable, Sendable {
     var installed: Bool?
 }
 
+/// `logs.tail` 的返回。
+struct LogsResult: Codable, Sendable {
+    var lines: [LogLine]?
+    var source: String?
+}
+
+struct LogSourcesResult: Codable, Sendable {
+    var sources: [String]?
+}
+
+/// `system.shutdown` 的返回。
+struct ShutdownResult: Codable, Sendable {
+    var ok: Bool?
+    var shuttingDown: Bool?
+}
+
 // MARK: - UI 辅助
 
 enum PortsFormatter {
@@ -791,4 +807,105 @@ enum PortsFormatter {
     static func mapping(_ mapping: ProxyMapping) -> String {
         "代理监听 \(mapping.listenPort ?? 0) → 容器 \(mapping.targetPort ?? 0)"
     }
+}
+
+// MARK: - 健康 / 恢复 / 环境 / 备份
+
+struct Health: Codable, Sendable, Hashable {
+    var daemonVersion: String?
+    var protocolVersion: Int?
+    var dataDir: String?
+    var socketPath: String?
+    var uptimeSecs: Int?
+    var dockerReachable: Bool?
+    var dockerContext: DockerContextInfo?
+    var proxy: ProxyStatus?
+    var counts: StatusCounts?
+    var pendingTransactions: Int?
+    var runningOperations: Int?
+    var launchAgentLoaded: Bool?
+    var legacyLaunchAgent: Bool?
+    var legacyBinaries: [String]?
+    var lastError: LastErrorInfo?
+}
+
+struct RecoveryTransaction: Codable, Sendable, Hashable, Identifiable {
+    var id: String
+    var kind: String?
+    var operationId: String?
+    var status: String?
+    var phase: String?
+    var startedAt: String?
+    var updatedAt: String?
+    var error: String?
+}
+
+struct RecoveryListResult: Codable, Sendable {
+    var transactions: [RecoveryTransaction]?
+    var resolved: Int?
+    var message: String?
+}
+
+struct ShutdownPreparation: Codable, Sendable {
+    var safe: Bool?
+    var runningOperations: [Operation]?
+    var pendingTransactions: [RecoveryTransaction]?
+    var message: String?
+}
+
+struct DockerContextEntry: Codable, Sendable, Hashable, Identifiable {
+    var name: String
+    var endpoint: String?
+    var kind: String?
+    var current: Bool?
+    var reachable: Bool?
+    var source: String?
+
+    var id: String { endpoint ?? name }
+    var displayName: String { current == true ? "\(name)（当前）" : name }
+}
+
+struct DockerContextsResult: Codable, Sendable {
+    var contexts: [DockerContextEntry]?
+    var selected: String?
+}
+
+struct BackupEntry: Codable, Sendable, Hashable, Identifiable {
+    var id: String
+    var path: String?
+    var createdAt: String?
+    var sizeBytes: Int64?
+    var kind: String?
+    var note: String?
+}
+
+struct BackupListResult: Codable, Sendable {
+    var backups: [BackupEntry]?
+}
+
+struct BackupCreateResult: Codable, Sendable {
+    var backup: BackupEntry?
+}
+
+struct LogsExportResult: Codable, Sendable {
+    var path: String?
+    var lines: Int?
+}
+
+/// 应用更新信息（更新中心使用）。
+struct AppUpdate: Codable, Sendable, Hashable {
+    var version: String
+    var notes: String?
+    var downloadURL: String?
+    var publishedAt: String?
+    var sha256: String?
+    var sizeBytes: Int64?
+}
+
+/// `backup.restore` 的返回。
+struct RestoreResult: Codable, Sendable {
+    var ok: Bool?
+    var restartRequired: Bool?
+    var message: String?
+    var backupPath: String?
 }

@@ -236,6 +236,7 @@ type Settings struct {
 	SocketPath           string   `json:"socketPath"`
 	ProxyDialMode        string   `json:"proxyDialMode"` // published | container_ip
 	ExcludeImagePatterns []string `json:"excludeImagePatterns"`
+	DockerSocket         string   `json:"dockerSocket"` // optional explicit socket; empty = auto detect
 	LaunchAgentInstalled bool     `json:"launchAgentInstalled"`
 }
 
@@ -246,4 +247,101 @@ type DoctorCheck struct {
 	Status      string `json:"status"` // ok | warn | fail
 	Detail      string `json:"detail"`
 	Remediation string `json:"remediation"`
+}
+
+// Health is the compact runtime health payload used by the GUI's service and
+// diagnostics centers.
+type Health struct {
+	DaemonVersion       string      `json:"daemonVersion"`
+	ProtocolVersion     int         `json:"protocolVersion"`
+	DataDir             string      `json:"dataDir"`
+	SocketPath          string      `json:"socketPath"`
+	UptimeSecs          int64       `json:"uptimeSecs"`
+	DockerReachable     bool        `json:"dockerReachable"`
+	DockerContext       ContextInfo `json:"dockerContext"`
+	Proxy               ProxyStatus `json:"proxy"`
+	Counts              Counts      `json:"counts"`
+	PendingTransactions int         `json:"pendingTransactions"`
+	RunningOperations   int         `json:"runningOperations"`
+	LaunchAgentLoaded   bool        `json:"launchAgentLoaded"`
+	LegacyLaunchAgent   bool        `json:"legacyLaunchAgent"`
+	LegacyBinaries      []string    `json:"legacyBinaries"`
+	LastError           LastError   `json:"lastError"`
+}
+
+// RecoveryTransaction is a durable in-flight transaction exposed to the GUI.
+type RecoveryTransaction struct {
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	OperationID string `json:"operationId"`
+	Status      string `json:"status"`
+	Phase       string `json:"phase"`
+	StartedAt   string `json:"startedAt"`
+	UpdatedAt   string `json:"updatedAt"`
+	Error       string `json:"error"`
+}
+
+// RecoveryList is returned by system.recovery.list/resolve.
+type RecoveryList struct {
+	Transactions []RecoveryTransaction `json:"transactions"`
+	Resolved     int                   `json:"resolved"`
+	Message      string                `json:"message"`
+}
+
+// ShutdownPreparation reports whether it is safe to stop/upgrade the daemon.
+type ShutdownPreparation struct {
+	Safe                bool                  `json:"safe"`
+	RunningOperations   []Operation           `json:"runningOperations"`
+	PendingTransactions []RecoveryTransaction `json:"pendingTransactions"`
+	Message             string                `json:"message"`
+}
+
+// DockerContext is one discoverable Docker endpoint.
+type DockerContext struct {
+	Name      string `json:"name"`
+	Endpoint  string `json:"endpoint"`
+	Kind      string `json:"kind"`
+	Current   bool   `json:"current"`
+	Reachable bool   `json:"reachable"`
+	Source    string `json:"source"` // env | orbstack | docker-desktop | context | default
+}
+
+// DockerContexts is returned by docker.contexts.
+type DockerContexts struct {
+	Contexts []DockerContext `json:"contexts"`
+	Selected string          `json:"selected"`
+}
+
+// BackupEntry describes one manual backup archive.
+type BackupEntry struct {
+	ID        string `json:"id"`
+	Path      string `json:"path"`
+	CreatedAt string `json:"createdAt"`
+	SizeBytes int64  `json:"sizeBytes"`
+	Kind      string `json:"kind"` // manual | operation | migration
+	Note      string `json:"note"`
+}
+
+// BackupsResult is returned by backup.list.
+type BackupsResult struct {
+	Backups []BackupEntry `json:"backups"`
+}
+
+// BackupCreateResult is returned by backup.create.
+type BackupCreateResult struct {
+	Backup BackupEntry `json:"backup"`
+}
+
+// LogsExportResult is returned by logs.export.
+type LogsExportResult struct {
+	Path  string `json:"path"`
+	Lines int    `json:"lines"`
+}
+
+// RestoreResult is returned by backup.restore.
+type RestoreResult struct {
+	OK              bool   `json:"ok"`
+	RestartRequired bool   `json:"restartRequired"`
+	Message         string `json:"message"`
+	BackupPath      string `json:"backupPath"`
 }

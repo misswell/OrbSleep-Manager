@@ -11,12 +11,13 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: U8U443D7ZL
-    MARKETING_VERSION: 0.1.8
+    MARKETING_VERSION: 0.2.0
     CURRENT_PROJECT_VERSION: 1
     ENABLE_HARDENED_RUNTIME: YES
     ENABLE_APP_SANDBOX: NO
     DEAD_CODE_STRIPPING: YES
     CLANG_ENABLE_MODULES: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
 targets:
   OrbSleepManager:
     type: application
@@ -29,6 +30,7 @@ targets:
       properties:
         CFBundleDisplayName: OrbSleep Manager
         CFBundleName: OrbSleep Manager
+        CFBundleIconFile: AppIcon
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.developer-tools
@@ -46,7 +48,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.misswell.orbsleepmanager
         PRODUCT_NAME: OrbSleepManager
         PRODUCT_MODULE_NAME: OrbSleepManager
-        MARKETING_VERSION: 0.1.8
+        MARKETING_VERSION: 0.2.0
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Automatic
@@ -56,6 +58,13 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         COMBINE_HIDPI_IMAGES: YES
         SWIFT_EMIT_LOC_STRINGS: YES
+    postBuildScripts:
+      - name: Embed background service and LaunchAgent
+        script: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          "$SRCROOT/../scripts/embed-service.sh" "$SRCROOT/.." "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH"
+        basedOnDependencyAnalysis: false
 schemes:
   OrbSleepManager:
     build:

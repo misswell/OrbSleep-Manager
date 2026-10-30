@@ -3,7 +3,7 @@
 ## 结构
 
 - `core/`：Go 模块 `orbsleep`。`cmd/orbsleepd`（守护进程）、`cmd/orbsleepctl`（CLI）、`internal/engine`（业务核心）、`internal/compose`（Compose 定点修改）、`internal/gateway`（macOS TCP 网关）、`internal/proxy`（Lazy TCP Proxy 管理与配置）、`internal/dockerx`（Docker API over Unix Socket）、`internal/state`（SQLite）。
-- `app/`：SwiftUI 客户端，XcodeGen 工程（`app/project.yml`），产物 `app/build/Debug/OrbSleepManager.app`。
+- `app/`：SwiftUI 客户端，XcodeGen 工程（`app/project.yml`），产物 `app/build/Debug/OrbSleepManager.app`。`app/Support/` 存放随包分发的 LaunchAgent plist；post-build 阶段 `scripts/embed-service.sh` 把 `orbsleepd`/`orbsleepctl` 放进 `Contents/Resources`，GUI 通过 `SMAppService` 注册后台服务。
 - `docs/PROTOCOL.md`：GUI ↔ daemon 的 NDJSON 协议，**唯一契约**。改协议必须同时改 `core/internal/model`、`core/internal/api`、`app/Sources/Models.swift` 与文档。
 - `scripts/phase0.py`：真实 OrbStack 端到端验收。
 
@@ -41,7 +41,7 @@ make phase0         # 需要 OrbStack；会创建/清理测试 Compose 项目
 
 ## 数据位置
 
-`~/Library/Application Support/OrbSleep/`：`state.sqlite`、`proxy/`（compose + config）、`backups/`、`logs/`、`daemon.sock`。LaunchAgent：`com.misswell.orbsleep.daemon`。
+`~/Library/Application Support/OrbSleep/`：`state.sqlite`、`proxy/`（compose + config）、`backups/`、`logs/`、`daemon.sock`。LaunchAgent：`com.misswell.orbsleep.daemon.app`。
 
 ## 环境
 

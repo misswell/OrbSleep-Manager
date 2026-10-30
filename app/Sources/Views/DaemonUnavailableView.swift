@@ -1,10 +1,8 @@
 import SwiftUI
 
+/// 后台服务未运行时显示的界面。所有恢复动作都在应用内完成，不出现终端命令。
 struct DaemonUnavailableView: View {
     @Environment(AppState.self) private var app
-    @State private var copied = false
-
-    private let installCommand = "orbsleepctl install-agent"
 
     var body: some View {
         ScrollView {
@@ -13,9 +11,9 @@ struct DaemonUnavailableView: View {
                     Image(systemName: "bolt.horizontal.circle")
                         .font(.system(size: 44, weight: .light))
                         .foregroundStyle(.orange)
-                    Text("未连接到 orbsleepd")
+                    Text("后台服务未运行")
                         .font(.largeTitle.weight(.semibold))
-                    Text("OrbSleep Manager 通过本地 Unix Socket 与后台助手通信。GUI 不会自行启动或停止 orbsleepd，请确认它已安装并在运行。")
+                    Text("OrbSleep Manager 通过本地 Unix Socket 与后台服务通信。可以在这里直接启动它，无需打开终端。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -25,54 +23,51 @@ struct DaemonUnavailableView: View {
                     ErrorBanner(message: error)
                 }
 
-                Card("排查步骤", systemImage: "wrench.and.screwdriver") {
+                Card("恢复连接", systemImage: "wrench.and.screwdriver") {
                     VStack(alignment: .leading, spacing: 14) {
                         step(
                             index: 1,
-                            title: "安装并启动 LaunchAgent",
-                            detail: "在终端执行下面的命令；它会安装 LaunchAgent 并拉起 orbsleepd。"
+                            title: "启动后台服务",
+                            detail: "应用会通过 launchd 启动已注册的后台服务；如果尚未注册，会先完成注册。"
                         )
-                        codeBlock(installCommand)
                         step(
                             index: 2,
                             title: "确认数据目录与 Socket 路径",
-                            detail: "后台助手会在这里创建 daemon.sock（权限 0600）。"
+                            detail: "后台服务会在这里创建 daemon.sock（权限 0600）。"
                         )
                         LabeledValue(label: "数据目录", value: app.dataDir, monospaced: true)
                         LabeledValue(label: "Socket", value: app.socketPath, monospaced: true)
-                        Text("Socket 路径可通过环境变量 ORBSLEEP_SOCKET 覆盖，需要与 LaunchAgent 的配置保持一致。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                         step(
                             index: 3,
-                            title: "重试连接",
-                            detail: "安装后等待几秒，再点击「重试连接」。也可以通过「打开数据目录」确认日志与备份是否生成。"
+                            title: "如仍失败，查看诊断",
+                            detail: "「诊断与修复」会自动检查 Docker、代理与端口，并提供一键修复。"
                         )
                     }
                 }
 
                 HStack(spacing: 10) {
                     Button {
-                        Task { await app.retryConnection() }
+                        Task { await app.startService() }
                     } label: {
-                        Label("重试连接", systemImage: "arrow.clockwise")
+                        Label("启动后台服务", systemImage: "play.circle.fill")
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
+                    .disabled(app.isBusyService)
 
                     Button {
-                        app.copyInstallCommand()
-                        withAnimation {
-                            copied = true
-                        }
-                        Task {
-                            try? await Task.sleep(nanoseconds: 2_000_000_000)
-                            withAnimation {
-                                copied = false
-                            }
-                        }
+                        Task { await app.restartService() }
                     } label: {
-                        Label(copied ? "已复制" : "复制安装命令", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        Label("重新启动", systemImage: "arrow.clockwise")
+                    }
+                    .controlSize(.large)
+                    .disabled(app.isBusyService)
+
+                    Button {
+                        app.section = .diagnostics
+                        app.setupCompleted = true
+                    } label: {
+                        Label("打开诊断与修复", systemImage: "stethoscope")
                     }
                     .controlSize(.large)
 
@@ -82,9 +77,13 @@ struct DaemonUnavailableView: View {
                         Label("打开数据目录", systemImage: "folder")
                     }
                     .controlSize(.large)
+
+                    if app.isBusyService {
+                        ProgressView().controlSize(.small)
+                    }
                 }
 
-                Text("提示：GUI 关闭不会影响后台助手，也不会停止已经托管的服务。")
+                Text("提示：关闭应用不会影响后台服务，也不会停止已经托管的服务。")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -111,27 +110,5 @@ struct DaemonUnavailableView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-    }
-
-    private func codeBlock(_ text: String) -> some View {
-        HStack(spacing: 8) {
-            Text(text)
-                .font(.system(.callout, design: .monospaced))
-                .textSelection(.enabled)
-            Spacer(minLength: 0)
-            Button {
-                app.copyInstallCommand()
-            } label: {
-                Image(systemName: "doc.on.doc")
-            }
-            .buttonStyle(.borderless)
-            .help("复制命令")
-        }
-        .padding(10)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-        )
     }
 }

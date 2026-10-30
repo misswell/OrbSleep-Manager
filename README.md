@@ -6,45 +6,78 @@ macOS 上的 OrbStack / Docker 容器「按需休眠」管理器。扫描现有 
 客户端 → 127.0.0.1:8080（macOS 端口网关）→ 代理发布端口 → Lazy TCP Proxy → 业务容器:80
 ```
 
+## 安装（最终用户）
+
+1. 下载 DMG。
+2. 把 `OrbSleepManager.app` 拖到「应用程序」。
+3. 打开应用。
+4. 点击「一键配置并启动」。
+5. 如 macOS 提示，在「系统设置 → 通用 → 登录项」中允许后台服务运行。
+
+完成。后台服务安装、开机启动注册、Docker 检测、Lazy TCP Proxy 初始化、数据库创建和环境检查都由应用自动完成；不需要打开终端，不需要复制任何二进制，也不需要执行 `sudo`。需要管理员权限时使用 macOS 原生授权界面。
+
+「设置」里两个开关相互独立：登录后自动启动后台服务、登录后自动打开 OrbSleep Manager。
+
+应用包内已经包含运行所需的一切：
+
+```text
+OrbSleepManager.app/Contents/
+├── MacOS/OrbSleepManager
+├── Resources/
+│   ├── orbsleepd            # 后台服务
+│   └── orbsleepctl          # 可选 CLI
+└── Library/LaunchAgents/
+    └── com.misswell.orbsleep.daemon.app.plist
+```
+
+后台服务通过 macOS 的 `SMAppService` 注册为当前用户的 LaunchAgent，由 launchd 在登录后自动启动。默认只使用当前用户权限；没有需要 root 的功能，因此不引入 LaunchDaemon。
+
+### 从 0.1.x 手动安装迁移
+
+应用启动时会检测旧版安装（`/usr/local/bin/orbsleepd`、`/usr/local/bin/orbsleepctl`、`~/Library/LaunchAgents/com.misswell.orbsleep.daemon.plist`）。安装向导和「诊断与修复」提供「迁移到应用内后台服务」：先创建备份，确认没有未完成事务后停止旧服务、移除旧启动项、注册包内后台服务并验证，最后清理旧二进制（root 所有的文件通过一次性 macOS 管理员授权删除）。数据目录、托管记录、备份和操作历史全部保留。
+
+### 更新
+
+「更新与维护」页负责应用与后台服务升级：
+
+- 应用更新从 `OSUpdateFeedURL`（Info.plist）或环境变量 `ORBSLEEP_UPDATE_FEED` 读取 JSON：`{"version":"0.2.1","downloadURL":"https://.../OrbSleepManager.zip","sha256":"...","notes":"...","sizeBytes":123456}`。
+- 下载后校验 SHA256、解包并验证新应用签名，再替换 App Bundle；旧版本保留在 `~/Library/Application Support/OrbSleep/app-backup/`，新版本 12 秒内未运行会自动回滚。
+- 后台服务二进制随应用包更新；执行「升级后台服务」会重新注册并重启服务，应用与后台服务版本保持一致。
+- 备份中心支持创建数据库快照并在停止态恢复；恢复时旧数据库保留为 `state.sqlite.pre-restore-<时间>`。
+
 ## 组成
 
 | 目录 | 内容 |
 |---|---|
-| `core/` | Go 后台助手 `orbsleepd`、CLI `orbsleepctl`、扫描 / Compose 修改 / 代理管理 / 端口网关 / SQLite |
-| `app/` | SwiftUI GUI（XcodeGen 工程） |
-| `docs/PROTOCOL.md` | GUI 与守护进程的 Unix Socket NDJSON 协议 |
-| `docs/ARCHITECTURE.md` | 组件、事务、回滚与设计取舍 |
+| `core/` | Go 后台服务 `orbsleepd`、CLI `orbsleepctl`、扫描 / Compose 修改 / 代理管理 / 端口网关 / SQLite |
+| `app/` | SwiftUI GUI（XcodeGen 工程），含安装向导、后台服务管理、诊断、日志与卸载 |
+| `app/Support/` | 随包分发的 LaunchAgent plist |
+| `docs/PROTOCOL.md` | GUI 与后台服务的 Unix Socket NDJSON 协议 |
+| `docs/ARCHITECTURE.md` | 组件、后台服务、事务、回滚与设计取舍 |
 | `docs/PHASE0.md` | 阶段 0 可行性验证清单与结论 |
+| `scripts/embed-service.sh` | 构建时把 `orbsleepd`/`orbsleepctl` 与 plist 放进应用包 |
 | `scripts/phase0.py` | 端到端验收脚本（需要 OrbStack） |
 
-## 快速开始
+## 开发
 
 ```sh
-# 1. 构建后台与 CLI
-make build-core
+make build-core     # bin/orbsleepd bin/orbsleepctl
+make test           # go test ./...
+make app            # xcodegen + xcodebuild，产物 app/build/Debug/OrbSleepManager.app
+make phase0         # 真实 OrbStack 端到端验收
+```
 
-# 2. 安装开机自启（LaunchAgent），并等待守护进程就绪
-./bin/orbsleepctl install-agent
+`make app` 的 post-build 阶段会调用 `scripts/embed-service.sh`，自动把后台服务与 LaunchAgent 放进 Debug 应用包，因此打开 Debug 构建也能直接使用「一键配置并启动」。
 
-# 3. 检查环境（OrbStack / Docker / 代理 / 端口）
+命令行工具仍可用于调试，但不是用户安装流程的一部分：
+
+```sh
 ./bin/orbsleepctl doctor
-
-# 4. 安装并启动 Lazy TCP Proxy（首次需要拉镜像）
-./bin/orbsleepctl proxy-setup
-
-# 5. 扫描容器
 ./bin/orbsleepctl scan
-
-# 6. 生成计划 → 预览 diff → 执行
 ./bin/orbsleepctl plan <容器ID或名称> --apply
 ```
 
-GUI：
-
-```sh
-make app          # xcodegen + xcodebuild
-open app/build/Debug/OrbSleepManager.app
-```
+在「设置 → 命令行工具」中可以把应用包内的 `orbsleepctl` 安装为 `~/.local/bin/orbsleepctl`（用户级，无需 sudo）。
 
 ## 打包发行
 
@@ -52,11 +85,28 @@ open app/build/Debug/OrbSleepManager.app
 make release   # 或 ./scripts/package-release.sh
 ```
 
-产物在 `dist/`：通用（arm64 + x86_64）的 `OrbSleepManager.app`、`orbsleepd`、`orbsleepctl`，以及 DMG、ZIP 和 `SHA256SUMS`。
+产物在 `dist/`：
 
-- 检测到 `Developer ID Application` 证书时会带安全时间戳签名（app 与 `orbsleepd`/`orbsleepctl` 都签名）；配置 `APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_PRIVATE_KEY_PATH` 后会自动公证 app 与 DMG 并 staple。
-- 没有 Developer ID 证书时只做 ad-hoc 签名，`README.txt` 和产物会明确标记 **UNSIGNED**，首次启动需右键打开。
-- Releases 中的正式构建使用 Developer ID 签名并已公证。
+- `OrbSleepManager.app`：通用（arm64 + x86_64），已把 `orbsleepd`、`orbsleepctl` 和 LaunchAgent plist 嵌入包内。
+- `OrbSleepManager-<version>-macos-universal.dmg`：只包含应用、`README.txt` 和 Applications 快捷方式，不再分发单独的 `bin/`。
+- `OrbSleepManager-<version>-macos-universal.zip` 与 `SHA256SUMS`。
+
+签名与公证：
+
+- 检测到 `Developer ID Application` 证书时，先用带安全时间戳和 Hardened Runtime 的签名签内嵌的 `orbsleepd`/`orbsleepctl`，再签应用包。
+- 公证支持两种凭据：`APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_PRIVATE_KEY_PATH`，或本机 `notarytool` keychain profile（默认尝试 `agentspace-notary`，也可用 `NOTARY_PROFILE` 指定）。公证通过后自动 staple app 与 DMG，并用 `spctl` 验证。
+- 当前 0.2.0 构建已完成 Apple 公证与 staple：`spctl` 对 app 返回 `accepted / Notarized Developer ID`。
+- 没有 Developer ID 证书时只做 ad-hoc 签名，`README.txt` 会明确标记 **UNSIGNED** 并说明如何在系统设置中允许。正式发布不使用这种构建。
+- 配置 `UPDATE_BASE_URL` 后，打包结束会调用 `scripts/make-appcast.sh` 生成 `dist/appcast.json`，可直接作为 `OSUpdateFeedURL` 的更新源。
+
+## 后台服务与权限模型
+
+- GUI 负责注册、启动、停止、重启、修复、升级和卸载后台服务。
+- 后台服务只以当前用户权限运行，数据在 `~/Library/Application Support/OrbSleep/`。
+- GUI 通过本地 Unix Socket（`daemon.sock`，权限 0600）与后台服务通信。
+- 打开应用后自动执行环境检查，只在发现问题时提示；用户不需要运行 `doctor`。
+- 升级随应用一起完成：新版本的后台服务就在新的应用包内，重启服务即加载新版本。
+- 卸载会先恢复所有托管服务的原始端口映射，再移除后台服务、开机启动项和可选的 CLI，最后把应用移到废纸篓；数据目录保留。
 
 ## 安全边界
 
@@ -79,7 +129,11 @@ make release   # 或 ./scripts/package-release.sh
 - 单容器多端口、已停止容器接入、容器删除后重建恢复
 - 守护进程重启后立即恢复监听；代理容器重启后服务不中断
 - 进程被强制终止时，未完成的接入/恢复事务会在下次启动自动回滚或补记（Compose、容器、代理目标、原端口、操作记录）
-- LaunchAgent 安装/卸载
+- 应用包内嵌后台服务、LaunchAgent 注册与卸载（SMAppService / 开发构建回退）
+- 强制 `kill -9` 后台进程后 launchd 自动重启；`system.shutdown` 优雅停止且不重启
+- 备份创建 → 修改设置 → 恢复 → 重启后数据回滚
+- 0.2.0 复跑 `scripts/phase0.py`：代理启动 → 接入 → 端口移除后仍 200 → 唤醒 → 空闲停止 → Compose 逐字节恢复
+- 公证与 staple：app / DMG 均 Accepted，`spctl` 返回 `accepted / Notarized Developer ID`
 - Go 单元测试、真实 Linux TCP 网关测试、GUI 编译与真实守护进程协议直连
 
 详细记录见 [docs/VERIFICATION.md](docs/VERIFICATION.md)。复跑：
@@ -92,4 +146,4 @@ python3 scripts/phase0.py
 
 ## 状态
 
-阶段 0–4 的主体实现已落地并验证；阶段 5 的直接分发签名与公证已完成（Developer ID），自动升级、特权端口助手仍待实现；阶段 6（UDP/IPv6、多文件 Compose）尚未实现。
+阶段 0–4 的主体实现已落地并验证；阶段 5 的直接分发签名与公证已完成（Developer ID），0.2.0 起安装、后台服务管理、诊断、日志、升级与卸载全部在 GUI 中完成；特权端口助手与阶段 6（UDP/IPv6、多文件 Compose）尚未实现。

@@ -5,12 +5,42 @@
 | 进程 | 语言 | 职责 |
 |---|---|---|
 | `orbsleepd` | Go | Docker 扫描、Compose 定位与修改、代理配置、端口网关、SQLite、Unix Socket API |
-| `orbsleepctl` | Go | 同一套核心的 CLI（诊断、扫描、计划、执行、恢复、LaunchAgent） |
-| OrbSleep Manager | SwiftUI | 概览、扫描、计划预览、托管服务、设置、操作日志 |
+| `orbsleepctl` | Go | 同一套核心的 CLI（诊断、扫描、计划、执行、恢复；可选高级入口） |
+| OrbSleep Manager | SwiftUI | 安装向导、后台服务管理、概览、扫描、计划预览、托管服务、诊断与修复、日志与维护、设置、操作日志 |
 | Lazy TCP Proxy | 官方镜像 | 按连接启动容器、空闲停止、TCP 转发 |
 | LaunchAgent | launchd | 用户登录后启动 `orbsleepd`，GUI 关闭后保持端口监听 |
 
-GUI 与守护进程使用 Unix Socket（`~/Library/Application Support/OrbSleep/daemon.sock`，0600）通信，协议见 [PROTOCOL.md](PROTOCOL.md)。GUI 不直接操作 Docker，也不执行 Shell。
+GUI 与后台服务使用 Unix Socket（`~/Library/Application Support/OrbSleep/daemon.sock`，0600）通信，协议见 [PROTOCOL.md](PROTOCOL.md)。GUI 不直接操作 Docker，也不执行用户输入的 Shell。
+
+## 1.1 打包与后台服务
+
+`orbsleepd`、`orbsleepctl` 和 LaunchAgent plist 全部位于应用包内，由构建阶段 `scripts/embed-service.sh` 放入：
+
+```text
+OrbSleepManager.app/Contents/
+├── MacOS/OrbSleepManager
+├── Resources/{orbsleepd,orbsleepctl}
+└── Library/LaunchAgents/com.misswell.orbsleep.daemon.app.plist
+```
+
+GUI 通过 `SMAppService.agent(plistName:)` 注册应用包内的 LaunchAgent；plist 使用 `BundleProgram = Contents/Resources/orbsleepd`，因此应用被移动后仍能正确启动。注册、启动、停止、重启、修复、升级和卸载都由 GUI 发起：
+
+- 启动：`launchctl kickstart -k gui/<uid>/com.misswell.orbsleep.daemon.app`
+- 停止：调用 `system.shutdown`，后台服务完成事务后以退出码 0 退出（`KeepAlive.SuccessfulExit=false` 不会重启）
+- 升级：后台服务二进制随应用包更新，重启服务即加载新版本
+- 卸载：先恢复所有托管服务，再 `SMAppService.unregister` 并清理可选的 `~/.local/bin/orbsleepctl`
+
+开发构建若没有 Developer ID 签名，`SMAppService.register` 可能被拒绝，此时 GUI 回退到由包内 `orbsleepctl install-agent` 写入用户级 LaunchAgent；两条路径都不需要用户打开终端或输入 `sudo`。后台服务只以当前用户权限运行，没有 LaunchDaemon。
+
+### 1.2 旧版迁移与运行时契约
+
+0.2.0 使用新的 LaunchAgent label `com.misswell.orbsleep.daemon.app`，与 0.1.x 手动安装的 `com.misswell.orbsleep.daemon` 并存而不冲突。GUI 启动时检测旧版 plist、`/usr/local/bin/orbsleepd` / `orbsleepctl` 与旧 launchd 任务，并按「备份 → 检查未完成事务 → 停止旧服务 → 移除旧启动项 → 注册包内服务 → 验证 → 清理旧二进制」的顺序迁移；root 所有的旧二进制通过一次性 macOS 管理员授权删除，不作为常驻 root 服务。
+
+后台协议在 0.2.0 增加 `system.health`、`system.prepareShutdown`、`system.prepareUpdate`、`system.recovery.list/resolve`、`docker.contexts/select`、`backup.create/list/restore`、`logs.export`。`agent.install/uninstall` 从正常 API 移除，LaunchAgent 生命周期统一由 Swift 的 `BackgroundService` 管理，避免 GUI 与 daemon 同时管理同一任务。Docker Context 的选择只保存为 OrbSleep 自己的配置（`settings.dockerSocket`），不修改用户全局 Docker Context。
+
+`backup.restore` 不直接覆盖运行中的 SQLite：daemon 先写入 `restore-request.json` 并退出，`main` 在 `engine.New` 之前调用 `ApplyPendingRestore` 替换数据库，旧库保留为 `state.sqlite.pre-restore-<ts>`，因此恢复过程即使中断也不会留下半写状态。
+
+应用更新中心从 `OSUpdateFeedURL` / `ORBSLEEP_UPDATE_FEED` 读取 JSON，下载后校验 SHA256、解包并 `codesign --verify --deep --strict`，再把当前 App 移到 `app-backup/` 后替换；由独立 relaunch 脚本启动新版本，12 秒内未运行则自动还原旧版本。后台服务二进制随应用包更新，升级时重新注册 LaunchAgent 并重启服务。
 
 ## 2. 端口链路的关键取舍
 
@@ -128,4 +158,4 @@ GUI 与守护进程使用 Unix Socket（`~/Library/Application Support/OrbSleep/
 
 - UDP 转发、IPv6、低端口特权助手、多文件 Compose 自动修改、复杂 `extends` / 锚点。
 - 独立 `docker run` 容器的自动迁移（只给出「不支持」原因，不猜测创建命令）。
-- 应用签名、公证、自动更新。
+- 应用内自动下载并替换应用包（后台服务升级随应用更新已完成，但应用自身的自动更新尚未实现）。

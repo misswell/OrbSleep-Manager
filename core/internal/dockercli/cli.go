@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -76,6 +77,14 @@ func (r *Runner) run(ctx context.Context, dir string, timeout time.Duration, arg
 		return nil, fmt.Errorf("docker %s 失败: %v: %s", strings.Join(args, " "), err, msg)
 	}
 	return stdout.Bytes(), nil
+}
+
+// Logs reads the last N lines from a container.
+func (r *Runner) Logs(ctx context.Context, container string, tail int) ([]byte, error) {
+	if tail <= 0 || tail > 5000 {
+		tail = 500
+	}
+	return r.run(ctx, "", 30*time.Second, "logs", "--timestamps", "--tail", strconv.Itoa(tail), container)
 }
 
 // Compose runs a compose subcommand in the project directory.

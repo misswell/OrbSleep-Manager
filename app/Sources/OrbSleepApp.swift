@@ -25,42 +25,81 @@ struct RootView: View {
 
     var body: some View {
         @Bindable var app = app
-        NavigationSplitView {
-            SidebarView()
-                .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 300)
-        } detail: {
-            detailContent
-                .frame(minWidth: 760, maxWidth: .infinity, maxHeight: .infinity)
-                .sheet(item: $app.plan) { plan in
-                    PlanSheetView(plan: plan)
-                }
-        }
-        .navigationSplitViewStyle(.balanced)
-        .sheet(isPresented: $app.isOperationSheetPresented) {
-            OperationSheetView()
-        }
-        .overlay(alignment: .top) {
-            if let message = app.errorBanner {
-                ErrorBanner(message: message) {
-                    app.dismissError()
+        content
+            .sheet(item: $app.plan) { plan in
+                PlanSheetView(plan: plan)
+            }
+            .sheet(isPresented: $app.isOperationSheetPresented) {
+                OperationSheetView()
+            }
+            .overlay(alignment: .top) {
+                VStack(spacing: 8) {
+                    if let message = app.errorBanner {
+                        ErrorBanner(message: message) {
+                            app.dismissError()
+                        }
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                    if let message = app.noticeMessage {
+                        NoticeBanner(message: message) {
+                            app.dismissNotice()
+                        }
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 10)
                 .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
-                .transition(.move(edge: .top).combined(with: .opacity))
             }
+            .animation(.easeInOut(duration: 0.18), value: app.errorBanner)
+            .animation(.easeInOut(duration: 0.18), value: app.noticeMessage)
+            .task {
+                await app.bootstrap()
+            }
+            .frame(minWidth: 1100, minHeight: 700)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if app.isBootstrapping {
+            VStack(spacing: 12) {
+                ProgressView()
+                    .controlSize(.large)
+                Text("正在连接后台服务…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+        } else if !app.daemonReachable && !app.setupCompleted {
+            SetupView()
+        } else {
+            NavigationSplitView {
+                SidebarView()
+                    .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 300)
+            } detail: {
+                detailContent
+                    .frame(minWidth: 760, maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .navigationSplitViewStyle(.balanced)
         }
-        .animation(.easeInOut(duration: 0.18), value: app.errorBanner)
-        .task {
-            await app.bootstrap()
-        }
-        .frame(minWidth: 1100, minHeight: 700)
     }
 
     @ViewBuilder
     private var detailContent: some View {
         if !app.daemonReachable {
-            DaemonUnavailableView()
+            switch app.section {
+            case .diagnostics:
+                DiagnosticsView()
+            case .logs:
+                LogsView()
+            case .update:
+                UpdateView()
+            case .settings:
+                SettingsView()
+            default:
+                DaemonUnavailableView()
+            }
         } else {
             switch app.section {
             case .overview:
@@ -71,10 +110,50 @@ struct RootView: View {
                 ServicesView()
             case .operations:
                 OperationsView()
+            case .diagnostics:
+                DiagnosticsView()
+            case .logs:
+                LogsView()
+            case .update:
+                UpdateView()
             case .settings:
                 SettingsView()
             }
         }
+    }
+}
+
+/// 绿色提示条，用于成功的操作反馈（区别于橙色 ErrorBanner）。
+struct NoticeBanner: View {
+    let message: String
+    var onDismiss: (() -> Void)?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            if let onDismiss {
+                Button {
+                    onDismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.green.opacity(0.35), lineWidth: 1)
+        )
     }
 }
 

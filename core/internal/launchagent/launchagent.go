@@ -13,8 +13,12 @@ import (
 	"strings"
 )
 
-// Label is the launchd job label.
-const Label = "com.misswell.orbsleep.daemon"
+// Label is the current app-bundled launchd job label. It intentionally differs
+// from the 0.1.x manual-install label so the two never collide during migration.
+const Label = "com.misswell.orbsleep.daemon.app"
+
+// LegacyLabel is the label written by 0.1.x manual installs.
+const LegacyLabel = "com.misswell.orbsleep.daemon"
 
 // Path returns the plist location for the current user.
 func Path() (string, error) {
@@ -25,7 +29,18 @@ func Path() (string, error) {
 	return filepath.Join(home, "Library", "LaunchAgents", Label+".plist"), nil
 }
 
-// Installed reports whether the plist exists.
+// LegacyPath returns the 0.1.x plist location for the current user.
+func LegacyPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", LegacyLabel+".plist"), nil
+}
+
+// Installed reports whether the current plist exists in ~/Library/LaunchAgents.
+// App-bundled SMAppService registrations keep the plist inside the app bundle,
+// so a missing file here does not mean the service is unregistered.
 func Installed() bool {
 	p, err := Path()
 	if err != nil {
@@ -33,6 +48,35 @@ func Installed() bool {
 	}
 	_, err = os.Stat(p)
 	return err == nil
+}
+
+// LegacyInstalled reports whether a 0.1.x manual-install plist is present.
+func LegacyInstalled() bool {
+	p, err := LegacyPath()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
+	return err == nil
+}
+
+// Loaded reports whether launchd currently manages the job (SMAppService
+// registrations and legacy LaunchAgents both appear in the gui domain).
+func Loaded() bool {
+	uid := os.Getuid()
+	return run("launchctl", "print", fmt.Sprintf("gui/%d/%s", uid, Label)) == nil
+}
+
+// LegacyLoaded reports whether the 0.1.x job is still loaded by launchd.
+func LegacyLoaded() bool {
+	uid := os.Getuid()
+	return run("launchctl", "print", fmt.Sprintf("gui/%d/%s", uid, LegacyLabel)) == nil
+}
+
+// Active reports whether the current background service is registered with
+// launchd in any supported form.
+func Active() bool {
+	return Loaded() || Installed()
 }
 
 // Plist renders the launchd property list.

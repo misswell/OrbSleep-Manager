@@ -33,7 +33,15 @@ GUI 与后台助手（`orbsleepd`）通过 **Unix Domain Socket** + **换行分�
 |---|---|---|
 | `ping` | `{}` | `{"pong":true,"version":"0.1.0"}` |
 | `system.status` | `{}` | `Status` |
+| `system.health` | `{}` | `Health` |
 | `system.doctor` | `{}` | `{"checks":[DoctorCheck]}` |
+| `system.prepareShutdown` | `{}` | `{"safe":true,"runningOperations":[],"pendingTransactions":[],"message":"..."}` |
+| `system.prepareUpdate` | `{}` | `{"safe":true,...}` |
+| `system.shutdown` | `{}` | `{"ok":true,"shuttingDown":true}` |
+| `system.recovery.list` | `{}` | `{"transactions":[RecoveryTransaction],"resolved":0,"message":"..."}` |
+| `system.recovery.resolve` | `{}` | `{"transactions":[...],"resolved":1,"message":"..."}` |
+| `docker.contexts` | `{}` | `{"contexts":[DockerContext],"selected":"unix://..."}` |
+| `docker.context.select` | `{"name":"OrbStack"}` 或 `{"endpoint":"unix://..."}` | `DockerContexts` |
 | `scan` | `{}` | `ScanResult` |
 | `container.inspect` | `{"id":"..."}` | `{"container":Container,"inspect":object}` |
 | `plan.create` | `{"containerIds":["..."],"allowLanExposure":false}` | `Plan` |
@@ -46,11 +54,16 @@ GUI 与后台助手（`orbsleepd`）通过 **Unix Domain Socket** + **换行分�
 | `settings.update` | `SettingsPatch` | `Settings` |
 | `proxy.setup` | `{}` | `{"operationId":"..."}` |
 | `proxy.stop` | `{}` | `{"operationId":"..."}` |
-| `agent.install` | `{}` | `{"installed":true}` |
-| `agent.uninstall` | `{}` | `{"installed":false}` |
-| `logs.tail` | `{"limit":200}` | `{"lines":[{"at":"...","level":"info","message":"..."}]}` |
+| `backup.create` | `{}` | `{"backup":BackupEntry}` |
+| `backup.list` | `{}` | `{"backups":[BackupEntry]}` |
+| `backup.restore` | `{"id":"backup-..."}` 或 `{"path":"..."}` | `{"ok":true,"restartRequired":true,"message":"...","backupPath":"..."}` |
+| `logs.sources` | `{}` | `{"sources":["daemon","proxy"]}` |
+| `logs.tail` | `{"limit":200,"source":"daemon 或 proxy"}` | `{"lines":[{"at":"...","level":"info","message":"..."}],"source":"daemon"}` |
+| `logs.export` | `{"limit":2000}` | `{"path":"...","lines":2000}` |
 
 GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在用户点击或设置开启时调用；`operation.get` 在操作进行中每 500ms。
+
+`system.shutdown` 返回后后台服务会关闭监听、完成未完成事务并退出（退出码 0，launchd 的 `KeepAlive.SuccessfulExit=false` 不会重启它）。GUI 的「停止服务」使用该方法；「启动服务」使用 `launchctl kickstart`。
 
 ## 数据结构
 
@@ -194,7 +207,7 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 
 ```json
 {
-  "daemonVersion": "0.1.8",
+  "daemonVersion": "0.2.0",
   "dataDir": "/Users/me/Library/Application Support/OrbSleep",
   "context": {"name":"orbstack","endpoint":"unix:///Users/me/.orbstack/run/docker.sock","kind":"orbstack"},
   "dockerReachable": true,

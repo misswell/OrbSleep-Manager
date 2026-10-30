@@ -452,3 +452,12 @@ func boolInt(b bool) int {
 	}
 	return 0
 }
+
+// BackupTo writes a consistent snapshot of the database to path using
+// SQLite's VACUUM INTO. The destination must not already exist.
+func (s *Store) BackupTo(path string) error {
+	_ = os.Remove(path)
+	stmt := fmt.Sprintf("VACUUM INTO '%s'", strings.ReplaceAll(path, "'", "''"))
+	_, err := s.db.Exec(stmt)
+	return err
+}

@@ -155,17 +155,30 @@ jobs:
           }
           codesign --verify --deep --strict "$app"
           for tool in orbsleepd orbsleepctl; do
-            codesign --verify --strict "dist/OrbSleepManager-$version-macos-universal/bin/$tool"
-            codesign --display --verbose=4 "dist/OrbSleepManager-$version-macos-universal/bin/$tool" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
-            lipo -archs "dist/OrbSleepManager-$version-macos-universal/bin/$tool" | grep -q arm64
-            lipo -archs "dist/OrbSleepManager-$version-macos-universal/bin/$tool" | grep -q x86_64
+            codesign --verify --strict "$app/Contents/Resources/$tool"
+            codesign --display --verbose=4 "$app/Contents/Resources/$tool" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
+            lipo -archs "$app/Contents/Resources/$tool" | grep -q arm64
+            lipo -archs "$app/Contents/Resources/$tool" | grep -q x86_64
           done
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "Authority=Developer ID Application"
           codesign --display --verbose=4 "$app" 2>&1 | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
           spctl --assess --type execute --verbose "$app"
           validate_staple "$app"
+          validate_staple "$dmg"
+          [[ -f "$app/Contents/Library/LaunchAgents/com.misswell.orbsleep.daemon.app.plist" ]]
+          /usr/libexec/PlistBuddy -c 'Print :BundleProgram' \
+            "$app/Contents/Library/LaunchAgents/com.misswell.orbsleep.daemon.app.plist" \
+            | grep -q 'Contents/Resources/orbsleepd'
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q arm64
           lipo -archs "$app/Contents/MacOS/OrbSleepManager" | grep -q x86_64
+          lipo -archs "$app/Contents/Resources/orbsleepd" | grep -q arm64
+          lipo -archs "$app/Contents/Resources/orbsleepd" | grep -q x86_64
+          rm -rf /tmp/orbsleep-dmg
+          hdiutil attach "$dmg" -nobrowse -quiet -mountpoint /tmp/orbsleep-dmg
+          test ! -e /tmp/orbsleep-dmg/bin
+          test -d /tmp/orbsleep-dmg/OrbSleepManager.app
+          hdiutil detach /tmp/orbsleep-dmg -quiet || true
+          rm -rf /tmp/orbsleep-dmg
 
           # Verify the ZIP and DMG actually contain the stapled, signed app.
           tmp="$(mktemp -d)"

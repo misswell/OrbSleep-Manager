@@ -90,11 +90,15 @@ func (e *Engine) Doctor() []model.DoctorCheck {
 		add("backup_dir", "备份目录可写", "ok", s.BackupDir, "")
 	}
 
-	if launchagent.Installed() {
-		add("launch_agent", "后台助手开机启动", "ok", "LaunchAgent 已安装（"+launchagent.Label+"）", "")
-	} else {
-		add("launch_agent", "后台助手开机启动", "warn", "尚未安装 LaunchAgent；关闭 GUI 后端口网关会随守护进程退出",
-			"运行 orbsleepctl install-agent，或在设置中启用")
+	switch {
+	case launchagent.Loaded():
+		add("launch_agent", "后台服务", "ok", "已由 launchd 管理（"+launchagent.Label+"），登录后自动启动", "")
+	case launchagent.Installed():
+		add("launch_agent", "后台服务", "warn", "启动项已安装，但当前没有运行",
+			"在「设置 → 后台服务」中点击「启动服务」")
+	default:
+		add("launch_agent", "后台服务", "warn", "尚未注册为登录启动项；关闭应用后端口网关会随守护进程退出",
+			"在「设置 → 后台服务」中点击「启用开机启动」")
 	}
 
 	if s.EnableLowPortHelper {

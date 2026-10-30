@@ -69,6 +69,7 @@ type Engine struct {
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	eventsCh  chan struct{}
+	startedAt time.Time
 }
 
 // New opens the state database and prepares the engine.
@@ -102,6 +103,7 @@ func New(version, dataDir string) (*Engine, error) {
 		stopCh:        make(chan struct{}),
 		composeLocker: transaction.NewFileLocker(filepath.Join(dataDir, "locks")),
 		txns:          transaction.NewManager(store),
+		startedAt:     time.Now(),
 	}
 	if migrateErr != nil {
 		logger.Printf("warn", "迁移旧设置失败: %v", migrateErr)
@@ -182,7 +184,7 @@ func (e *Engine) Status() model.Status {
 	st := model.Status{
 		DaemonVersion:        e.version,
 		DataDir:              e.dataDir,
-		LaunchAgentInstalled: launchagent.Installed(),
+		LaunchAgentInstalled: launchagent.Active(),
 	}
 	if c, err := e.dockerClient(ctx); err == nil {
 		st.Context = c.Context()
@@ -312,7 +314,7 @@ func (e *Engine) UninstallAgent() error {
 // Settings returns the current settings.
 func (e *Engine) Settings() model.Settings {
 	s := e.settings.Get()
-	s.LaunchAgentInstalled = launchagent.Installed()
+	s.LaunchAgentInstalled = launchagent.Active()
 	return s
 }
 
@@ -369,6 +371,11 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 			s.ExcludeImagePatterns = patterns
 		}
 	}
+	if v, ok := patch["dockerSocket"]; ok {
+		if str, ok := v.(string); ok {
+			s.DockerSocket = str
+		}
+	}
 	if s.AdminPort < 1 || s.AdminPort > 65535 || s.WebPort < 1 || s.WebPort > 65535 {
 		return s, errors.New("代理管理端口/状态端口无效")
 	}
@@ -406,6 +413,9 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 	}
 	if err := e.settings.Save(s); err != nil {
 		return s, err
+	}
+	if old.DockerSocket != s.DockerSocket {
+		e.invalidateDocker()
 	}
 	e.logger.Printf("info", "设置已更新: 空闲超时 %ds，端口范围 %d-%d", s.IdleTimeoutSecs, s.ProxyPortStart, s.ProxyPortEnd)
 	e.triggerReconcile()
@@ -458,7 +468,17 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 
 	detectCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	c, err := dockerx.Detect(detectCtx)
+	var c *dockerx.Client
+	var err error
+	if selected := strings.TrimSpace(e.settings.Get().DockerSocket); selected != "" {
+		c, err = dockerx.New(detectCtx, strings.TrimPrefix(selected, "unix://"))
+		if err != nil {
+			e.logger.Printf("warn", "选定的 Docker Socket 不可用（%s）：%v；回退自动检测", selected, err)
+			c, err = dockerx.Detect(detectCtx)
+		}
+	} else {
+		c, err = dockerx.Detect(detectCtx)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err != nil {

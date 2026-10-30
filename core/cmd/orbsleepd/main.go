@@ -15,7 +15,7 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.1.8"
+const version = "0.2.0"
 
 func main() {
 	// Keep state, logs and backups readable by the current user only.
@@ -42,6 +42,12 @@ func main() {
 	sock := *socket
 	if sock == "" {
 		sock = settings.SocketPath(dir)
+	}
+	// A previous backup.restore request is applied before SQLite is opened, so
+	// the engine starts from the restored database.
+	if err := engine.ApplyPendingRestore(dir); err != nil {
+		fmt.Fprintln(os.Stderr, "恢复备份失败:", err)
+		os.Exit(1)
 	}
 	eng, err := engine.New(version, dir)
 	if err != nil {
@@ -79,4 +85,8 @@ func main() {
 		eng.Close()
 		os.Exit(1)
 	}
+	// Serve returns nil after system.shutdown closes the listener; finish the
+	// in-flight transactions before the process exits so the journal is clean.
+	srv.Close()
+	eng.Close()
 }

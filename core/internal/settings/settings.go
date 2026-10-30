@@ -147,6 +147,9 @@ func merge(dst *model.Settings, src model.Settings) {
 	if src.ProxyDialMode != "" {
 		dst.ProxyDialMode = src.ProxyDialMode
 	}
+	if src.DockerSocket != "" {
+		dst.DockerSocket = src.DockerSocket
+	}
 	if src.ExcludeImagePatterns != nil {
 		dst.ExcludeImagePatterns = src.ExcludeImagePatterns
 	}

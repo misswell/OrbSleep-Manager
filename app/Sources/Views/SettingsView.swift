@@ -5,7 +5,7 @@ struct SettingsView: View {
 
     @State private var draft = SettingsDraft()
     @State private var savedMessage: String?
-    @State private var showUninstallAgentConfirmation = false
+    @State private var showUninstallServiceConfirmation = false
     @State private var showStopProxyConfirmation = false
 
     var body: some View {
@@ -18,12 +18,17 @@ struct SettingsView: View {
                 }
             }
 
+            environmentSection
             sleepSection
             proxySection
-            agentSection
+            serviceSection
+            cliSection
             excludeSection
+            dataSection
             pathsSection
             doctorSection
+            updateLinkSection
+            aboutSection
         }
         .formStyle(.grouped)
         .navigationTitle("设置")
@@ -35,13 +40,13 @@ struct SettingsView: View {
         } message: {
             Text("代理容器会被停止并移除，配置、设置和托管记录保留。停止后新连接无法唤醒托管容器；可在修改端口设置后重新安装启动。")
         }
-        .confirmationDialog("卸载 LaunchAgent", isPresented: $showUninstallAgentConfirmation) {
-            Button("卸载并停止后台助手", role: .destructive) {
-                Task { await app.uninstallLaunchAgent() }
+        .confirmationDialog("卸载后台服务", isPresented: $showUninstallServiceConfirmation) {
+            Button("停止并移除后台服务", role: .destructive) {
+                Task { await app.uninstallBackgroundService() }
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("卸载后 orbsleepd 不再随登录启动；如果后台助手退出，GUI 会断开连接。需要时可以重新安装，或执行 orbsleepctl install-agent。")
+            Text("会先恢复所有托管服务的原始端口映射，再停止后台服务、移除开机启动项和可选的命令行工具。数据目录会保留。")
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -67,6 +72,7 @@ struct SettingsView: View {
             }
         }
         .task {
+            guard app.daemonReachable else { return }
             if app.settings == nil {
                 await app.loadSettings()
             }
@@ -81,6 +87,105 @@ struct SettingsView: View {
             if !isDirty {
                 syncDraft()
             }
+        }
+    }
+
+    // MARK: - 运行环境
+
+    private var environmentSection: some View {
+        Section {
+            LabeledValue(
+                label: "当前 Docker",
+                value: app.health?.dockerContext?.name ?? app.status?.context?.name ?? "—"
+            )
+            LabeledValue(
+                label: "Socket",
+                value: app.status?.context?.endpoint ?? "—",
+                monospaced: true
+            )
+            ForEach(app.dockerContexts) { context in
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(context.name).font(.callout)
+                        Text(context.endpoint ?? "")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer()
+                    if context.current == true {
+                        StatusBadge(text: "当前", color: .green, systemImage: "checkmark.circle.fill")
+                    } else if context.reachable == true {
+                        Button("使用") {
+                            Task { await app.selectDockerContext(context.name) }
+                        }
+                        .controlSize(.small)
+                    } else {
+                        StatusBadge(text: "不可达", color: .secondary, systemImage: "xmark.circle")
+                    }
+                }
+            }
+            HStack {
+                Button("重新检测") { Task { await app.loadDockerContexts() } }
+                Button("打开 Docker") { app.openDockerApp() }
+                Spacer()
+            }
+        } header: {
+            Text("运行环境")
+        }
+        .task { await app.loadDockerContexts() }
+    }
+
+    // MARK: - 数据管理
+
+    private var dataSection: some View {
+        Section {
+            LabeledValue(label: "数据目录", value: app.dataDir, monospaced: true)
+            LabeledValue(label: "备份目录", value: app.settings?.backupDir ?? "—", monospaced: true)
+            LabeledValue(label: "手动备份", value: "\(app.backups.count)")
+            HStack(spacing: 10) {
+                Button("立即备份") { Task { await app.createBackup() } }
+                Button("打开备份目录") {
+                    if let path = app.settings?.backupDir { app.openPath(path) }
+                }
+                Button("打开数据目录") { app.openDataDirectory() }
+                Spacer()
+            }
+        } header: {
+            Text("数据管理")
+        }
+        .task { await app.loadBackups() }
+    }
+
+    // MARK: - 更新入口
+
+    private var updateLinkSection: some View {
+        Section {
+            HStack {
+                Text("应用更新、后台服务升级与失败回滚在「更新与维护」中。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("打开更新与维护") { app.section = .update }
+            }
+        } header: {
+            Text("更新")
+        }
+    }
+
+    // MARK: - 关于
+
+    private var aboutSection: some View {
+        Section {
+            LabeledValue(label: "应用版本", value: app.appVersion.isEmpty ? "未知" : app.appVersion)
+            LabeledValue(label: "后台版本", value: app.status?.daemonVersion ?? "—")
+            LabeledValue(label: "Bundle ID", value: Bundle.main.bundleIdentifier ?? "—", monospaced: true)
+            LabeledValue(label: "安装位置", value: Bundle.main.bundleURL.path, monospaced: true)
+            LabeledValue(label: "签名", value: app.signingSummary)
+            LabeledValue(label: "公证", value: app.notarizationSummary)
+        } header: {
+            Text("关于")
         }
     }
 
@@ -247,38 +352,132 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - LaunchAgent
+    // MARK: - 后台服务
 
-    private var agentSection: some View {
+    private var serviceSection: some View {
         Section {
             HStack(spacing: 8) {
-                if app.launchAgentInstalled {
-                    StatusBadge(text: "已安装", color: .green, systemImage: "checkmark.circle.fill")
+                if app.daemonReachable {
+                    StatusBadge(text: "运行中", color: .green, systemImage: "checkmark.circle.fill")
+                } else if app.backgroundService.installed {
+                    StatusBadge(text: "已注册但未运行", color: .orange, systemImage: "exclamationmark.triangle.fill")
                 } else {
-                    StatusBadge(text: "未安装", color: .orange, systemImage: "exclamationmark.triangle.fill")
+                    StatusBadge(text: "未注册", color: .orange, systemImage: "exclamationmark.triangle.fill")
                 }
-                Text("LaunchAgent 负责在登录后自动拉起 orbsleepd。")
+                Text("后台服务随应用包一起分发，由 launchd 管理，登录后自动启动。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
-                if app.isTogglingAgent {
-                    ProgressView()
-                        .controlSize(.small)
+                if app.isBusyService {
+                    ProgressView().controlSize(.small)
                 }
-                Button(app.launchAgentInstalled ? "卸载 LaunchAgent…" : "安装 LaunchAgent") {
-                    if app.launchAgentInstalled {
-                        showUninstallAgentConfirmation = true
-                    } else {
-                        Task { await app.installLaunchAgent() }
+            }
+
+            LabeledValue(label: "应用版本", value: app.appVersion.isEmpty ? "未知" : app.appVersion)
+            LabeledValue(label: "服务版本", value: app.status?.daemonVersion ?? "未连接")
+            LabeledValue(label: "注册状态", value: app.backgroundService.statusText)
+            Toggle("登录后自动启动后台服务", isOn: Binding(
+                get: { app.backgroundService.installed },
+                set: { enabled in Task { await app.setAutoStart(enabled) } }
+            ))
+            Text("与是否打开 GUI 分离：关闭 GUI 后后台服务仍可继续运行。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Toggle("登录后自动打开 OrbSleep Manager", isOn: Binding(
+                get: { app.launchesGUIAtLogin },
+                set: { enabled in Task { await app.setLaunchGUIAtLogin(enabled) } }
+            ))
+            Text("只控制 GUI 是否随登录打开，不影响后台服务。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                Button {
+                    Task { await app.startService() }
+                } label: {
+                    Label("启动", systemImage: "play.circle")
+                }
+                .disabled(app.isBusyService || app.daemonReachable)
+
+                Button {
+                    Task { await app.stopService() }
+                } label: {
+                    Label("停止", systemImage: "stop.circle")
+                }
+                .disabled(app.isBusyService || !app.daemonReachable)
+
+                Button {
+                    Task { await app.restartService() }
+                } label: {
+                    Label("重启", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(app.isBusyService)
+
+                if app.serviceVersionMismatch {
+                    Button {
+                        Task { await app.upgradeService() }
+                    } label: {
+                        Label("升级后台服务", systemImage: "arrow.up.circle")
+                    }
+                    .disabled(app.isBusyService)
+                }
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    showUninstallServiceConfirmation = true
+                } label: {
+                    Label("卸载后台服务…", systemImage: "trash")
+                }
+                .disabled(app.isBusyService)
+            }
+
+            if app.serviceNeedsApproval {
+                HStack(spacing: 8) {
+                    Label("后台服务需要在系统设置中允许。", systemImage: "lock.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Button("打开登录项设置") {
+                        app.backgroundService.openLoginItemsSettings()
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                }
+            }
+        } header: {
+            Text("后台服务")
+        }
+    }
+
+    // MARK: - 命令行工具
+
+    private var cliSection: some View {
+        Section {
+            HStack(spacing: 8) {
+                if app.cliInstalled {
+                    StatusBadge(text: "已安装", color: .green, systemImage: "checkmark.circle.fill")
+                } else {
+                    StatusBadge(text: "未安装", color: .secondary, systemImage: "circle")
+                }
+                Text("命令行工具是可选的开发者入口，普通使用不需要它。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                if app.cliInstalled {
+                    Button("卸载命令行工具") {
+                        app.removeCommandLineTools()
+                    }
+                } else {
+                    Button("安装命令行工具") {
+                        app.installCommandLineTools()
                     }
                 }
-                .disabled(app.isTogglingAgent)
             }
-            Text("也可以在终端执行 orbsleepctl install-agent。GUI 不会自行启动或停止后台助手。")
+            Text("安装位置：~/.local/bin/orbsleepctl（用户级，无需 sudo）。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } header: {
-            Text("开机启动（agent.install / agent.uninstall）")
+            Text("命令行工具（可选）")
         }
     }
 
@@ -346,7 +545,7 @@ struct SettingsView: View {
                 let path = app.settings?.socketPath ?? app.socketPath
                 app.openPath(URL(fileURLWithPath: path).deletingLastPathComponent().path)
             }
-            LabeledValue(label: "LaunchAgent", value: app.settings?.launchAgentInstalled == true ? "已安装" : "未安装")
+            LabeledValue(label: "后台服务", value: app.backgroundService.statusText)
         } header: {
             Text("路径")
         }
