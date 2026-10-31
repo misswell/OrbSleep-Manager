@@ -1942,7 +1942,20 @@ final class AppState {
                 }
             }
             if backgroundService.isRegistered {
-                try? await backgroundService.unregister()
+                do {
+                    try await backgroundService.unregister()
+                } catch {
+                    migrationRollbackError = "注销新后台服务失败（\(errorMessage(error))）"
+                    return false
+                }
+            }
+            // Verify the new registration is actually gone before touching
+            // the old agent: two startable daemons would fight over the same
+            // socket and database.
+            refreshLocalState()
+            if backgroundService.isRegistered {
+                migrationRollbackError = "新后台服务注销后仍处于注册状态"
+                return false
             }
             guard await waitForDaemonToStop(seconds: 10) else {
                 migrationRollbackError = "新后台进程未能退出"

@@ -172,14 +172,23 @@ final class UpdateManager {
         } catch {
             throw UpdateError.installFailed("无法保留旧版本：\(error.localizedDescription)")
         }
-        // Only the newest two rollback copies are kept; unbounded retention
-        // would slowly fill the disk.
-        cleanupOldAppBackups(in: backupRoot, keeping: 2)
+        // Keep three rollback copies at install time (the freshly saved old
+        // bundle is the newest); the health handshake trims to two once the
+        // update is confirmed healthy, so the active rollback candidate is
+        // never removed early.
+        cleanupOldAppBackups(in: backupRoot, keeping: 3)
         do {
             try FileManager.default.copyItem(at: newApp, to: appURL)
         } catch {
-            try? FileManager.default.moveItem(at: oldApp, to: appURL)
-            throw UpdateError.installFailed("替换应用失败：\(error.localizedDescription)")
+            do {
+                try FileManager.default.moveItem(at: oldApp, to: appURL)
+                guard Bundle(url: appURL)?.infoDictionary?["CFBundleIdentifier"] as? String == Self.expectedBundleID else {
+                    throw UpdateError.installFailed("旧版本还原后校验失败")
+                }
+            } catch {
+                throw UpdateError.installFailed("替换应用失败且旧版本还原未成功：\(error.localizedDescription)")
+            }
+            throw UpdateError.installFailed("替换应用失败，已恢复旧版本：\(error.localizedDescription)")
         }
 
         // Health handshake markers: the GUI writes `update-ok` after it has
@@ -224,8 +233,22 @@ final class UpdateManager {
         rm -rf "$APP.failed-$$"
         open -n "$APP" >/dev/null 2>&1
         """
-        try script.write(to: helper, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        do {
+            try script.write(to: helper, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        } catch {
+            // Same contract as a helper start failure: the app directory must
+            // never be left empty or half-replaced.
+            let failed = backupRoot.appendingPathComponent("OrbSleepManager.failed-\(UUID().uuidString).app")
+            do {
+                try FileManager.default.moveItem(at: appURL, to: failed)
+                try FileManager.default.moveItem(at: oldApp, to: appURL)
+                try FileManager.default.removeItem(at: failed)
+            } catch {
+                try? FileManager.default.moveItem(at: failed, to: appURL)
+            }
+            throw UpdateError.installFailed("无法准备更新辅助脚本，已恢复旧版本：\(error.localizedDescription)")
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -234,11 +257,26 @@ final class UpdateManager {
             try process.run()
         } catch {
             // The helper never started: nobody else will restore the old app,
-            // and right now the app bundle is missing from its install
-            // location. Put it back instead of leaving the machine without
-            // the application.
-            try? FileManager.default.moveItem(at: oldApp, to: appURL)
-            throw UpdateError.installFailed("无法启动更新辅助脚本：\(error.localizedDescription)")
+            // and appURL currently holds the NEW bundle. appURL must never be
+            // empty, so move the new bundle to a failed directory first, put
+            // the old bundle back, verify it, and only then drop the failed
+            // copy.
+            let failed = backupRoot.appendingPathComponent("OrbSleepManager.failed-\(UUID().uuidString).app")
+            do {
+                try FileManager.default.moveItem(at: appURL, to: failed)
+                try FileManager.default.moveItem(at: oldApp, to: appURL)
+                guard let restored = Bundle(url: appURL),
+                      restored.infoDictionary?["CFBundleIdentifier"] as? String == Self.expectedBundleID else {
+                    throw UpdateError.installFailed("旧版本还原后校验失败")
+                }
+                try FileManager.default.removeItem(at: failed)
+            } catch {
+                // Restoring the old bundle failed too: move the new bundle
+                // back so the install location is never empty.
+                try? FileManager.default.moveItem(at: failed, to: appURL)
+                throw UpdateError.installFailed("无法启动更新辅助脚本且回滚失败（应用已还原为新版本）：\(error.localizedDescription)")
+            }
+            throw UpdateError.installFailed("无法启动更新辅助脚本：已恢复旧版本。\(error.localizedDescription)")
         }
         NSApp.terminate(nil)
     }

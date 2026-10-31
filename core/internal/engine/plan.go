@@ -42,6 +42,10 @@ type planSnapshot struct {
 // plan is caught at apply time — attachOne re-reads the Compose file and
 // refuses when it no longer matches the plan's snapshot.
 func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (model.Plan, error) {
+	e.mu.Lock()
+	planGeneration := e.dockerGeneration
+	e.mu.Unlock()
+
 	plan := model.Plan{
 		ID:        newID("plan"),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -138,10 +142,14 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 		})
 	}
 	seen := map[string]bool{}
+	entry := &planEntry{createdAt: time.Now(), allowLan: allowLan, dockerGeneration: planGeneration}
 	e.mu.Lock()
-	generation := e.dockerGeneration
+	if e.dockerGeneration != planGeneration {
+		// The environment switched while the plan was being generated.
+		e.mu.Unlock()
+		return plan, errors.New("生成计划期间 Docker 环境已切换，请重新扫描")
+	}
 	e.mu.Unlock()
-	entry := &planEntry{createdAt: time.Now(), allowLan: allowLan, dockerGeneration: generation}
 	for _, id := range ids {
 		if seen[id] {
 			continue

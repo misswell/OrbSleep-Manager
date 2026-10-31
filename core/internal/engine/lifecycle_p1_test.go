@@ -677,13 +677,16 @@ func TestRestoreRejectsForeignManifestPath(t *testing.T) {
 	if err := os.WriteFile(current, []byte("broken-current-db"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	marker, _ := json.Marshal(map[string]string{"backupPath": backup})
+	marker, _ := json.Marshal(map[string]any{
+		"backupPath": backup,
+		"allow":      map[string]any{"files": []string{}, "dirs": []string{dir}},
+	})
 	if err := os.WriteFile(filepath.Join(dir, "restore-request.json"), marker, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	err = ApplyPendingRestore(dir)
-	if err == nil {
-		t.Fatal("foreign manifest path must be refused")
+	if err == nil || !strings.Contains(err.Error(), "拒绝写入") {
+		t.Fatalf("foreign manifest path must be refused by the allowlist, got %v", err)
 	}
 	// The evil file must be untouched and the live database not swapped.
 	raw, _ := os.ReadFile(evil)
@@ -717,6 +720,7 @@ func TestRestoreIsAtomicAndRollsBackOnFailure(t *testing.T) {
 		if err := e.store.UpsertService(svc); err != nil {
 			t.Fatal(err)
 		}
+		registerKnownComposePath(e, svc.ComposeFile)
 		bd := filepath.Join(e.settings.Get().BackupDir, "services", svc.ID)
 		if err := os.MkdirAll(bd, 0o700); err != nil {
 			t.Fatal(err)
@@ -795,23 +799,49 @@ func TestApplyPendingRestoreWALRemovalFailureAborts(t *testing.T) {
 	if err := os.WriteFile(current, []byte("broken"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// A directory cannot be removed with os.Remove while non-empty: this
-	// simulates an undeletable WAL sidecar.
-	if err := os.MkdirAll(current+"-wal", 0o700); err != nil {
+	// The live WAL and SHM carry state that must survive a failed restore.
+	if err := os.WriteFile(current+"-wal", []byte("committed-wal"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(current+"-wal/x", []byte("x"), 0o600); err != nil {
+	if err := os.WriteFile(current+"-shm", []byte("shared-memory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	marker, _ := json.Marshal(map[string]string{"backupPath": backup})
+	// A journaled DATABASE_COMMITTING with a blocked SHM move: the snapshot
+	// dir pre-contains a directory where the SHM must land, so os.Rename
+	// fails after the WAL was already moved away.
+	origDir := filepath.Join(dir, "restore-orig-test")
+	if err := os.MkdirAll(filepath.Join(origDir, "state.sqlite-shm"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(origDir, "state.sqlite-wal"), []byte("committed-wal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker, _ := json.Marshal(map[string]any{
+		"backupPath": backup,
+		"allow":      map[string]any{"files": []string{}, "dirs": []string{dir}},
+	})
 	if err := os.WriteFile(filepath.Join(dir, "restore-request.json"), marker, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	journal, _ := json.Marshal(map[string]any{
+		"phase": "DATABASE_COMMITTING", "backupPath": backup, "stamp": "test", "origDir": origDir, "files": []any{},
+	})
+	if err := os.WriteFile(filepath.Join(dir, "restore-journal.json"), journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".restore-state.tmp"), dbBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := ApplyPendingRestore(dir); err == nil {
-		t.Fatal("undeletable WAL sidecar must abort the restore")
+		t.Fatal("blocked SHM move must abort the restore")
+	}
+	// The live WAL content must be back next to the (unswapped) database.
+	wal, err := os.ReadFile(current + "-wal")
+	if err != nil || string(wal) != "committed-wal" {
+		t.Fatalf("live WAL content was lost: %v %q", err, wal)
 	}
 	if db, _ := os.ReadFile(current); string(db) == string(dbBytes) {
-		t.Fatal("database was swapped despite the WAL removal failure")
+		t.Fatal("database was swapped despite the SHM move failure")
 	}
 }
 

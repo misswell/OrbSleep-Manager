@@ -536,7 +536,7 @@ func TestRunAttachAbortsWithoutProxyBaseline(t *testing.T) {
 	if err := e.store.InsertOperation(op); err != nil {
 		t.Fatal(err)
 	}
-	e.runAttach(context.Background(), plan, nil, op, func() {})
+	e.runAttach(context.Background(), plan, nil, op, 0, func() {})
 	got, ok, err := e.store.GetOperation(op.ID)
 	if err != nil || !ok {
 		t.Fatal(err)
@@ -630,7 +630,12 @@ func managedServiceFixture(t *testing.T, e *Engine, admin *fakeAdmin, docker *fa
 	if err := os.WriteFile(snap.composeFile, managed, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	backupDir := t.TempDir()
+	// Mirror the production layout: the stable backup directory lives under
+	// the managed BackupDir (restore scoping relies on that).
+	backupDir := filepath.Join(e.settings.Get().BackupDir, "services", "svc-test")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	backupPath := filepath.Join(backupDir, "docker-compose.yml")
 	if err := os.WriteFile(backupPath, original, 0o644); err != nil {
 		t.Fatal(err)
@@ -649,6 +654,9 @@ func managedServiceFixture(t *testing.T, e *Engine, admin *fakeAdmin, docker *fa
 	if err := e.store.SetMeta("serviceBackup:"+svc.ID, backupDir); err != nil {
 		t.Fatal(err)
 	}
+	// Mirror the real attach path: register the managed Compose file so a
+	// later backup restore may address it.
+	registerKnownComposePath(e, snap.composeFile)
 	// Baseline proxy config and a listener for the managed route.
 	admin.mu.Lock()
 	admin.cfg = proxy.Config{Services: []proxy.ServiceConfig{{Name: svc.ContainerName, Ports: []string{fmt.Sprintf("%d:80", bindings[0].ProxyPort)}, IdleTimeoutSecs: 1800, StartTimeoutSecs: 60}}}

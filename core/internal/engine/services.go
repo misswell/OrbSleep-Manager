@@ -520,6 +520,9 @@ func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model
 
 // deleteServiceRecord is a seam for fault-injection tests.
 var deleteServiceRecord = func(e *Engine, id string) error {
+	// The known-compose-path registry entry is intentionally kept: a backup
+	// created while the service was managed must stay restorable after the
+	// service is removed.
 	return e.store.DeleteService(id)
 }
 

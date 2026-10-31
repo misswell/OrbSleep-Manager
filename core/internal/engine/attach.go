@@ -112,12 +112,19 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 		resetApplying()
 		return "", err
 	}
-	go e.runAttach(ctx, plan, items, op, done)
+	go e.runAttach(ctx, plan, items, op, entry.dockerGeneration, done)
 	return opID, nil
 }
 
-func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSnapshot, op model.Operation, done func()) {
+func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSnapshot, op model.Operation, planGeneration int, done func()) {
 	defer done()
+	// Drop the plan unconditionally on any exit path — including the safety
+	// check below — so a failed run can never leave it stuck in "applying".
+	defer func() {
+		e.plansMu.Lock()
+		delete(e.plans, plan.ID)
+		e.plansMu.Unlock()
+	}()
 	logger := e.newOpLogger(op)
 	unlock, err := e.beginSafeWrite()
 	if err != nil {
@@ -126,11 +133,16 @@ func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSna
 		return
 	}
 	defer unlock()
-	defer func() {
-		e.plansMu.Lock()
-		delete(e.plans, plan.ID)
-		e.plansMu.Unlock()
-	}()
+	// The plan must execute on the environment it was generated against; a
+	// context switch between ApplyPlan and this lock invalidates it.
+	e.mu.Lock()
+	envChanged := planGeneration != e.dockerGeneration
+	e.mu.Unlock()
+	if envChanged {
+		logger.finish("failed", "Docker 环境在计划执行前已切换，已中止（未做任何修改）")
+		e.setLastError("接入未执行: Docker 环境已切换，请重新扫描")
+		return
+	}
 	logger.add("info", fmt.Sprintf("接入计划 %s 开始执行（%d 个容器）", plan.ID, len(items)))
 
 	// A complete, validated baseline snapshot is mandatory. Never start

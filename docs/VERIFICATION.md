@@ -292,6 +292,37 @@ P2：`ApplyPlan` 的 `applying` 在 beginOperation/InsertOperation 失败时复�
 
 新增 9 个回归测试；`go vet ./...`、`go test -race -count=1 ./...` 全部通过；App 构建通过。真机（2026-10-31）：`phase1_lifecycle.py` A/B/C 全过、`phase0.py` 全流程通过。
 
+## 第十一轮加固（0.2.7，针对 v0.2.6 复审）
+
+P0（恢复白名单与 Journal 事务窗口）：
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| dataDir 整体进入白名单 | 白名单目录只保留管理的 BackupDir（symlink 解析）；dataDir 不再是通用可写目录 |
+| 导入备份的数据库可自行授权 | 新增 `knownComposePaths` 注册表（meta 持久化）：接入成功登记、服务删除后保留；白名单 compose 路径只来自注册表 ∪ 活服务记录。备份库的 `serviceBackup`/事务 backupPath 目录仅在位于 BackupDir 内时采纳；备份库的 compose_file 不再作为授权来源（恶意路径测试覆盖） |
+| 最终文件符号链接绕过 | `resolveRestoreTarget` 对已存在的目标文件本身做 EvalSymlinks；写入经 WriteAtomic 跟随后仍落在白名单内。新增 symlink 逃逸拒绝测试（经由 allowlist 外路径断言） |
+| 逐文件提交的崩溃窗口 | Journal 改为**写前记账**：标记 committed → fsync → 原子替换 → 刷新；写前崩溃时回滚只是重复一次幂等的原样还原。Journal 写入含 fsync + 目录同步 |
+| 数据库替换阶段的崩溃窗口 | 新增 `DATABASE_COMMITTING` 阶段（rename 前持久化）；恢复按**磁盘实际状态**判定：tmp 存在 → 重做 sidecar 移动 + 替换；tmp 丢失且快照持有原 sidecar → 视为已替换，补清理；无法判定 → 从快照还原原库与 sidecar 并回滚文件 |
+| WAL/SHM 移动失败不回滚 Compose | 所有数据库阶段失败统一走 `fail`：回滚文件 + 从快照还原原库/WAL/SHM；只有回滚完全成功才清理 Journal，否则保留 Journal 与快照作为证据。新增测试：SHM 移动被阻止后，活 WAL 内容回到原位、数据库未被替换 |
+| 回滚权限丢失 | journalFile 拆分 `OriginalMode`/`RestoreMode`：恢复用备份 mode、回滚用原 mode；零 mode 兜底 0644（防手写 journal 产生 0000 文件） |
+| Journal 损坏 | 读取失败即隔离请求并 fail-closed，不触碰任何文件 |
+
+P1：
+
+| 问题 | 修复 |
+|---|---|
+| maintenance 未进入统一门禁 | `ensureNoUnresolvedWork`（beginSafeWrite 与全部同步入口共用）首先检查维护标志；Docker Context 切换同样拒绝 |
+| CreatePlan 代际获取太晚 | 进入函数即捕获代际，全程使用；入库前再次校验，切换则返回"请重新扫描" |
+| ApplyPlan 检查未延伸到执行 | `runAttach` 持写锁后再次校验代际；Plan 的删除 defer 提前注册（安全检查失败也不留下 applying 状态） |
+| cliRunner 缓存命中无代际保护 | 缓存命中需代际一致，否则视为冷启动重新解析并在写缓存前复验 |
+| 代理端口检查漏公网绑定 | `proxyPublishedPorts` 保留**全部**绑定；逐绑定验证：宿主端口必须等于代理端口、HostIP 必须是 127.0.0.1（空=全接口、::1、0.0.0.0 均拒绝）。新增 3 个用例（空 HostIP、回环+公网并存、仅 IPv6 回环） |
+| UpdateManager 回滚失效 | 助手启动失败/脚本写入失败改为交换目录真回滚（新包→failed-* → 旧包→安装位 → 校验 Bundle ID → 清理；还原失败则新包移回）；copyItem 失败的还原改为校验式；旧包保留 3 份、健康握手成功后裁剪为 2 份 |
+| 迁移回滚可能留下双注册 | `rollbackMigration` 注销新 SMAppService 必须成功并复核注册状态已清除，才恢复旧 LaunchAgent 并验证加载 |
+
+P2：`Status()` 的 LastError 在本轮计算完成后读取（不返回旧值）；ZIP 限制统一（512 条目、普通条目 64MiB、state.sqlite 256MiB、总量 1GiB，validateBackupZip 与恢复端一致，manifest 限制读取）。
+
+新增 6 个回归测试（共 23 个本轮以来新增）；`go vet ./...`、`go test -race -count=1 ./...` 全部通过；App 构建通过。真机（2026-10-31）：`phase1_lifecycle.py` A/B/C 全过、`phase0.py` 全流程通过。
+
 ## 未验证 / 未实现
 - 每实例独立代理（容器名/管理端口/发布端口范围按 Docker 实例隔离）：当前一台机器一个代理容器；跨实例接入由 plan 阶段 `proxy_not_on_current_instance` 阻塞兜底。
 

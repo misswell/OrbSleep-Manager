@@ -231,14 +231,17 @@ func (e *Engine) Status() model.Status {
 		}
 	}
 	lastScan := e.scanAt
-	lastErr := e.lastErr
 	e.mu.Unlock()
 	st.Counts = counts
 	if !lastScan.IsZero() {
 		st.LastScanAt = lastScan.UTC().Format(time.RFC3339)
 	}
-	st.LastError = lastErr
 	st.Proxy = e.proxyStatus(ctx)
+	// Read lastErr last: docker/proxy checks above may have raised a fresh
+	// error during this very status computation.
+	e.mu.Lock()
+	st.LastError = e.lastErr
+	e.mu.Unlock()
 	return st
 }
 
@@ -563,9 +566,14 @@ func (e *Engine) cliRunner() (composeCLI, error) {
 	c := e.docker
 	gen := e.dockerGeneration
 	e.mu.Unlock()
-	if cli != nil {
+	if cli != nil && gen == e.dockerGeneration {
+		// Cached runner matches the current environment generation.
 		return cli, nil
 	}
+	e.mu.Lock()
+	c = e.docker
+	gen = e.dockerGeneration
+	e.mu.Unlock()
 	if c == nil {
 		return nil, errors.New("Docker 不可用")
 	}
