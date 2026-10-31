@@ -72,13 +72,29 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 		e.plansMu.Unlock()
 		return "", err
 	}
+	// A plan snapshots containers of one Docker environment; after a context
+	// switch it must never be applied.
+	e.mu.Lock()
+	envChanged := entry.dockerGeneration != e.dockerGeneration
+	e.mu.Unlock()
+	if envChanged {
+		e.plansMu.Unlock()
+		delete(e.plans, planID)
+		return "", errors.New("该计划生成于 Docker 环境切换之前，请重新扫描并生成计划")
+	}
 	entry.applying = true
+	resetApplying := func() {
+		e.plansMu.Lock()
+		entry.applying = false
+		e.plansMu.Unlock()
+	}
 	plan := entry.plan
 	items := append([]planSnapshot(nil), entry.items...)
 	e.plansMu.Unlock()
 
 	ctx, done, err := e.beginOperation(20 * time.Minute)
 	if err != nil {
+		resetApplying()
 		return "", err
 	}
 	opID := newID("op")
@@ -93,6 +109,7 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 	}
 	if err := e.store.InsertOperation(op); err != nil {
 		done()
+		resetApplying()
 		return "", err
 	}
 	go e.runAttach(ctx, plan, items, op, done)
@@ -101,14 +118,19 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 
 func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSnapshot, op model.Operation, done func()) {
 	defer done()
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	logger := e.newOpLogger(op)
+	unlock, err := e.beginSafeWrite()
+	if err != nil {
+		logger.finish("failed", "安全检查失败，未执行任何修改: "+err.Error())
+		e.setLastError("接入未执行: " + err.Error())
+		return
+	}
+	defer unlock()
 	defer func() {
 		e.plansMu.Lock()
 		delete(e.plans, plan.ID)
 		e.plansMu.Unlock()
 	}()
-	logger := e.newOpLogger(op)
 	logger.add("info", fmt.Sprintf("接入计划 %s 开始执行（%d 个容器）", plan.ID, len(items)))
 
 	// A complete, validated baseline snapshot is mandatory. Never start

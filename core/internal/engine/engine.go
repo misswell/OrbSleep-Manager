@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"orbsleep/internal/dockercli"
@@ -67,6 +68,8 @@ type Engine struct {
 
 	composeLocker *transaction.FileLocker
 	txns          *transaction.Manager
+	maintenance   atomic.Bool
+	findCLI       func(dockerHost string) (composeCLI, error)
 
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
@@ -106,6 +109,9 @@ func New(version, dataDir string) (*Engine, error) {
 		stopCh:        make(chan struct{}),
 		composeLocker: transaction.NewFileLocker(filepath.Join(dataDir, "locks")),
 		txns:          transaction.NewManager(store),
+		findCLI: func(host string) (composeCLI, error) {
+			return dockercli.Find(host)
+		},
 		startedAt:     time.Now(),
 	}
 	if migrateErr != nil {
@@ -555,6 +561,7 @@ func (e *Engine) cliRunner() (composeCLI, error) {
 	e.mu.Lock()
 	cli := e.cli
 	c := e.docker
+	gen := e.dockerGeneration
 	e.mu.Unlock()
 	if cli != nil {
 		return cli, nil
@@ -562,11 +569,23 @@ func (e *Engine) cliRunner() (composeCLI, error) {
 	if c == nil {
 		return nil, errors.New("Docker 不可用")
 	}
-	cli, err := dockercli.Find(c.DockerHost())
+	find := e.findCLI
+	if find == nil {
+		find = func(host string) (composeCLI, error) { return dockercli.Find(host) }
+	}
+	cli, err := find(c.DockerHost())
 	if err != nil {
 		return nil, err
 	}
 	e.mu.Lock()
+	// The CLI runner is bound to the Docker host it was resolved against. If
+	// the environment switched while the lookup ran, the runner must never
+	// reach the cache — otherwise compose commands would target the previous
+	// instance while the API client targets the new one.
+	if gen != e.dockerGeneration {
+		e.mu.Unlock()
+		return nil, errors.New("Docker 环境已切换，请重试")
+	}
 	e.cli = cli
 	e.mu.Unlock()
 	return cli, nil

@@ -279,9 +279,17 @@ func (g *Gateway) accept(rt *route) {
 			conn.Close()
 			continue
 		}
-		rt.wg.Add(1)
+		// Register the connection and count its handler under the gateway
+		// lock, re-checking closed: StopAll collects and closes the registry
+		// under the same lock, so nothing can register or survive after it.
 		g.mu.Lock()
+		if g.closed {
+			g.mu.Unlock()
+			conn.Close()
+			return
+		}
 		g.conns[conn] = rt
+		rt.wg.Add(1)
 		g.mu.Unlock()
 		go func() {
 			defer func() {

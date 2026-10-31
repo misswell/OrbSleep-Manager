@@ -284,3 +284,43 @@ func TestEnsureListensOnIPv6(t *testing.T) {
 		t.Fatalf("echo = %q", buf)
 	}
 }
+
+// Concurrency: StopAll racing against ongoing dials must be race-clean and
+// must never leave handlers behind.
+func TestGatewayStopAllRacingDials(t *testing.T) {
+	targetPort, closeSrv := echoServer(t)
+	defer closeSrv()
+	bindPort := freePort(t)
+	gw := New(nil)
+	if err := gw.Ensure(Route{Key: "k", ServiceID: "svc", BindHost: "127.0.0.1", BindPort: bindPort,
+		TargetHost: "127.0.0.1", TargetPort: targetPort}); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				conn, err := net.DialTimeout("tcp", "127.0.0.1:"+itoa(bindPort), 200*time.Millisecond)
+				if err != nil {
+					continue
+				}
+				conn.Close()
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	gw.StopAll()
+	close(stop)
+	wg.Wait()
+	if keys := gw.RouteKeys(); len(keys) != 0 {
+		t.Fatalf("routes must be gone after StopAll: %v", keys)
+	}
+}

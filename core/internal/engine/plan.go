@@ -14,11 +14,12 @@ import (
 )
 
 type planEntry struct {
-	plan      model.Plan
-	createdAt time.Time
-	allowLan  bool
-	applying  bool
-	items     []planSnapshot
+	plan             model.Plan
+	createdAt        time.Time
+	allowLan         bool
+	applying         bool
+	dockerGeneration int // plan snapshot was taken on this environment
+	items            []planSnapshot
 }
 
 type planSnapshot struct {
@@ -137,7 +138,10 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 		})
 	}
 	seen := map[string]bool{}
-	entry := &planEntry{createdAt: time.Now(), allowLan: allowLan}
+	e.mu.Lock()
+	generation := e.dockerGeneration
+	e.mu.Unlock()
+	entry := &planEntry{createdAt: time.Now(), allowLan: allowLan, dockerGeneration: generation}
 	for _, id := range ids {
 		if seen[id] {
 			continue
@@ -208,7 +212,28 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 	return plan, nil
 }
 
-func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *model.Plan, used *map[int]bool, rangeStart, rangeEnd int, cli composeCLI, published map[int]bool) (*model.PlanItem, *planSnapshot, []model.Reason) {
+// checkProxyPublishedPort validates that the proxy port the gateway is about
+// to use is genuinely published on the local loopback interface. An empty
+// binding set means "nothing published" and must block, never be skipped.
+func checkProxyPublishedPort(published map[int]PublishedPort, proxyPort int, block func(code, msg string)) {
+	pb, ok := published[proxyPort]
+	if !ok {
+		block("proxy_port_unpublished", fmt.Sprintf("代理容器没有发布端口 %d；修改端口范围后需要在设置中重新安装/启动代理", proxyPort))
+		return
+	}
+	// The gateway forwards to 127.0.0.1:<proxyPort>; a binding on a different
+	// host port or a non-loopback interface would make the service
+	// unreachable even though the container looks healthy.
+	if pb.HostPort != proxyPort {
+		block("proxy_port_mismatch", fmt.Sprintf("代理端口 %d 发布在宿主机 %d，与网关目标不一致；请重新安装代理", proxyPort, pb.HostPort))
+		return
+	}
+	if pb.HostIP != "" && pb.HostIP != "127.0.0.1" && pb.HostIP != "::1" {
+		block("proxy_port_exposed", fmt.Sprintf("代理端口 %d 发布在 %s 而非本机回环地址，拒绝接管（存在对外暴露风险）", proxyPort, pb.HostIP))
+	}
+}
+
+func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *model.Plan, used *map[int]bool, rangeStart, rangeEnd int, cli composeCLI, published map[int]PublishedPort) (*model.PlanItem, *planSnapshot, []model.Reason) {
 	var blockers []model.Reason
 	block := func(code, msg string) {
 		blockers = append(blockers, model.Reason{Code: code, Message: msg, Severity: "blocker"})
@@ -276,8 +301,20 @@ func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *
 			block("proxy_ports_exhausted", fmt.Sprintf("代理端口范围 %d-%d 已用尽，请在设置中扩大范围", rangeStart, rangeEnd))
 			return nil, nil, blockers
 		}
-		if len(published) > 0 && !published[proxyPort] {
-			block("proxy_range_mismatch", fmt.Sprintf("代理容器没有发布端口 %d；修改端口范围后需要在设置中重新安装/启动代理", proxyPort))
+		pb, ok := published[proxyPort]
+		if !ok {
+			block("proxy_port_unpublished", fmt.Sprintf("代理容器没有发布端口 %d；修改端口范围后需要在设置中重新安装/启动代理", proxyPort))
+			return nil, nil, blockers
+		}
+		// The gateway forwards to 127.0.0.1:<proxyPort>; a binding on a
+		// different host port or a non-loopback interface would make the
+		// service unreachable even though the container looks healthy.
+		if pb.HostPort != proxyPort {
+			block("proxy_port_mismatch", fmt.Sprintf("代理端口 %d 发布在宿主机 %d，与网关目标不一致；请重新安装代理", proxyPort, pb.HostPort))
+			return nil, nil, blockers
+		}
+		if pb.HostIP != "" && pb.HostIP != "127.0.0.1" && pb.HostIP != "::1" {
+			block("proxy_port_exposed", fmt.Sprintf("代理端口 %d 发布在 %s 而非本机回环地址，拒绝接管（存在对外暴露风险）", proxyPort, pb.HostIP))
 			return nil, nil, blockers
 		}
 		*used = withPort(*used, proxyPort)

@@ -265,6 +265,33 @@ P1/P2：
 
 新增 14 个回归测试；`go vet ./...`、`go test -race -count=1 ./...` 全部通过；App 构建通过。真机（2026-10-31）：`phase1_lifecycle.py` A/B/C 全过（含新证据目录断言）、`phase0.py` 全流程通过。
 
+## 第十轮加固（0.2.6，针对 v0.2.5 复审）
+
+P0（恢复事务化）：
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| WAL 删除顺序可丢失提交记录 | 活 WAL/SHM **移入** restore-orig 快照（同卷 rename），不再逐个删除；成功后快照保留原始库+sidecar 作证据。新增测试：恢复后原 WAL 内容完整存在于快照、新库旁无残留旧 WAL |
+| 崩溃后无法恢复现场 | 持久化 `restore-journal.json`（ORIGINALS_SAVED → FILES_COMMITTED → DATABASE_COMMITTED，逐文件 committed 标记，每步原子落盘）。启动时按阶段恢复：文件阶段中断 → 回滚文件 + 隔离请求（避免确定性失败的无限重试）；文件已提交 → 续完数据库阶段；数据库已换 → 补清理。新增两个崩溃注入测试 |
+| 文件回滚不完整 | 暂存阶段读取失败（权限/IO）只允许 NotNotExist 视为不存在，其他错误中止（新增测试：0o000 目标中止且不被修改）；恢复新建的文件回滚时删除；journal 记录原文件 mode，回滚按原权限还原 |
+| 白名单可被伪造数据库绕过 | 白名单由活守护进程在 `RestoreBackup` 时写入 marker（活库 ∪ 备份库引用且**本机磁盘存在**的路径，全部 symlink 解析），下次启动只信任 marker；manifest 夹带其他路径在请求时即拒绝。新增 allowlist 外路径拒绝测试。残留边界（攻击者完全控制备份且用户主动恢复）已记录 |
+| RestoreBackup 无排他维护 | 持 writeMu + `maintenance` 标志（写 marker 成功后置位）；`ensureNoUnresolvedWork` 同时检查维护标志，所有业务写入口自动拒绝 |
+
+P1：
+
+| 问题 | 修复 |
+|---|---|
+| 异步入口锁后未复查 | 新增 `beginSafeWrite`（锁内复查未解决事务与维护标志），`runAttach`/`runDetach`/`runProxySetup`/`runProxyStop` 全部改为锁后复查，失败记为 failed 且零修改 |
+| cliRunner 无代际 | 查找 CLI 前捕获 generation，写缓存前校验；切换期间完成的查找被丢弃并提示重试（`findCLI` 可注入便于测试）；Plan 记录生成时代际，`ApplyPlan` 拒绝切换前的旧计划 |
+| Gateway Accept/StopAll 竞态 | 连接登记、closed 复查与 `wg.Add(1)` 同锁完成；StopAll 后 Accept 的连接直接丢弃 |
+| 代理发布端口空集合绕过 | `proxyPublishedPorts` 返回完整绑定（容器端口/宿主端口/HostIP）；计划阶段逐端口验证：未发布、宿主端口不一致、非回环绑定均阻塞（新增 3 个纯函数测试） |
+| 迁移回滚不完整 | `rollbackMigration` 反向状态机：force 停新后台 → 注销 SMAppService → 确认退出 → 恢复旧 plist（尊重 Bool）→ 验证旧 job 已加载；版本校验失败与启动失败均走完整回滚并如实报告 |
+| UpdateManager 回滚失效 | 助手启动失败改为交换目录回滚：新包移到 failed-* → 旧包还原 → 校验 → 删除 failed；还原失败则把新包移回，应用目录永不为空；旧包只保留 2 份 |
+
+P2：`ApplyPlan` 的 `applying` 在 beginOperation/InsertOperation 失败时复位；proxy-setup 检查 ListServices 错误；Health 的操作查询错误静默记入 LastError；自启动注销失败明确反馈；ZIP 资源限制（≤512 条目、单文件 ≤64MB、总量 ≤512MB）。
+
+新增 9 个回归测试；`go vet ./...`、`go test -race -count=1 ./...` 全部通过；App 构建通过。真机（2026-10-31）：`phase1_lifecycle.py` A/B/C 全过、`phase0.py` 全流程通过。
+
 ## 未验证 / 未实现
 - 每实例独立代理（容器名/管理端口/发布端口范围按 Docker 实例隔离）：当前一台机器一个代理容器；跨实例接入由 plan 阶段 `proxy_not_on_current_instance` 阻塞兜底。
 

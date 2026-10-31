@@ -86,7 +86,18 @@ func containerIP(ins *dockerx.ContainerInspect) string {
 
 // proxyPublishedPorts returns the proxy's container ports that are published to
 // the macOS host. The gateway can only reach those ports.
-func (e *Engine) proxyPublishedPorts(ctx context.Context) (map[int]bool, error) {
+// PublishedPort is one host-side binding of the proxy container.
+type PublishedPort struct {
+	ContainerPort int
+	HostPort      int
+	HostIP        string // "" means all interfaces
+}
+
+// proxyPublishedPorts returns the proxy's actual TCP host bindings keyed by
+// container port. Callers must verify the specific port they are about to
+// hand to the gateway — an empty result means nothing is published and must
+// block the plan, never be treated as "no need to check".
+func (e *Engine) proxyPublishedPorts(ctx context.Context) (map[int]PublishedPort, error) {
 	c, err := e.dockerClient(ctx)
 	if err != nil {
 		return nil, err
@@ -95,14 +106,22 @@ func (e *Engine) proxyPublishedPorts(ctx context.Context) (map[int]bool, error) 
 	if err != nil {
 		return nil, err
 	}
-	out := map[int]bool{}
+	out := map[int]PublishedPort{}
 	for key, bindings := range ins.NetworkSettings.Ports {
 		if len(bindings) == 0 {
 			continue
 		}
 		port, proto := splitPortKey(key)
-		if proto == "tcp" && port > 0 {
-			out[port] = true
+		if proto != "tcp" || port <= 0 {
+			continue
+		}
+		for _, b := range bindings {
+			hostPort, perr := strconv.Atoi(b.HostPort)
+			if perr != nil || hostPort <= 0 {
+				continue
+			}
+			out[port] = PublishedPort{ContainerPort: port, HostPort: hostPort, HostIP: b.HostIP}
+			break
 		}
 	}
 	return out, nil
@@ -173,9 +192,14 @@ func (e *Engine) ProxyStop() (string, error) {
 
 func (e *Engine) runProxyStop(ctx context.Context, op model.Operation, done func()) {
 	defer done()
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
 	logger := e.newOpLogger(op)
+	unlock, err := e.beginSafeWrite()
+	if err != nil {
+		logger.finish("failed", "安全检查失败，未执行任何修改: "+err.Error())
+		e.setLastError("代理停止未执行: " + err.Error())
+		return
+	}
+	defer unlock()
 	cli, err := e.cliRunner()
 	if err != nil {
 		logger.finish("failed", err.Error())
@@ -200,9 +224,14 @@ func (e *Engine) runProxyStop(ctx context.Context, op model.Operation, done func
 
 func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done func()) {
 	defer done()
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
 	logger := e.newOpLogger(op)
+	unlock, err := e.beginSafeWrite()
+	if err != nil {
+		logger.finish("failed", "安全检查失败，未执行任何修改: "+err.Error())
+		e.setLastError("代理安装未执行: " + err.Error())
+		return
+	}
+	defer unlock()
 	logger.add("info", "开始安装/启动 Lazy TCP Proxy")
 
 	c, err := e.dockerClient(ctx)
@@ -259,7 +288,11 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 	next.AdminPort, next.WebPort = adminPort, webPort
 
 	// Never silently change the range while services still use ports from it.
-	existing, _ := e.store.ListServices()
+	existing, err := e.store.ListServices()
+	if err != nil {
+		logger.finish("failed", "读取托管服务失败: "+err.Error())
+		return
+	}
 	for _, svc := range existing {
 		for _, b := range svc.Bindings {
 			if b.ProxyPort < next.ProxyPortStart || b.ProxyPort > next.ProxyPortEnd {

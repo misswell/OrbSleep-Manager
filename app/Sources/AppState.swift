@@ -1000,7 +1000,12 @@ final class AppState {
                     return
                 }
             }
-            try? await backgroundService.unregister()
+            do {
+                try await backgroundService.unregister()
+            } catch {
+                showError("注销后台服务失败（\(errorMessage(error))）。已保留当前状态，请稍后重试。")
+                return
+            }
             await backgroundService.removeLegacyAgent()
         }
         refreshLocalState()
@@ -1907,11 +1912,48 @@ final class AppState {
         // Restore the old agent after a mid-migration failure. Without this a
         // backup failure would leave the old service unloaded and unstarted.
         var legacyBootedOut = false
-        func restoreLegacyAgent() async {
-            if legacyBootedOut, let savedPlist {
-                _ = await backgroundService.reinstallLegacyPlist(data: savedPlist)
-                legacyBootedOut = false
+        var migrationRollbackError: String?
+        /// 恢复旧 LaunchAgent。返回是否确认成功：plist 写入或 launchctl load
+        /// 失败时保留 legacyBootedOut 并记录原因，绝不把失败当成完成。
+        func restoreLegacyAgent() async -> Bool {
+            guard legacyBootedOut, let savedPlist else {
+                migrationRollbackError = legacyBootedOut ? "缺少旧 LaunchAgent 备份" : nil
+                return !legacyBootedOut
             }
+            if await backgroundService.reinstallLegacyPlist(data: savedPlist) {
+                legacyBootedOut = false
+                return true
+            }
+            migrationRollbackError = "旧 LaunchAgent 恢复失败（写入或加载未成功）"
+            return false
+        }
+        /// 迁移失败的完整反向操作：停止并注销新后台 → 确认退出 → 恢复旧
+        /// LaunchAgent → 验证旧 job 已加载。任何一步失败都会记录。
+        func rollbackMigration() async -> Bool {
+            if await probeDaemon() {
+                _ = try? await client.call(
+                    "system.shutdown",
+                    params: ["force": .bool(true)],
+                    as: ShutdownResult.self
+                )
+                if !(await waitForDaemonToStop(seconds: 10)) {
+                    backgroundService.terminateLegacyDaemon()
+                    _ = await waitForDaemonToStop(seconds: 8)
+                }
+            }
+            if backgroundService.isRegistered {
+                try? await backgroundService.unregister()
+            }
+            guard await waitForDaemonToStop(seconds: 10) else {
+                migrationRollbackError = "新后台进程未能退出"
+                return false
+            }
+            guard await restoreLegacyAgent() else { return false }
+            guard await backgroundService.isLegacyJobLoaded() else {
+                migrationRollbackError = "旧 LaunchAgent 未处于加载状态"
+                return false
+            }
+            return true
         }
 
         if await probeDaemon() && legacy.daemonExists {
@@ -2004,20 +2046,21 @@ final class AppState {
             try await ensureServiceRunning()
         } catch {
             handleServiceError(error)
-            if let savedPlist {
-                _ = await backgroundService.reinstallLegacyPlist(data: savedPlist)
-                showNotice("新版后台服务启动失败，已尝试恢复旧 LaunchAgent；旧组件未清理。")
-            } else {
-                showError("新版后台服务启动失败，迁移未完成（旧组件未清理）。")
-            }
+            let rolledBack = await rollbackMigration()
             await refreshLegacyDetection()
+            if rolledBack {
+                showNotice("新版后台服务启动失败，已回滚到旧版后台服务；旧组件未清理。")
+            } else {
+                showError("新版后台服务启动失败且回滚未完成：\(migrationRollbackError ?? "未知原因")。请勿同时使用两套后台服务，请先手动处理。")
+            }
             return
         }
         await refreshStatus(silent: true)
         guard status?.daemonVersion == appVersion, backgroundService.installed else {
-            showError("新版后台服务版本校验失败（当前 \(status?.daemonVersion ?? "未知")），迁移未完成，已恢复旧 LaunchAgent。")
-            await restoreLegacyAgent()
+            let rolledBack = await rollbackMigration()
             await refreshLegacyDetection()
+            let detail = migrationRollbackError ?? "旧服务已恢复"
+            showError("新版后台服务版本校验失败（当前 \(status?.daemonVersion ?? "未知")）。\(rolledBack ? "已回滚到旧版后台服务。" : "回滚未完成：\(detail)。请勿同时使用两套后台服务，请先手动处理。")")
             return
         }
 

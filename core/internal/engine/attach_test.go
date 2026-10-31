@@ -35,6 +35,9 @@ type fakeDocker struct {
 	// stoppedProxy makes the fake serve a stopped proxy container so plan
 	// generation can be tested against a "proxy exists but not running" state.
 	stoppedProxy bool
+	// proxyPorts serves a running proxy container with these published
+	// bindings (NetworkSettings.Ports).
+	proxyPorts map[string][]dockerx.PortBinding
 }
 
 func newFakeDocker(t *testing.T, name, id string, ports []model.PortBinding) *fakeDocker {
@@ -75,12 +78,22 @@ func newFakeDocker(t *testing.T, name, id string, ports []model.PortBinding) *fa
 		defer f.mu.Unlock()
 		path := strings.TrimPrefix(r.URL.Path, "/containers/")
 		path = strings.TrimSuffix(path, "/json")
-		if f.stoppedProxy && path == proxy.ContainerName {
-			ins := &dockerx.ContainerInspect{ID: "proxy-id", Name: "/" + proxy.ContainerName}
-			ins.State.Status = "exited"
-			ins.State.Running = false
-			json.NewEncoder(w).Encode(ins)
-			return
+		if path == proxy.ContainerName {
+			switch {
+			case f.stoppedProxy:
+				ins := &dockerx.ContainerInspect{ID: "proxy-id", Name: "/" + proxy.ContainerName}
+				ins.State.Status = "exited"
+				ins.State.Running = false
+				json.NewEncoder(w).Encode(ins)
+				return
+			case f.proxyPorts != nil:
+				ins := &dockerx.ContainerInspect{ID: "proxy-id", Name: "/" + proxy.ContainerName}
+				ins.State.Status = "running"
+				ins.State.Running = true
+				ins.NetworkSettings.Ports = f.proxyPorts
+				json.NewEncoder(w).Encode(ins)
+				return
+			}
 		}
 		if path != f.id && path != f.name {
 			http.NotFound(w, r)

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
@@ -58,8 +59,14 @@ func TestApplyPendingRestoreStillWorksWithValidBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Close()
+	// Markers written by the live daemon carry the restore allowlist; this
+	// backup has no file manifest, so an empty scope is enough.
 	marker := filepath.Join(dir, "restore-request.json")
-	if err := os.WriteFile(marker, []byte(`{"backupPath":"`+entry.Path+`"}`), 0o600); err != nil {
+	markerPayload, _ := json.Marshal(map[string]any{
+		"backupPath": entry.Path,
+		"allow":      map[string]any{"files": []string{}, "dirs": []string{dir}},
+	})
+	if err := os.WriteFile(marker, markerPayload, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := ApplyPendingRestore(dir); err != nil {

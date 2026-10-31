@@ -85,7 +85,12 @@ func TestApplyPendingRestore(t *testing.T) {
 	if err := os.WriteFile(current, []byte("broken-current-db"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	marker, _ := json.Marshal(map[string]string{"backupPath": backup})
+	// Markers written by the live daemon carry the restore allowlist; this
+	// backup has no file manifest, so an empty scope is enough.
+	marker, _ := json.Marshal(map[string]any{
+		"backupPath": backup,
+		"allow":      map[string]any{"files": []string{}, "dirs": []string{dir}},
+	})
 	if err := os.WriteFile(filepath.Join(dir, "restore-request.json"), marker, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -100,9 +105,12 @@ func TestApplyPendingRestore(t *testing.T) {
 	if len(restored) < 16 || string(restored[:16]) != "SQLite format 3\x00" {
 		t.Fatalf("database was not restored: %q", string(restored[:min(16, len(restored))]))
 	}
-	pre, _ := filepath.Glob(filepath.Join(dir, "state.sqlite.pre-restore-*"))
-	if len(pre) != 1 {
-		t.Fatalf("expected one pre-restore backup, got %d", len(pre))
+	orig, _ := filepath.Glob(filepath.Join(dir, "restore-orig-*"))
+	if len(orig) != 1 {
+		t.Fatalf("expected one restore-orig snapshot dir, got %d", len(orig))
+	}
+	if _, err := os.Stat(filepath.Join(orig[0], "state.sqlite")); err != nil {
+		t.Fatalf("original database missing from the snapshot: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "restore-request.json")); !os.IsNotExist(err) {
 		t.Fatal("restore marker was not removed")

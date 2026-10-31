@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"orbsleep/internal/dockerx"
 	"orbsleep/internal/gateway"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
@@ -893,5 +894,333 @@ func TestUpdateSettingsRejectsLowPorts(t *testing.T) {
 	}
 	if _, err := e.UpdateSettings(map[string]any{"webPort": 443}); err == nil {
 		t.Fatal("status port below 1024 must be rejected")
+	}
+}
+
+// ---------- v0.2.6: journalled restore, write-entry recheck, plan generation ----------
+
+// restoreJournalFixture writes a pending restore request plus an explicit
+// journal so crash-resume paths can be driven deterministically.
+func restoreJournalFixture(t *testing.T, e *Engine, composeFile string, journalPhase string, committed bool) string {
+	t.Helper()
+	// The live compose file differs from the backup content: the restore
+	// would overwrite it (or roll it back on crash).
+	original := []byte("services:\n  web:\n    image: nginx:alpine\n    ports:\n      - \"127.0.0.1:1:80\"\n")
+	// ORIGINALS_SAVED means the crash happened before the file commit: the
+	// live file still drifts. FILES_COMMITTED means the commit landed: the
+	// live file already carries the backup content.
+	liveContent := []byte("drifted-live")
+	if journalPhase == "FILES_COMMITTED" {
+		liveContent = original
+	}
+	if err := os.WriteFile(composeFile, liveContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The archive must carry a real SQLite database: integrity is verified
+	// before anything else happens.
+	source := filepath.Join(t.TempDir(), "source.sqlite")
+	sdb, err := state.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdb.Close()
+	dbBytes, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(t.TempDir(), "backup.zip")
+	f, err := os.Create(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("state.sqlite")
+	w.Write(dbBytes)
+	manifest, _ := json.Marshal(map[string]any{
+		"files": []map[string]any{{
+			"path":  composeFile,
+			"entry": "compose/0000",
+			"kind":  "compose",
+			"mode":  420,
+		}},
+	})
+	w, _ = zw.Create("manifest.json")
+	w.Write(manifest)
+	w, _ = zw.Create("compose/0000")
+	w.Write(original)
+	zw.Close()
+	f.Close()
+
+	// The allowlist comes from the live daemon's request (symlink-resolved),
+	// not the archive.
+	resolved, rerr := filepath.EvalSymlinks(composeFile)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	resolvedBackup, _ := filepath.EvalSymlinks(e.settings.Get().BackupDir)
+	resolvedData, _ := filepath.EvalSymlinks(e.dataDir)
+	allow := map[string]any{
+		"files": []string{resolved},
+		"dirs":  []string{resolvedBackup, resolvedData},
+	}
+	marker, _ := json.Marshal(map[string]any{
+		"backupPath":  backup,
+		"requestedAt": time.Now().UTC().Format(time.RFC3339),
+		"allow":       allow,
+	})
+	if err := os.WriteFile(filepath.Join(e.dataDir, "restore-request.json"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if journalPhase == "" {
+		return backup
+	}
+	origDir := filepath.Join(e.dataDir, "restore-orig-"+time.Now().Format("20060102-150405"))
+	if err := os.MkdirAll(origDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	saved := filepath.Join(origDir, "0000-docker-compose.yml")
+	if err := os.WriteFile(saved, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	journal, _ := json.Marshal(map[string]any{
+		"phase":      journalPhase,
+		"backupPath": backup,
+		"stamp":      "test",
+		"origDir":    origDir,
+		"files": []map[string]any{{
+			"target":    composeFile,
+			"entry":     "compose/0000",
+			"saved":     saved,
+			"mode":      420,
+			"committed": committed,
+		}},
+	})
+	if err := os.WriteFile(filepath.Join(e.dataDir, "restore-journal.json"), journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if journalPhase == "FILES_COMMITTED" {
+		// A crash after the file phase leaves the staged database on disk.
+		tmp := filepath.Join(e.dataDir, ".restore-state.tmp")
+		if err := os.WriteFile(tmp, dbBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return backup
+}
+
+// A crash during the file phase rolls the committed files back to their
+// journalled original state and quarantines the request (no retry loop).
+func TestRestoreJournalRollsBackAfterCrashInFilePhase(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	composeFile := filepath.Join(t.TempDir(), "docker-compose.yml")
+	restoreJournalFixture(t, e, composeFile, "ORIGINALS_SAVED", true)
+
+	err := ApplyPendingRestore(e.dataDir)
+	if err == nil {
+		t.Fatal("interrupted restore must surface as a restore error")
+	}
+	raw, _ := os.ReadFile(composeFile)
+	if !strings.Contains(string(raw), "ports:") {
+		t.Fatalf("live compose must be rolled back to its original content, got:\n%s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(e.dataDir, "restore-journal.json")); !os.IsNotExist(err) {
+		t.Fatal("journal must be removed after rollback")
+	}
+	failed, _ := filepath.Glob(filepath.Join(e.dataDir, "restore-failed-*.json"))
+	if len(failed) != 1 {
+		t.Fatalf("request must be quarantined as evidence, got %v", failed)
+	}
+}
+
+// A crash after the file phase resumes on the next start: the database swap
+// completes without re-running the (already committed) file phase.
+func TestRestoreJournalResumesAfterCrashInDatabasePhase(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	composeFile := filepath.Join(t.TempDir(), "docker-compose.yml")
+	restoreJournalFixture(t, e, composeFile, "FILES_COMMITTED", true)
+
+	if err := ApplyPendingRestore(e.dataDir); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	raw, _ := os.ReadFile(composeFile)
+	if !strings.Contains(string(raw), "ports:") {
+		t.Fatalf("committed files must survive the resume:\\n%s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(e.dataDir, "restore-journal.json")); !os.IsNotExist(err) {
+		t.Fatal("journal must be cleaned up after completion")
+	}
+	if _, err := os.Stat(filepath.Join(e.dataDir, "state.sqlite")); err != nil {
+		t.Fatal("database must be in place after completion")
+	}
+}
+
+// A target whose current content cannot be read aborts the restore before any
+// write: overwriting an unreadable file risks silent data loss.
+func TestRestoreAbortsOnUnreadableTarget(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	composeFile := filepath.Join(t.TempDir(), "docker-compose.yml")
+	restoreJournalFixture(t, e, composeFile, "", false)
+	if err := os.Chmod(composeFile, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(composeFile, 0o644) })
+
+	err := ApplyPendingRestore(e.dataDir)
+	if err == nil || !strings.Contains(err.Error(), "读取") {
+		t.Fatalf("unreadable target must abort the restore, got %v", err)
+	}
+	// Restore permissions before reading: the test process is subject to the
+	// same 0o000 denial it just injected.
+	if err := os.Chmod(composeFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(composeFile)
+	if string(raw) != "drifted-live" {
+		t.Fatal("unreadable target was modified")
+	}
+}
+
+// The allowlist captured with the request is authoritative: a manifest entry
+// outside it is refused even when the archive's own database references it.
+func TestRestoreRejectsPathOutsideRequestAllowlist(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	evil := filepath.Join(t.TempDir(), "not-in-allowlist.yml")
+	composeFile := filepath.Join(t.TempDir(), "docker-compose.yml")
+	restoreJournalFixture(t, e, composeFile, "", false)
+	// The fixture allowlisted composeFile only. Point the manifest at the
+	// non-allowlisted path by rewriting the request.
+	markerPath := filepath.Join(e.dataDir, "restore-request.json")
+	var marker map[string]any
+	rawMarker, _ := os.ReadFile(markerPath)
+	json.Unmarshal(rawMarker, &marker)
+	marker["allow"].(map[string]any)["files"] = []string{evil}
+	updated, _ := json.Marshal(marker)
+	os.WriteFile(markerPath, updated, 0o600)
+
+	err := ApplyPendingRestore(e.dataDir)
+	if err == nil || !strings.Contains(err.Error(), "拒绝写入") {
+		t.Fatalf("path outside the request allowlist must be refused, got %v", err)
+	}
+	if _, serr := os.Stat(composeFile); serr != nil {
+		t.Fatal("allowlisted target must be untouched")
+	}
+}
+
+// A plan generated before a Docker context switch is never applied.
+func TestApplyPlanRejectedAfterContextSwitch(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	entry := &planEntry{createdAt: time.Now(), dockerGeneration: 0,
+		plan:  model.Plan{ID: "plan-old", Status: "ready"},
+		items: []planSnapshot{{containerName: "demo-web-1"}}}
+	e.plansMu.Lock()
+	e.plans["plan-old"] = entry
+	e.plansMu.Unlock()
+
+	e.mu.Lock()
+	e.dockerGeneration = 3 // invalidateDocker() ran twice
+	e.mu.Unlock()
+
+	if _, err := e.ApplyPlan("plan-old"); err == nil || !strings.Contains(err.Error(), "环境切换") {
+		t.Fatalf("stale-generation plan must be rejected: %v", err)
+	}
+}
+
+// The sidecar swap must preserve the live WAL content: after a successful
+// restore the original WAL lives in the restore-orig snapshot.
+func TestRestoreMovesSidecarsIntoSnapshot(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	composeFile := filepath.Join(t.TempDir(), "docker-compose.yml")
+	restoreJournalFixture(t, e, composeFile, "", false)
+
+	// The fixture created the real database via engine.New; give it a WAL
+	// sidecar whose content must survive the swap.
+	liveWAL := filepath.Join(e.dataDir, "state.sqlite-wal")
+	if err := os.WriteFile(liveWAL, []byte("committed-wal-records"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyPendingRestore(e.dataDir); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	stages, _ := filepath.Glob(filepath.Join(e.dataDir, "restore-orig-*"))
+	if len(stages) != 1 {
+		t.Fatalf("expected one restore-orig snapshot, got %d", len(stages))
+	}
+	moved, err := os.ReadFile(filepath.Join(stages[0], "state.sqlite-wal"))
+	if err != nil {
+		t.Fatalf("live WAL was not moved into the snapshot: %v", err)
+	}
+	if string(moved) != "committed-wal-records" {
+		t.Fatalf("WAL content corrupted: %q", moved)
+	}
+	if _, err := os.Stat(liveWAL); !os.IsNotExist(err) {
+		t.Fatal("stale WAL must not remain next to the new database")
+	}
+}
+
+// Published-port validation: empty bindings, host-port mismatch and
+// non-loopback bindings all block the plan.
+func parseProxyPorts(ports map[string][]dockerx.PortBinding) map[int]PublishedPort {
+	out := map[int]PublishedPort{}
+	for key, bindings := range ports {
+		if len(bindings) == 0 {
+			continue
+		}
+		port, proto := splitPortKey(key)
+		if proto != "tcp" {
+			continue
+		}
+		hostPort, _ := strconv.Atoi(bindings[0].HostPort)
+		out[port] = PublishedPort{ContainerPort: port, HostPort: hostPort, HostIP: bindings[0].HostIP}
+	}
+	return out
+}
+
+func TestPlanValidatesProxyPublishedPorts(t *testing.T) {
+	cases := []struct {
+		name  string
+		ports map[string][]dockerx.PortBinding
+		code  string
+	}{
+		{"empty bindings", map[string][]dockerx.PortBinding{}, "proxy_port_unpublished"},
+		{"host port mismatch", map[string][]dockerx.PortBinding{
+			"21001/tcp": {{HostIP: "127.0.0.1", HostPort: "29999"}},
+		}, "proxy_port_mismatch"},
+		{"non-loopback binding", map[string][]dockerx.PortBinding{
+			"21001/tcp": {{HostIP: "0.0.0.0", HostPort: "21001"}},
+		}, "proxy_port_exposed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotCode, gotMsg string
+			blocked := false
+			checkProxyPublishedPort(map[int]PublishedPort{}, 21001, func(code, msg string) {})
+			checkProxyPublishedPort(parseProxyPorts(tc.ports), 21001, func(code, msg string) {
+				blocked = true
+				gotCode, gotMsg = code, msg
+			})
+			if !blocked || gotCode != tc.code {
+				t.Fatalf("expected %s blocker, got %s (%s)", tc.code, gotCode, gotMsg)
+			}
+			// A correct loopback binding passes.
+			ok := map[int]PublishedPort{21001: {ContainerPort: 21001, HostPort: 21001, HostIP: "127.0.0.1"}}
+			checkProxyPublishedPort(ok, 21001, func(code, msg string) {
+				t.Fatalf("valid binding must pass, got %s: %s", code, msg)
+			})
+		})
 	}
 }
