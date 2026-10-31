@@ -38,7 +38,7 @@ type Engine struct {
 	cli        composeCLI
 	dockerErr  string
 	lastDetect time.Time
-	detectCh   chan detectResult
+	detect     *detectState
 	lastErr    model.LastError
 	scanCache  []model.Container
 	scanAt     time.Time
@@ -455,47 +455,47 @@ func (e *Engine) Logs(limit int) ([]model.LogEntry, error) {
 	return out, nil
 }
 
-// detectResult is shared by every goroutine waiting on one detection run:
+// detectState is shared by every goroutine waiting on one detection run:
 // without singleflight, concurrent first callers each saw "Docker 不可用"
-// while the very first detection was still in progress.
-type detectResult struct {
-	c   *dockerx.Client
-	err error
+// while the very first detection was still in progress. The done channel is
+// closed once, broadcasting the result to every waiter.
+type detectState struct {
+	done chan struct{}
+	c    *dockerx.Client
+	err  error
 }
 
 func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
-	for {
-		e.mu.Lock()
-		if e.docker != nil {
-			c := e.docker
-			e.mu.Unlock()
-			return c, nil
-		}
-		if e.detectCh != nil {
-			ch := e.detectCh
-			e.mu.Unlock()
-			// A detection is already running: wait for its result instead of
-			// failing this request spuriously.
-			select {
-			case res := <-ch:
-				return res.c, res.err
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		if !e.lastDetect.IsZero() && time.Since(e.lastDetect) < 3*time.Second {
-			msg := e.dockerErr
-			e.mu.Unlock()
-			if msg == "" {
-				msg = "Docker 不可用"
-			}
-			return nil, errors.New(msg)
-		}
-		e.lastDetect = time.Now()
-		e.detectCh = make(chan detectResult, 1)
+	e.mu.Lock()
+	if e.docker != nil {
+		c := e.docker
 		e.mu.Unlock()
-		break
+		return c, nil
 	}
+	if e.detect != nil {
+		d := e.detect
+		e.mu.Unlock()
+		// A detection is already running: wait for its broadcast result
+		// instead of failing this request spuriously.
+		select {
+		case <-d.done:
+			return d.c, d.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if !e.lastDetect.IsZero() && time.Since(e.lastDetect) < 3*time.Second {
+		msg := e.dockerErr
+		e.mu.Unlock()
+		if msg == "" {
+			msg = "Docker 不可用"
+		}
+		return nil, errors.New(msg)
+	}
+	e.lastDetect = time.Now()
+	e.detect = &detectState{done: make(chan struct{})}
+	d := e.detect
+	e.mu.Unlock()
 
 	detectCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
@@ -514,22 +514,22 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 	}
 
 	e.mu.Lock()
-	ch := e.detectCh
-	e.detectCh = nil
 	if err != nil {
 		e.dockerErr = err.Error()
-		e.mu.Unlock()
-		ch <- detectResult{err: err}
-		return nil, err
+	} else {
+		e.docker = c
+		e.dockerErr = ""
+		if cli, cliErr := dockercli.Find(c.DockerHost()); cliErr == nil {
+			e.cli = cli
+		}
 	}
-	e.docker = c
-	e.dockerErr = ""
-	if cli, cliErr := dockercli.Find(c.DockerHost()); cliErr == nil {
-		e.cli = cli
+	if e.detect == d {
+		e.detect = nil
 	}
 	e.mu.Unlock()
-	ch <- detectResult{c: c}
-	return c, nil
+	d.c, d.err = c, err
+	close(d.done)
+	return c, err
 }
 
 func (e *Engine) cliRunner() (composeCLI, error) {

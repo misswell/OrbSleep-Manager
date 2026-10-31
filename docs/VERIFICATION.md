@@ -226,6 +226,10 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 
 同日 `phase0.py`（隔离数据目录）全流程通过：接入 → 原地址 200 → 停止唤醒 → 空闲自动停止 → 恢复逐字节一致。首个 phase0 运行曾报失败，但守护进程日志显示各步（含恢复与连通性）均成功，系与 phase1 清理窗口重叠（共享代理容器）的环境竞争，干净重跑通过。
 
+### 补充（0.2.4，修正 0.2.2 引入的 singleflight 缺陷）
+
+- 目标完成审计中的并发测试（12 个并发 `dockerClient` 首次调用）暴露 0.2.2 实现的真实缺陷：`buffered(1)` 通道只把检测结果投递给一个等待者，其余并发请求各自挂起到自身上下文超时（比旧的"误报 Docker 不可用"更糟）。改为 `detectState{done}` 关闭广播：所有等待者共享同一次检测结果。新增 `TestDockerClientConcurrentDetectionSharesResult`（断言全部调用方结局一致），5 连跑通过；全套 `go test -race` 绿。
+
 ### 补充（0.2.3，收口 P1-03 隔离要求）
 
 - `CreatePlan` 新增 `proxy_not_on_current_instance` 阻塞项：代理管理接口在 127.0.0.1 上与实例无关，切换 Docker 实例后旧实例的代理仍可 ping 通；现在计划阶段强制要求代理运行在当前实例，杜绝把接入目标注册到不可达代理上（此前仅靠接入后的连通性回滚兜底）。

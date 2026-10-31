@@ -475,3 +475,46 @@ func TestCreatePlanBlocksWhenProxyIsOnAnotherInstance(t *testing.T) {
 		t.Fatalf("no items may be planned without a local proxy: %+v", plan.Items)
 	}
 }
+
+// P2 singleflight: concurrent first-time dockerClient callers share one
+// detection result. Without singleflight, callers arriving during the first
+// detection each got a spurious "Docker 不可用". All callers must observe the
+// identical outcome, whatever the environment's Docker state is.
+func TestDockerClientConcurrentDetectionSharesResult(t *testing.T) {
+	admin := newFakeAdmin(t)
+	// No fake docker client injected: exercise the real detection path.
+	e, _ := testEngine(t, admin, nil, nil)
+
+	const callers = 12
+	results := make(chan string, callers)
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		go func() {
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			c, err := e.dockerClient(ctx)
+			switch {
+			case err != nil:
+				results <- "err:" + err.Error()
+			case c != nil:
+				results <- "ok:" + c.Socket()
+			default:
+				results <- "bad:both-nil"
+			}
+		}()
+	}
+	close(start)
+	outcomes := map[string]int{}
+	for i := 0; i < callers; i++ {
+		outcomes[<-results]++
+	}
+	if len(outcomes) != 1 {
+		t.Fatalf("concurrent callers must share one detection outcome, got %v", outcomes)
+	}
+	for outcome := range outcomes {
+		if strings.HasPrefix(outcome, "bad:") {
+			t.Fatal(outcome)
+		}
+	}
+}
