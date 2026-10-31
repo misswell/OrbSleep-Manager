@@ -2,6 +2,7 @@ package engine
 
 import (
 	"archive/zip"
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -442,4 +443,35 @@ func TestReconcileSkipsForeignSocketServices(t *testing.T) {
 
 func itoa(n int) string {
 	return strconv.Itoa(n)
+}
+
+// P1-03 isolation: the proxy admin endpoint answers on 127.0.0.1 even when
+// the proxy runs on another Docker instance. A plan on the current instance
+// must not wire targets into a proxy that cannot reach its containers.
+func TestCreatePlanBlocksWhenProxyIsOnAnotherInstance(t *testing.T) {
+	admin := newFakeAdmin(t) // admin ping succeeds, like a proxy on instance A
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	// The fake docker serves only the target container: a proxy container on
+	// THIS instance would 404, like instance B without its own proxy.
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	plan, err := e.CreatePlan(context.Background(), []string{"abc123"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Status != "blocked" {
+		t.Fatalf("plan must be blocked, got %s (%+v)", plan.Status, plan.Blockers)
+	}
+	found := false
+	for _, b := range plan.Blockers {
+		if b.Code == "proxy_not_on_current_instance" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing proxy_not_on_current_instance blocker: %+v", plan.Blockers)
+	}
+	if len(plan.Items) != 0 {
+		t.Fatalf("no items may be planned without a local proxy: %+v", plan.Items)
+	}
 }

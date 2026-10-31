@@ -98,6 +98,16 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 			Message:  "Lazy TCP Proxy 未运行或管理接口不可达；请先在「设置」中安装并启动代理",
 			Severity: "blocker",
 		})
+	} else if _, ierr := c.InspectContainer(ctx, proxy.ContainerName); ierr != nil {
+		// The admin endpoint answers on 127.0.0.1 regardless of which Docker
+		// instance hosts the proxy. After a context switch the plan must not
+		// wire targets into a proxy that cannot reach this instance's
+		// containers — require a proxy on the current instance.
+		plan.Blockers = append(plan.Blockers, model.Reason{
+			Code:     "proxy_not_on_current_instance",
+			Message:  "Lazy TCP Proxy 未运行在当前 Docker 实例上；请先在当前实例执行 proxy-setup 再生成接入计划",
+			Severity: "blocker",
+		})
 	}
 
 	cli, cliErr := e.cliRunner()

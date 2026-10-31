@@ -207,7 +207,7 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 
 ```json
 {
-  "daemonVersion": "0.2.2",
+  "daemonVersion": "0.2.3",
   "dataDir": "/Users/me/Library/Application Support/OrbSleep",
   "context": {"name":"orbstack","endpoint":"unix:///Users/me/.orbstack/run/docker.sock","kind":"orbstack"},
   "dockerReachable": true,
