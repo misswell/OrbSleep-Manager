@@ -112,7 +112,7 @@ func New(version, dataDir string) (*Engine, error) {
 		findCLI: func(host string) (composeCLI, error) {
 			return dockercli.Find(host)
 		},
-		startedAt:     time.Now(),
+		startedAt: time.Now(),
 	}
 	if migrateErr != nil {
 		logger.Printf("warn", "迁移旧设置失败: %v", migrateErr)
