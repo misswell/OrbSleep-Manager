@@ -98,16 +98,26 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 			Message:  "Lazy TCP Proxy 未运行或管理接口不可达；请先在「设置」中安装并启动代理",
 			Severity: "blocker",
 		})
-	} else if _, ierr := c.InspectContainer(ctx, proxy.ContainerName); ierr != nil {
-		// The admin endpoint answers on 127.0.0.1 regardless of which Docker
-		// instance hosts the proxy. After a context switch the plan must not
-		// wire targets into a proxy that cannot reach this instance's
-		// containers — require a proxy on the current instance.
-		plan.Blockers = append(plan.Blockers, model.Reason{
-			Code:     "proxy_not_on_current_instance",
-			Message:  "Lazy TCP Proxy 未运行在当前 Docker 实例上；请先在当前实例执行 proxy-setup 再生成接入计划",
-			Severity: "blocker",
-		})
+	} else {
+		proxyIns, ierr := c.InspectContainer(ctx, proxy.ContainerName)
+		switch {
+		case ierr != nil:
+			// The admin endpoint answers on 127.0.0.1 regardless of which
+			// Docker instance hosts the proxy. After a context switch the
+			// plan must not wire targets into a proxy that cannot reach this
+			// instance's containers.
+			plan.Blockers = append(plan.Blockers, model.Reason{
+				Code:     "proxy_not_on_current_instance",
+				Message:  "Lazy TCP Proxy 未运行在当前 Docker 实例上；请先在当前实例执行 proxy-setup 再生成接入计划",
+				Severity: "blocker",
+			})
+		case !proxyIns.State.Running:
+			plan.Blockers = append(plan.Blockers, model.Reason{
+				Code:     "proxy_not_running",
+				Message:  "Lazy TCP Proxy 容器存在但未运行；请在当前实例执行 proxy-setup",
+				Severity: "blocker",
+			})
+		}
 	}
 
 	cli, cliErr := e.cliRunner()
@@ -118,7 +128,14 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 			Severity: "blocker",
 		})
 	}
-	published, _ := e.proxyPublishedPorts(ctx)
+	published, pubErr := e.proxyPublishedPorts(ctx)
+	if pubErr != nil {
+		plan.Blockers = append(plan.Blockers, model.Reason{
+			Code:     "proxy_ports_unknown",
+			Message:  "无法确认代理端口发布状态（" + pubErr.Error() + "）；请检查代理容器后再试",
+			Severity: "blocker",
+		})
+	}
 	seen := map[string]bool{}
 	entry := &planEntry{createdAt: time.Now(), allowLan: allowLan}
 	for _, id := range ids {

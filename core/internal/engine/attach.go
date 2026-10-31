@@ -68,9 +68,9 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 		e.plansMu.Unlock()
 		return "", errors.New("接入计划包含阻塞项，无法执行")
 	}
-	if running, _ := e.store.ListRunningTransactions(); len(running) > 0 {
+	if err := e.ensureNoUnresolvedWork(); err != nil {
 		e.plansMu.Unlock()
-		return "", errors.New("存在未完成的接入事务，请先查看操作记录并完成恢复")
+		return "", err
 	}
 	entry.applying = true
 	plan := entry.plan

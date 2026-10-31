@@ -24,7 +24,7 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.2.4"
+const version = "0.2.5"
 
 type globals struct {
 	socket  string

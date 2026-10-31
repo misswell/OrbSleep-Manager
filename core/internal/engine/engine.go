@@ -60,6 +60,8 @@ type Engine struct {
 	txnCancels map[string]context.CancelFunc
 	closing    bool
 
+	dockerGeneration int
+
 	recoveryMu   sync.Mutex
 	lastRecovery time.Time
 
@@ -323,6 +325,9 @@ func (e *Engine) Settings() model.Settings {
 func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	if err := e.ensureNoUnresolvedWork(); err != nil {
+		return model.Settings{}, err
+	}
 	s := e.settings.Get()
 	if v, ok := patch["idleTimeoutSecs"]; ok {
 		s.IdleTimeoutSecs = toInt(v)
@@ -355,6 +360,9 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 	}
 	if v, ok := patch["enableLowPortHelper"]; ok {
 		s.EnableLowPortHelper = toBool(v)
+	}
+	if s.AdminPort < 1024 || s.WebPort < 1024 {
+		return s, errors.New("管理端口与状态端口不能低于 1024（特权端口无法可靠绑定）")
 	}
 	if v, ok := patch["proxyDialMode"]; ok {
 		if str, ok := v.(string); ok {
@@ -493,6 +501,7 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 		return nil, errors.New(msg)
 	}
 	e.lastDetect = time.Now()
+	generation := e.dockerGeneration
 	e.detect = &detectState{done: make(chan struct{})}
 	d := e.detect
 	e.mu.Unlock()
@@ -514,7 +523,17 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 	}
 
 	e.mu.Lock()
-	if err != nil {
+	stale := generation != e.dockerGeneration
+	if stale {
+		// The environment was switched while this detection was running: its
+		// result describes the previous Docker instance and must neither be
+		// cached nor handed to the (possibly new) waiters.
+		e.dockerErr = "Docker 环境已切换，请重试"
+		if err == nil {
+			err = errors.New(e.dockerErr)
+			c = nil
+		}
+	} else if err != nil {
 		e.dockerErr = err.Error()
 	} else {
 		e.docker = c
@@ -558,6 +577,9 @@ func (e *Engine) invalidateDocker() {
 	e.docker = nil
 	e.cli = nil
 	e.lastDetect = time.Time{}
+	// Invalidate any detection already in flight: when it completes it must
+	// not repopulate the cache with a client for the previous environment.
+	e.dockerGeneration++
 	e.mu.Unlock()
 }
 
@@ -577,6 +599,15 @@ func (e *Engine) adminClient() (*proxy.AdminClient, error) {
 		key = k
 	}
 	return proxy.NewAdminClient(fmt.Sprintf("127.0.0.1:%d", s.AdminPort), key), nil
+}
+
+// setLastErrorQuiet records a last error without flooding the daemon log:
+// used by frequently polled read paths (system.health) where the condition
+// is usually transient.
+func (e *Engine) setLastErrorQuiet(msg string) {
+	e.mu.Lock()
+	e.lastErr = model.LastError{At: time.Now().UTC().Format(time.RFC3339), Message: msg}
+	e.mu.Unlock()
 }
 
 func (e *Engine) setLastError(msg string) {

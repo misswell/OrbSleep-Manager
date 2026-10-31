@@ -48,10 +48,19 @@ func (r *route) target() (string, int) {
 	return r.TargetHost, r.TargetPort
 }
 
+// serviceID returns the route's owner under the route lock: Ensure updates
+// the field, and readers on other locks (gateway-wide) would otherwise race.
+func (r *route) serviceID() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.ServiceID
+}
+
 // Gateway owns all host port listeners.
 type Gateway struct {
 	mu       sync.Mutex
 	routes   map[string]*route
+	conns    map[net.Conn]*route
 	sem      chan struct{}
 	logf     func(level, format string, args ...any)
 	onActive func(serviceID string, at time.Time)
@@ -65,6 +74,7 @@ func New(logf func(level, format string, args ...any)) *Gateway {
 	}
 	return &Gateway{
 		routes: make(map[string]*route),
+		conns:  make(map[net.Conn]*route),
 		sem:    make(chan struct{}, 1024),
 		logf:   logf,
 	}
@@ -94,7 +104,7 @@ func (g *Gateway) Ensure(r Route) error {
 		return nil
 	}
 	addr := net.JoinHostPort(r.BindHost, fmt.Sprintf("%d", r.BindPort))
-	ln, err := net.Listen("tcp4", addr)
+	ln, err := net.Listen(listenNetwork(r.BindHost), addr)
 	if err != nil {
 		return fmt.Errorf("无法监听 %s: %w", addr, err)
 	}
@@ -109,6 +119,21 @@ func (g *Gateway) Ensure(r Route) error {
 	go g.accept(rt)
 	g.logf("info", "监听 %s（服务 %s，转发到 %s:%d）", addr, r.ServiceID, r.TargetHost, r.TargetPort)
 	return nil
+}
+
+// listenNetwork picks the address family for a listener: an empty host binds
+// dual-stack, an IPv6 literal must use tcp6 (tcp4 would fail), and everything
+// else is IPv4.
+func listenNetwork(bindHost string) string {
+	host := strings.TrimSpace(bindHost)
+	if host == "" {
+		return "tcp"
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.To4() == nil {
+		return "tcp6"
+	}
+	return "tcp4"
 }
 
 // Remove closes one listener. Established connections are left to drain.
@@ -128,7 +153,7 @@ func (g *Gateway) RemoveService(serviceID string) {
 	g.mu.Lock()
 	var keys []string
 	for k, rt := range g.routes {
-		if rt.ServiceID == serviceID {
+		if rt.serviceID() == serviceID {
 			keys = append(keys, k)
 		}
 	}
@@ -180,7 +205,7 @@ func (g *Gateway) ActiveConns(serviceID string) int {
 	defer g.mu.Unlock()
 	total := 0
 	for _, rt := range g.routes {
-		if rt.ServiceID == serviceID {
+		if rt.serviceID() == serviceID {
 			total += int(rt.active.Load())
 		}
 	}
@@ -198,7 +223,8 @@ func (g *Gateway) RouteKeys() []string {
 	return out
 }
 
-// StopAll closes every listener and active connection (daemon shutdown).
+// StopAll closes every listener and active connection (daemon shutdown) and
+// waits — bounded — for the connection handlers to finish.
 func (g *Gateway) StopAll() {
 	g.mu.Lock()
 	g.closed = true
@@ -207,9 +233,31 @@ func (g *Gateway) StopAll() {
 		routes = append(routes, rt)
 	}
 	g.routes = map[string]*route{}
+	conns := make([]net.Conn, 0, len(g.conns))
+	for conn := range g.conns {
+		conns = append(conns, conn)
+	}
+	g.conns = map[net.Conn]*route{}
 	g.mu.Unlock()
 	for _, rt := range routes {
 		rt.once.Do(func() { rt.ln.Close() })
+	}
+	// Active connections hold the daemon's port forwarding; a shutdown that
+	// leaves them running keeps client sockets alive after "stop".
+	for _, conn := range conns {
+		conn.Close()
+	}
+	done := make(chan struct{})
+	go func() {
+		for _, rt := range routes {
+			rt.wg.Wait()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		g.logf("warn", "网关连接处理协程未在 10s 内全部退出")
 	}
 }
 
@@ -232,8 +280,17 @@ func (g *Gateway) accept(rt *route) {
 			continue
 		}
 		rt.wg.Add(1)
+		g.mu.Lock()
+		g.conns[conn] = rt
+		g.mu.Unlock()
 		go func() {
-			defer func() { <-g.sem; rt.wg.Done() }()
+			defer func() {
+				g.mu.Lock()
+				delete(g.conns, conn)
+				g.mu.Unlock()
+				<-g.sem
+				rt.wg.Done()
+			}()
 			g.handle(rt, conn)
 		}()
 	}
@@ -248,7 +305,7 @@ func (g *Gateway) handle(rt *route, client net.Conn) {
 	rt.active.Add(1)
 	defer rt.active.Add(-1)
 	if g.onActive != nil {
-		g.onActive(rt.ServiceID, time.Now())
+		g.onActive(rt.serviceID(), time.Now())
 	}
 
 	targetHost, targetPort := rt.target()

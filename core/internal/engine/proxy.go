@@ -122,6 +122,9 @@ func (e *Engine) proxyContainerIP(ctx context.Context) string {
 
 // ProxySetup installs or restarts the proxy and returns an operation id.
 func (e *Engine) ProxySetup() (string, error) {
+	if err := e.ensureNoUnresolvedWork(); err != nil {
+		return "", err
+	}
 	ctx, done, err := e.beginOperation(10 * time.Minute)
 	if err != nil {
 		return "", err
@@ -145,6 +148,9 @@ func (e *Engine) ProxySetup() (string, error) {
 // ProxyStop stops and removes the proxy container but keeps its configuration,
 // settings and backups so it can be started again.
 func (e *Engine) ProxyStop() (string, error) {
+	if err := e.ensureNoUnresolvedWork(); err != nil {
+		return "", err
+	}
 	ctx, done, err := e.beginOperation(5 * time.Minute)
 	if err != nil {
 		return "", err

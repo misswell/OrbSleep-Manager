@@ -200,7 +200,7 @@ def main() -> int:
     print(f"  数据目录: {data_dir}")
 
     try:
-        step("启动隔离后台助手（0.2.2）")
+        step("启动隔离后台助手")
         version = run([str(CTL), "version"]).stdout.strip()
         log(f"CLI {version}")
         daemon = start_daemon(data_dir)
@@ -293,9 +293,10 @@ def main() -> int:
         restored = compose_file.read_text(encoding="utf-8")
         if restored != managed_content:
             raise Failure(f"恢复后 Compose 应为备份时托管内容:\n got={restored!r}\nwant={managed_content!r}")
-        pre = list(workdir.glob("docker-compose.yml.pre-restore-*"))
-        if len(pre) != 1:
-            raise Failure(f"漂移证据应保留一份，实际 {len(pre)}")
+        stages = list(data_dir.glob("restore-orig-*"))
+        evidence = [f for d in stages for f in d.glob("*") if "user edit after backup" in f.read_text(errors="ignore")]
+        if not evidence:
+            raise Failure(f"漂移证据应保留在 restore-orig-* 暂存目录，实际 {len(stages)} 个目录")
         if not service_items(data_dir):
             raise Failure("恢复备份后服务应仍处于托管状态（数据库与文件一致）")
         if not http_ok(port):

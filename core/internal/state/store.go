@@ -167,7 +167,9 @@ func (s *Store) ListServices() ([]model.Service, error) {
 			&svc.LastError, &excl, &svc.DockerSocket); err != nil {
 			return nil, err
 		}
-		json.Unmarshal([]byte(bindings), &svc.Bindings)
+		if err := json.Unmarshal([]byte(bindings), &svc.Bindings); err != nil {
+			return nil, fmt.Errorf("服务 %s 的端口绑定数据损坏: %w", svc.ID, err)
+		}
 		svc.ExcludedFromSleep = excl != 0
 		out = append(out, svc)
 	}
@@ -192,7 +194,9 @@ func (s *Store) GetService(id string) (model.Service, bool, error) {
 		}
 		return model.Service{}, false, err
 	}
-	json.Unmarshal([]byte(bindings), &svc.Bindings)
+	if err := json.Unmarshal([]byte(bindings), &svc.Bindings); err != nil {
+		return model.Service{}, false, fmt.Errorf("服务 %s 的端口绑定数据损坏: %w", id, err)
+	}
 	svc.ExcludedFromSleep = excl != 0
 	return svc, true, nil
 }
@@ -468,9 +472,13 @@ func (s *Store) FinishTransactionWithOperation(txnID, opID, txnStatus, phase, tx
 	return tx.Commit()
 }
 
-// PruneTransactions deletes old terminal transactions.
+// PruneTransactions deletes old transactions that reached a real terminal
+// state. rollback_failed and needs_repair are unresolved recovery records:
+// pruning them would make PrepareShutdown, uninstall and backup-restore
+// guards report a clean board while the recovery material is still needed.
 func (s *Store) PruneTransactions(cutoff time.Time) error {
-	_, err := s.db.Exec(`DELETE FROM transactions WHERE status<>'running' AND updated_at < ?`,
+	_, err := s.db.Exec(`DELETE FROM transactions
+		WHERE status IN ('committed','rolled_back') AND updated_at < ?`,
 		cutoff.UTC().Format(time.RFC3339))
 	return err
 }

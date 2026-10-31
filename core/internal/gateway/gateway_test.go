@@ -216,3 +216,71 @@ func TestMatchesDetectsTargetChange(t *testing.T) {
 		t.Fatal("route with changed owner must not match")
 	}
 }
+
+// StopAll must close established connections (they hold the daemon's port
+// forwarding) and wait for the handlers, not just close the listeners.
+func TestStopAllClosesActiveConnections(t *testing.T) {
+	targetPort, closeSrv := echoServer(t)
+	defer closeSrv()
+	bindPort := freePort(t)
+	gw := New(nil)
+	if err := gw.Ensure(Route{Key: "k", ServiceID: "svc", BindHost: "127.0.0.1", BindPort: bindPort,
+		TargetHost: "127.0.0.1", TargetPort: targetPort}); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", "127.0.0.1:"+itoa(bindPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for gw.ActiveConns("svc") != 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	gw.StopAll()
+
+	// The client connection must be closed by StopAll: a read returns EOF or
+	// an error promptly instead of hanging until the echo server times out.
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("connection survived StopAll")
+	}
+}
+
+// An IPv6 bind address must be served: the listener previously hard-coded
+// tcp4 and failed for ::1 bindings.
+func TestEnsureListensOnIPv6(t *testing.T) {
+	targetPort, closeSrv := echoServer(t)
+	defer closeSrv()
+	bindPort := freePort(t)
+	gw := New(nil)
+	defer gw.StopAll()
+	if err := gw.Ensure(Route{Key: "k6", ServiceID: "svc6", BindHost: "::1", BindPort: bindPort,
+		TargetHost: "127.0.0.1", TargetPort: targetPort}); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp6", "[::1]:"+itoa(bindPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("v6")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "v6" {
+		t.Fatalf("echo = %q", buf)
+	}
+}

@@ -140,7 +140,9 @@ final class UpdateManager {
     /// - Parameter expectedNewVersion: 更新源声明的目标版本。握手标记必须用
     ///   **新包** 的版本：此时 Bundle.main 仍返回旧包的缓存 Info.plist，用它
     ///   比对新版本会让健康握手永远失败、45 秒后必然回滚。
-    func install(package: URL, expectedNewVersion: String) async throws {
+    /// - Parameter dataDir: OrbSleep 数据目录。握手标记与旧包备份都放在这里，
+    ///   与 GUI（可能使用自定义 dataDir）读取同一位置。
+    func install(package: URL, expectedNewVersion: String, dataDir: String) async throws {
         let appURL = Bundle.main.bundleURL
         let work = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbSleepInstall-\(UUID().uuidString)", isDirectory: true)
@@ -159,8 +161,7 @@ final class UpdateManager {
             )
         }
 
-        let supportDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/OrbSleep", isDirectory: true)
+        let supportDir = URL(fileURLWithPath: dataDir, isDirectory: true)
         let backupRoot = supportDir.appendingPathComponent("app-backup", isDirectory: true)
         try FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
         let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
@@ -171,6 +172,9 @@ final class UpdateManager {
         } catch {
             throw UpdateError.installFailed("无法保留旧版本：\(error.localizedDescription)")
         }
+        // Only the newest two rollback copies are kept; unbounded retention
+        // would slowly fill the disk.
+        cleanupOldAppBackups(in: backupRoot, keeping: 2)
         do {
             try FileManager.default.copyItem(at: newApp, to: appURL)
         } catch {
@@ -226,8 +230,35 @@ final class UpdateManager {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [helper.path, appURL.path, oldApp.path, "\(ProcessInfo.processInfo.processIdentifier)", okMarker.path]
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            // The helper never started: nobody else will restore the old app,
+            // and right now the app bundle is missing from its install
+            // location. Put it back instead of leaving the machine without
+            // the application.
+            try? FileManager.default.moveItem(at: oldApp, to: appURL)
+            throw UpdateError.installFailed("无法启动更新辅助脚本：\(error.localizedDescription)")
+        }
         NSApp.terminate(nil)
+    }
+
+    /// Keeps the newest `keeping` rollback copies, deletes the rest.
+    private func cleanupOldAppBackups(in backupRoot: URL, keeping: Int) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: backupRoot, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+            return
+        }
+        let apps = entries
+            .filter { $0.pathExtension == "app" }
+            .sorted { (a, b) in
+                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                return da > db
+            }
+        for stale in apps.dropFirst(max(0, keeping)) {
+            try? fm.removeItem(at: stale)
+        }
     }
 
     // MARK: - 包处理

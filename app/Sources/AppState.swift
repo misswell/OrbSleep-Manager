@@ -341,8 +341,11 @@ final class AppState {
             if serviceVersionMismatch {
                 await upgradeService()
             }
-            await runAutoDoctor()
+            // The update helper only waits 45s for the health marker: finish
+            // the handshake right after the version check, before the slow
+            // diagnostics can eat the whole window.
             await completeUpdateHandshake()
+            await runAutoDoctor()
         } else {
             await refreshLegacyDetection()
             prepareSetupSteps()
@@ -559,13 +562,19 @@ final class AppState {
         }
     }
 
-    func refreshServices(silent: Bool = false) async {
+    /// 刷新托管服务列表。返回是否真正读取成功：读取失败时旧数组保持原样，
+    /// 安全流程（关闭自启动、卸载）必须把它当成 fail-closed 信号，而不是
+    /// 把「读取失败」当成「没有服务」。
+    @discardableResult
+    func refreshServices(silent: Bool = false) async -> Bool {
         do {
             let value = try await client.call("services.list", as: ServicesResult.self)
             services = value.services ?? []
             markReachable()
+            return true
         } catch {
             if !silent { handle(error) }
+            return false
         }
     }
 
@@ -960,15 +969,32 @@ final class AppState {
             }
         } else {
             // After a reboot no daemon would come back: managed services would
-            // keep their ports removed while nothing listens on them. Restore
-            // everything first and refuse when that fails.
-            await refreshServices()
+            // keep their ports removed while nothing listens on them, and a
+            // leftover failed transaction would never be recovered. Fail
+            // closed on every step before unregistering.
+            guard await refreshServices() else {
+                showError("无法读取托管服务列表（fail-closed）。已保留开机自启动，请稍后重试。")
+                return
+            }
+            do {
+                let prep = try await client.call("system.prepareShutdown", as: ShutdownPreparation.self)
+                if prep.safe == false {
+                    showError("存在未完成的操作或事务（\(prep.message ?? "")）。请先处理后再关闭自启动。")
+                    return
+                }
+            } catch {
+                showError("无法确认安全状态（\(errorMessage(error))）。已保留开机自启动。")
+                return
+            }
             if !services.isEmpty {
                 if !(await restoreAllManagedServices()) {
                     showError("恢复托管服务失败，已保留开机自启动。请先在服务列表中恢复后再关闭。")
                     return
                 }
-                await refreshServices()
+                guard await refreshServices(silent: true) else {
+                    showError("无法确认托管服务状态（fail-closed）。已保留开机自启动。")
+                    return
+                }
                 if !services.isEmpty {
                     showError("仍有托管服务未恢复，已保留开机自启动。")
                     return
@@ -1219,8 +1245,14 @@ final class AppState {
             refreshLocalState()
 
             // Only after every protection step passed may data be deleted.
+            var dataDeleted = false
             if mode == .full {
-                try? FileManager.default.removeItem(atPath: directory)
+                do {
+                    try FileManager.default.removeItem(atPath: directory)
+                    dataDeleted = true
+                } catch {
+                    showError("删除数据目录失败（\(error.localizedDescription)）。应用与服务已移除，但数据仍保留于 \(directory)。请手动删除。")
+                }
             }
 
             let appURL = Bundle.main.bundleURL
@@ -1229,11 +1261,11 @@ final class AppState {
                     try FileManager.default.trashItem(at: appURL, resultingItemURL: nil)
                     NSApp.terminate(nil)
                 } catch {
-                    let kept = mode == .full ? "数据与后台服务已移除" : "数据已保留"
+                    let kept = dataDeleted ? "数据与后台服务已移除" : "数据已保留"
                     showError("\(kept)，但移动应用失败：\(error.localizedDescription)。请手动把 OrbSleepManager.app 移到废纸篓。")
                 }
             } else {
-                let kept = mode == .full ? "数据与后台服务已移除" : "数据已保留"
+                let kept = dataDeleted ? "数据与后台服务已移除" : "数据已保留"
                 showNotice("\(kept)。请手动把 OrbSleepManager.app 移到废纸篓以完成卸载。")
             }
         }
@@ -1297,9 +1329,13 @@ final class AppState {
         return true
     }
 
-    /// 恢复全部托管服务；任何一次恢复失败（RPC 失败、操作失败、超时）都中止。
+    /// 恢复全部托管服务；任何一次恢复失败（RPC 失败、操作失败、超时、
+    /// 服务列表读取失败）都中止。
     private func restoreAllManagedServices() async -> Bool {
-        await refreshServices()
+        guard await refreshServices() else {
+            showError("无法读取托管服务列表（fail-closed）。已中止。")
+            return false
+        }
         for service in services {
             do {
                 let value = try await client.call(
@@ -1791,7 +1827,7 @@ final class AppState {
                     }
                 }
                 updateStatus = .installing
-                try await updateManager.install(package: package, expectedNewVersion: update.version)
+                try await updateManager.install(package: package, expectedNewVersion: update.version, dataDir: dataDir)
             } catch {
                 updateStatus = .failed(error.localizedDescription)
                 showError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -1860,8 +1896,14 @@ final class AppState {
 
         // The old plist is the rollback material for every destructive step
         // below. Read it before touching launchd: once the job is booted out
-        // there is no second chance to save it.
+        // there is no second chance to save it. A plist we cannot read must
+        // stop the migration — continuing would destroy rollback material we
+        // never captured.
         let savedPlist = backgroundService.readOldPlistData()
+        if savedPlist == nil && legacy.plistExists {
+            showError("无法读取旧 LaunchAgent 内容（可能是权限问题）。已中止迁移，旧服务保持原状。")
+            return
+        }
         // Restore the old agent after a mid-migration failure. Without this a
         // backup failure would leave the old service unloaded and unstarted.
         var legacyBootedOut = false
@@ -1942,8 +1984,20 @@ final class AppState {
             await restoreLegacyAgent()
             return
         }
-        try? backgroundService.removeOldPlist()
-        _ = await waitForDaemonToStop(seconds: 5)
+        do {
+            try backgroundService.removeOldPlist()
+        } catch {
+            // A plist that survives deletion may reload the old daemon at the
+            // next login alongside the new one. Roll back and stop here.
+            showError("删除旧 LaunchAgent 失败（\(errorMessage(error))）。已中止迁移并恢复旧服务。")
+            await restoreLegacyAgent()
+            return
+        }
+        if !(await waitForDaemonToStop(seconds: 5)) {
+            showError("旧后台服务在卸载启动项后仍未退出，已中止迁移并恢复旧服务。")
+            await restoreLegacyAgent()
+            return
+        }
 
         // 阶段 3：注册并启动包内服务，校验版本。
         do {
@@ -1961,7 +2015,9 @@ final class AppState {
         }
         await refreshStatus(silent: true)
         guard status?.daemonVersion == appVersion, backgroundService.installed else {
-            showError("新版后台服务版本校验失败（当前 \(status?.daemonVersion ?? "未知")），迁移未完成，旧组件未清理。")
+            showError("新版后台服务版本校验失败（当前 \(status?.daemonVersion ?? "未知")），迁移未完成，已恢复旧 LaunchAgent。")
+            await restoreLegacyAgent()
+            await refreshLegacyDetection()
             return
         }
 

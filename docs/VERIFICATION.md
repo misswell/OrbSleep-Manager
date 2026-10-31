@@ -237,6 +237,34 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 - 明确边界：**每实例独立代理**（独立容器名/管理端口/发布端口范围）属架构改造，当前模型下一台机器只运行一个代理容器；在第二个实例上执行 proxy-setup 会因宿主端口冲突失败并有明确报错。已记录于「未验证 / 未实现」。
 - GUI 的 0.1.x 迁移失败回滚（P1-07）为 `@MainActor` UI 流程，依赖真实 `launchctl` 与用户 LaunchAgents 路径，无法在自动化测试中安全注入；以代码路径审查 + 编译验证覆盖。
 
+## 第九轮加固（0.2.5，针对 v0.2.4 复审）
+
+P0（数据丢失 / fail-closed）：
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| 保留策略删除 rollback_failed/needs_repair 事务 | `PruneTransactions` 只删除 `committed`/`rolled_back`；新增保留测试（超期失败事务存活且继续阻止停止/卸载/新操作） |
+| 备份恢复非原子 | 两阶段恢复：内存暂存 → 原文件快照至 `restore-orig-<ts>` → 提交；任一失败回滚已写文件并隔离标记，WAL/SHM 删除失败中止（原为忽略），数据库替换失败同样回滚文件。新增原子回滚、WAL 失败中止测试 |
+| 恢复路径任意写入 | manifest 只能引用备份自身数据库登记的路径（services.compose_file 精确匹配、serviceBackup/事务 backupPath 目录前缀），清单无法夹带 LaunchAgents 等任意目标；残留风险（攻击者完全控制备份内容）已记录。新增恶意 manifest 拒绝测试 |
+| 失败事务期间继续业务操作 | 新增 `ensureNoUnresolvedWork` 并接入 ApplyPlan / ServiceAction（start/stop/restore/remove）/ updatePolicy / ProxySetup / ProxyStop / UpdateSettings；读库失败 fail-closed。新增六入口拒绝测试 |
+| Context 切换竞态 | `SelectDockerContext` 全程持 writeMu（TryLock，忙时拒绝）、锁内重查运行中操作与守卫、清空旧实例计划；`invalidateDocker` 递增代际，旧代际检测结果禁止写缓存并返回重试错误 |
+| 关闭自启动绕过恢复检查 | `refreshServices` 返回成败（fail-closed 信号）；`setAutoStart(false)` 先查 `system.prepareShutdown` 再恢复服务，任何失败保留自启动；卸载链同样传播读取失败 |
+| 旧版迁移回滚缺口 | 版本校验失败恢复旧 LaunchAgent；plist 删除失败中止并回滚；bootout 后确认旧进程退出；plist 存在但读取失败在 bootout 前中止 |
+
+P1/P2：
+
+| 问题 | 修复 |
+|---|---|
+| 备份一致性 | `CreateBackup` 全程持 writeMu（库与文件同刻）；打包未解决事务的恢复材料（txns/ 前缀）；ZIP 先写 .tmp 再原子重命名，失败清理 |
+| Gateway 生命周期 | 连接注册表 + `StopAll` 关闭活动连接并等待处理协程（10s 上限）；`ServiceID` 全部经路由锁读取；监听网络按绑定地址选择（空=双栈、IPv6 字面量=tcp6，修复 IPv6 绑定无法接管） |
+| 代理镜像供应链 | 镜像固定 digest（sha256:ed51f0b3…，本机当前部署版本） |
+| Plan 代理验证 | 代理容器存在且必须 Running；`proxyPublishedPorts` 失败阻塞计划 |
+| 数据库错误处理 | `RecoveryList`/`RecoveryResolve` 返回错误；`Health` 读取失败记入 LastError（静默路径）；`ListServices`/`GetService` 绑定数据损坏返回错误而非空端口 |
+| 更新中心 | 握手标记/旧包备份跟随 dataDir；健康握手提前到自动诊断之前（45 秒窗口）；旧 app 备份只保留 2 份；辅助脚本启动失败自动还原旧包 |
+| 其他 | 管理/状态端口拒绝 <1024；卸载数据目录删除失败如实报告 |
+
+新增 14 个回归测试；`go vet ./...`、`go test -race -count=1 ./...` 全部通过；App 构建通过。真机（2026-10-31）：`phase1_lifecycle.py` A/B/C 全过（含新证据目录断言）、`phase0.py` 全流程通过。
+
 ## 未验证 / 未实现
 - 每实例独立代理（容器名/管理端口/发布端口范围按 Docker 实例隔离）：当前一台机器一个代理容器；跨实例接入由 plan 阶段 `proxy_not_on_current_instance` 阻塞兜底。
 

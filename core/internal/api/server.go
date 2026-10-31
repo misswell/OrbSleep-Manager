@@ -308,7 +308,7 @@ func (s *Server) handlers() map[string]handler {
 			return s.eng.PrepareUpdate(), nil
 		},
 		"system.recovery.list": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			return s.eng.RecoveryList(), nil
+			return s.eng.RecoveryList()
 		},
 		"system.recovery.resolve": func(ctx context.Context, params json.RawMessage) (any, error) {
 			var p struct {
@@ -317,7 +317,7 @@ func (s *Server) handlers() map[string]handler {
 			if len(params) > 0 {
 				_ = json.Unmarshal(params, &p)
 			}
-			return s.eng.RecoveryResolve(p.ID), nil
+			return s.eng.RecoveryResolve(p.ID)
 		},
 		"docker.contexts": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return s.eng.DockerContexts(ctx), nil

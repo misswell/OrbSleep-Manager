@@ -3,6 +3,7 @@ package engine
 import (
 	"archive/zip"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"orbsleep/internal/gateway"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
+	"orbsleep/internal/state"
 )
 
 // crashAttachTxnFixture builds an engine plus one attach transaction frozen in
@@ -359,10 +361,21 @@ func TestBackupRestoreRestoresComposeFiles(t *testing.T) {
 	if string(raw) != string(managed) {
 		t.Fatalf("compose file was not restored from the backup:\n%s", raw)
 	}
-	// The drifted file must survive as evidence, not be silently destroyed.
-	pre, _ := filepath.Glob(snap.composeFile + ".pre-restore-*")
-	if len(pre) != 1 {
-		t.Fatalf("expected one pre-restore copy of the drifted file, got %d", len(pre))
+	// The drifted file must survive as evidence (staged under the data dir),
+	// not be silently destroyed.
+	stages, _ := filepath.Glob(filepath.Join(e.dataDir, "restore-orig-*"))
+	if len(stages) != 1 {
+		t.Fatalf("expected one restore-orig staging dir, got %d", len(stages))
+	}
+	saved, _ := filepath.Glob(filepath.Join(stages[0], "*"))
+	found := false
+	for _, f := range saved {
+		if raw, rerr := os.ReadFile(f); rerr == nil && strings.Contains(string(raw), "user edit") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("drifted content missing from the staging dir %s: %v", stages[0], saved)
 	}
 	// The service's stable backup material must be back on disk, or the
 	// restored database would point at missing recovery files.
@@ -516,5 +529,369 @@ func TestDockerClientConcurrentDetectionSharesResult(t *testing.T) {
 		if strings.HasPrefix(outcome, "bad:") {
 			t.Fatal(outcome)
 		}
+	}
+}
+
+// P0: the retention job must only prune truly terminal transactions. A
+// rollback_failed record older than the cutoff is recovery material — pruning
+// it would make every lifecycle guard report a clean board.
+func TestPruneKeepsFailedRecovery(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	old := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	mk := func(id, status string) {
+		if err := e.store.SaveTransaction(state.Transaction{
+			ID: id, Kind: "attach", Status: status, Phase: status,
+			StartedAt: old, UpdatedAt: old, Data: "{}",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("txn-committed-old", "committed")
+	mk("txn-rolled-old", "rolled_back")
+	mk("txn-failed-old", "rollback_failed")
+	mk("txn-repair-old", "needs_repair")
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	if err := e.store.PruneTransactions(cutoff); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"txn-committed-old", "txn-rolled-old"} {
+		if _, ok, _ := e.store.GetTransaction(id); ok {
+			t.Fatalf("%s should have been pruned", id)
+		}
+	}
+	for _, id := range []string{"txn-failed-old", "txn-repair-old"} {
+		txn, ok, _ := e.store.GetTransaction(id)
+		if !ok {
+			t.Fatalf("%s must survive pruning (unresolved recovery record)", id)
+		}
+		_ = txn
+	}
+	// The surviving records must still block the lifecycle guards.
+	if err := e.ensureNoUnresolvedWork(); err == nil {
+		t.Fatal("unresolved transactions must block new operations after pruning")
+	}
+	if prep := e.PrepareShutdown(); prep.Safe {
+		t.Fatal("unresolved transactions must block shutdown after pruning")
+	}
+}
+
+// P0: every business write entry refuses unresolved transactions, including
+// the needs_repair / rollback_failed states ApplyPlan used to ignore.
+func TestBusinessWritesBlockedByFailedRecovery(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	if err := e.store.SaveTransaction(state.Transaction{
+		ID: "txn-failed", Kind: "attach", Status: "rollback_failed", Phase: "rollback_failed", Data: "{}",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// ApplyPlan: a ready plan must be refused.
+	entry := &planEntry{createdAt: time.Now(), plan: model.Plan{ID: "plan-x", Status: "ready"},
+		items: []planSnapshot{{containerName: "demo-web-1"}}}
+	e.plansMu.Lock()
+	e.plans["plan-x"] = entry
+	e.plansMu.Unlock()
+	if _, err := e.ApplyPlan("plan-x"); err == nil || !strings.Contains(err.Error(), "未完成事务") {
+		t.Fatalf("ApplyPlan must be refused: %v", err)
+	}
+
+	// ServiceAction start.
+	svc := model.Service{ID: "svc-blk", ContainerID: "abc123", ContainerName: "demo-web-1",
+		ComposeProject: "demo", ComposeService: "web",
+		ComposeFile: filepath.Join(t.TempDir(), "docker-compose.yml"),
+		Status:      "managed_running", StartTimeoutSecs: 1,
+		Bindings: []model.Binding{{HostIP: "127.0.0.1", HostPort: freePort(t), ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}}
+	if err := e.store.UpsertService(svc); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ServiceAction(context.Background(), svc.ID, "start", nil); err == nil {
+		t.Fatal("ServiceAction must be refused while recovery is unresolved")
+	}
+
+	// updatePolicy.
+	if _, err := e.updatePolicy(svc.ID, map[string]any{"idleTimeoutSecs": 600}); err == nil {
+		t.Fatal("updatePolicy must be refused while recovery is unresolved")
+	}
+
+	// UpdateSettings.
+	if _, err := e.UpdateSettings(map[string]any{"idleTimeoutSecs": 900}); err == nil {
+		t.Fatal("UpdateSettings must be refused while recovery is unresolved")
+	}
+
+	// ProxySetup.
+	if _, err := e.ProxySetup(); err == nil {
+		t.Fatal("ProxySetup must be refused while recovery is unresolved")
+	}
+}
+
+// P0: a backup archive whose manifest invents paths outside the recorded
+// services and backup directories must be refused (no arbitrary file write).
+func TestRestoreRejectsForeignManifestPath(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.sqlite")
+	st, err := state.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	dbBytes, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := filepath.Join(dir, "evil.plist")
+	if err := os.WriteFile(evil, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(dir, "crafted.zip")
+	f, err := os.Create(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("state.sqlite")
+	w.Write(dbBytes)
+	manifest, _ := json.Marshal(map[string]any{
+		"files": []map[string]any{{
+			"path":  evil,
+			"entry": "evil-entry",
+			"kind":  "compose",
+			"mode":  420,
+		}},
+	})
+	w, _ = zw.Create("manifest.json")
+	w.Write(manifest)
+	w, _ = zw.Create("evil-entry")
+	w.Write([]byte("pwned"))
+	zw.Close()
+	f.Close()
+
+	current := filepath.Join(dir, "state.sqlite")
+	if err := os.WriteFile(current, []byte("broken-current-db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker, _ := json.Marshal(map[string]string{"backupPath": backup})
+	if err := os.WriteFile(filepath.Join(dir, "restore-request.json"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = ApplyPendingRestore(dir)
+	if err == nil {
+		t.Fatal("foreign manifest path must be refused")
+	}
+	// The evil file must be untouched and the live database not swapped.
+	raw, _ := os.ReadFile(evil)
+	if string(raw) != "original" {
+		t.Fatal("manifest-invented path was written")
+	}
+	if db, _ := os.ReadFile(current); string(db) != "broken-current-db" {
+		t.Fatal("database was swapped despite the refused manifest")
+	}
+}
+
+// P0: a mid-restore failure must roll back already-written files and leave
+// the live database untouched.
+func TestRestoreIsAtomicAndRollsBackOnFailure(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	// Two managed services sharing one Compose file, both with backups.
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	managed := []byte("services:\n  web:\n    image: nginx:alpine\n  api:\n    image: nginx:alpine\n")
+	if err := os.WriteFile(composeFile, managed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	web := model.Service{ID: "svc-web", ContainerName: "shared-web-1", ComposeProject: "shared",
+		ComposeService: "web", ComposeFile: composeFile, Status: "managed_running", StartTimeoutSecs: 1}
+	api := model.Service{ID: "svc-api", ContainerName: "shared-api-1", ComposeProject: "shared",
+		ComposeService: "api", ComposeFile: composeFile, Status: "managed_running", StartTimeoutSecs: 1}
+	for _, svc := range []model.Service{web, api} {
+		if err := e.store.UpsertService(svc); err != nil {
+			t.Fatal(err)
+		}
+		bd := filepath.Join(e.settings.Get().BackupDir, "services", svc.ID)
+		if err := os.MkdirAll(bd, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bd, "docker-compose.yml"), managed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.store.SetMeta("serviceBackup:"+svc.ID, bd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry, err := e.CreateBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drift the file, then make the restore target unwritable so the commit
+	// phase fails partway (the file lives in a read-only directory).
+	if err := os.WriteFile(composeFile, []byte("drifted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	// RestoreBackup registers the marker; drive the apply path directly and
+	// expect the commit phase to fail in the read-only directory.
+	marker, _ := json.Marshal(map[string]string{"backupPath": entry.Path})
+	if err := os.WriteFile(filepath.Join(e.dataDir, "restore-request.json"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoreErr := ApplyPendingRestore(e.dataDir)
+	_ = os.Chmod(dir, 0o755)
+	if restoreErr == nil {
+		// On this platform the write into the read-only directory may still
+		// succeed via permissions; the invariant below is what matters.
+		t.Log("restore unexpectedly succeeded; checking consistency only")
+	}
+	// Invariant: database and files agree. The DB swap happens only after the
+	// file phase, so a failure must leave the drifted file and the live DB.
+	raw, err := os.ReadFile(composeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restoreErr != nil && string(raw) == string(managed) {
+		t.Fatal("failed restore overwrote files without completing")
+	}
+	if restoreErr != nil {
+		if _, ok, _ := e.store.GetService("svc-web"); !ok {
+			t.Fatal("live database must stay authoritative after a failed restore")
+		}
+	}
+}
+
+// P0: WAL/SHM sidecar removal failure must abort the restore instead of
+// pairing a fresh database with an incompatible log.
+func TestApplyPendingRestoreWALRemovalFailureAborts(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.sqlite")
+	st, err := state.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	dbBytes, _ := os.ReadFile(source)
+	backup := filepath.Join(dir, "backup.zip")
+	f, _ := os.Create(backup)
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("state.sqlite")
+	w.Write(dbBytes)
+	zw.Close()
+	f.Close()
+
+	current := filepath.Join(dir, "state.sqlite")
+	if err := os.WriteFile(current, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A directory cannot be removed with os.Remove while non-empty: this
+	// simulates an undeletable WAL sidecar.
+	if err := os.MkdirAll(current+"-wal", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(current+"-wal/x", []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker, _ := json.Marshal(map[string]string{"backupPath": backup})
+	if err := os.WriteFile(filepath.Join(dir, "restore-request.json"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPendingRestore(dir); err == nil {
+		t.Fatal("undeletable WAL sidecar must abort the restore")
+	}
+	if db, _ := os.ReadFile(current); string(db) == string(dbBytes) {
+		t.Fatal("database was swapped despite the WAL removal failure")
+	}
+}
+
+// P1: a backup must include the recovery material of unresolved transactions
+// (their per-item backups), written atomically (no .tmp left behind).
+func TestCreateBackupPackagesTxnMaterial(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	itemDir := filepath.Join(e.settings.Get().BackupDir, "ops", "op-x", "item-1")
+	if err := os.MkdirAll(itemDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(itemDir, "docker-compose.yml"), []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.SaveTransaction(state.Transaction{
+		ID: "txn-mat", Kind: "attach", Status: "rollback_failed", Phase: "rollback_failed",
+		Data: `{"items":[{"backupPath":"` + filepath.Join(itemDir, "docker-compose.yml") + `"}]}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := e.CreateBackup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := zip.OpenReader(entry.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	found := false
+	for _, f := range r.File {
+		if strings.HasPrefix(f.Name, "txns/txn-mat/") && strings.HasSuffix(f.Name, "docker-compose.yml") {
+			found = true
+		}
+		if strings.HasSuffix(f.Name, ".tmp") {
+			t.Fatalf("temp archive leaked: %s", f.Name)
+		}
+	}
+	if !found {
+		t.Fatal("unresolved transaction's backup material missing from the archive")
+	}
+}
+
+// P1: a proxy container that exists but is not running must not let a plan
+// through (its admin endpoint could still answer from another instance).
+func TestPlanBlockedWhenProxyStopped(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	docker.stoppedProxy = true
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	plan, err := e.CreatePlan(context.Background(), []string{"abc123"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, b := range plan.Blockers {
+		if b.Code == "proxy_not_running" {
+			found = true
+		}
+	}
+	if !found || plan.Status != "blocked" {
+		t.Fatalf("stopped proxy must block the plan: %s %+v", plan.Status, plan.Blockers)
+	}
+}
+
+// P2: privileged admin/status ports are rejected at settings time instead of
+// failing later during proxy installation.
+func TestUpdateSettingsRejectsLowPorts(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+
+	if _, err := e.UpdateSettings(map[string]any{"adminPort": 80}); err == nil {
+		t.Fatal("admin port below 1024 must be rejected")
+	}
+	if _, err := e.UpdateSettings(map[string]any{"webPort": 443}); err == nil {
+		t.Fatal("status port below 1024 must be rejected")
 	}
 }

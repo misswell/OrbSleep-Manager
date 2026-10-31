@@ -137,7 +137,10 @@ func TestRecoverTransactionRetriesFailedByID(t *testing.T) {
 	if err := e.store.FinishTransaction(txnID, "rollback_failed", "test: forced failure", "rollback_failed"); err != nil {
 		t.Fatal(err)
 	}
-	list := e.RecoveryList()
+	list, lerr := e.RecoveryList()
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
 	if len(list.Transactions) != 1 {
 		t.Fatalf("rollback_failed transaction must be listed, got %+v", list.Transactions)
 	}
@@ -147,7 +150,7 @@ func TestRecoverTransactionRetriesFailedByID(t *testing.T) {
 	if got, _, _ := e.store.GetTransaction(txnID); got.Status != "rolled_back" {
 		t.Fatalf("retry must complete the rollback, got %s (%s)", got.Status, got.Error)
 	}
-	if len(e.RecoveryList().Transactions) != 0 {
+	if list2, lerr := e.RecoveryList(); lerr != nil || len(list2.Transactions) != 0 {
 		t.Fatal("transaction must be resolved after the retry")
 	}
 }
@@ -173,7 +176,7 @@ func TestRecoveryConcurrentSingleAndBatch(t *testing.T) {
 		wg.Add(3)
 		go func() { defer wg.Done(); e.RecoverTransactions() }()
 		go func() { defer wg.Done(); _ = e.RecoverTransaction(txnID) }()
-		go func() { defer wg.Done(); e.RecoveryResolve(txnID) }()
+		go func() { defer wg.Done(); _, _ = e.RecoveryResolve(txnID) }()
 		wg.Wait()
 		got, _, _ := e.store.GetTransaction(txnID)
 		if got.Status != "rolled_back" {

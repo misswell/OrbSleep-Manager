@@ -50,6 +50,9 @@ func (e *Engine) ServiceAction(ctx context.Context, id, action string, params ma
 			return nil, errors.New("正在执行接入/恢复等操作，请稍后重试")
 		}
 		defer e.writeMu.Unlock()
+		if err := e.ensureNoUnresolvedWork(); err != nil {
+			return nil, err
+		}
 		svc, ok, err := e.store.GetService(id)
 		if err != nil {
 			return nil, err
@@ -65,6 +68,9 @@ func (e *Engine) ServiceAction(ctx context.Context, id, action string, params ma
 	case "updatePolicy":
 		return e.updatePolicy(id, params)
 	case "restore", "remove":
+		if err := e.ensureNoUnresolvedWork(); err != nil {
+			return nil, err
+		}
 		svc, ok, err := e.store.GetService(id)
 		if err != nil {
 			return nil, err
@@ -112,6 +118,9 @@ func (e *Engine) updatePolicy(id string, params map[string]any) (map[string]any,
 		return nil, errors.New("正在执行接入/恢复等操作，请稍后重试")
 	}
 	defer e.writeMu.Unlock()
+	if err := e.ensureNoUnresolvedWork(); err != nil {
+		return nil, err
+	}
 	svc, ok, err := e.store.GetService(id)
 	if err != nil {
 		return nil, err
