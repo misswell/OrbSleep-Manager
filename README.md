@@ -57,6 +57,7 @@ OrbSleepManager.app/Contents/
 | `docs/PHASE0.md` | 阶段 0 可行性验证清单与结论 |
 | `scripts/embed-service.sh` | 构建时把 `orbsleepd`/`orbsleepctl` 与 plist 放进应用包 |
 | `scripts/phase0.py` | 端到端验收脚本（需要 OrbStack） |
+| `scripts/phase1_lifecycle.py` | 生命周期故障注入验收（停止保护 / 备份一致性 / 卸载 fail-closed；隔离数据目录） |
 
 ## 开发
 
@@ -65,6 +66,7 @@ make build-core     # bin/orbsleepd bin/orbsleepctl
 make test           # go test ./...
 make app            # xcodegen + xcodebuild，产物 app/build/Debug/OrbSleepManager.app
 make phase0         # 真实 OrbStack 端到端验收
+make phase1         # 生命周期故障注入验收（隔离数据目录）
 ```
 
 `make app` 的 post-build 阶段会调用 `scripts/embed-service.sh`，自动把后台服务与 LaunchAgent 放进 Debug 应用包，因此打开 Debug 构建也能直接使用「一键配置并启动」。

@@ -6,6 +6,7 @@
 - `app/`：SwiftUI 客户端，XcodeGen 工程（`app/project.yml`），产物 `app/build/Debug/OrbSleepManager.app`。`app/Support/` 存放随包分发的 LaunchAgent plist；post-build 阶段 `scripts/embed-service.sh` 把 `orbsleepd`/`orbsleepctl` 放进 `Contents/Resources`，GUI 通过 `SMAppService` 注册后台服务。
 - `docs/PROTOCOL.md`：GUI ↔ daemon 的 NDJSON 协议，**唯一契约**。改协议必须同时改 `core/internal/model`、`core/internal/api`、`app/Sources/Models.swift` 与文档。
 - `scripts/phase0.py`：真实 OrbStack 端到端验收。
+- `scripts/phase1_lifecycle.py`：生命周期故障注入验收（停止保护、备份一致性、卸载 fail-closed；使用独立数据目录，不触碰真实数据）。
 
 ## 构建与测试
 
@@ -14,6 +15,7 @@ make build-core     # bin/orbsleepd bin/orbsleepctl
 make test           # go test ./...
 make app            # xcodegen + xcodebuild（产物 app/build/Debug）
 make phase0         # 需要 OrbStack；会创建/清理测试 Compose 项目
+make phase1         # 需要 OrbStack；生命周期故障注入（独立数据目录）
 ```
 
 ## 不可破坏的规则
