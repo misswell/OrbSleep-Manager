@@ -2,6 +2,7 @@ package engine
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"orbsleep/internal/compose"
 	"orbsleep/internal/dockercli"
 	"orbsleep/internal/launchagent"
 	"orbsleep/internal/model"
@@ -60,13 +62,26 @@ func (e *Engine) legacyBinaries() []string {
 	return out
 }
 
-// PrepareShutdown reports whether stopping now is safe.
+// PrepareShutdown reports whether stopping now is safe. It covers every
+// unresolved state: running operations, running transactions and recoveries
+// that failed (rollback_failed / needs_repair). A database read error is
+// fail-closed: the caller must not stop on an unknown board.
 func (e *Engine) PrepareShutdown() model.ShutdownPreparation {
-	ops, _ := e.store.ListRunningOperations()
-	txns, _ := e.store.ListRunningTransactions()
-	safe := len(ops) == 0 && len(txns) == 0
+	ops, opsErr := e.store.ListRunningOperations()
+	txns, txnErr := e.store.ListUnresolvedTransactions()
+	var readErrs []string
+	if opsErr != nil {
+		readErrs = append(readErrs, "读取进行中操作失败: "+opsErr.Error())
+	}
+	if txnErr != nil {
+		readErrs = append(readErrs, "读取未完成事务失败: "+txnErr.Error())
+	}
+	safe := len(readErrs) == 0 && len(ops) == 0 && len(txns) == 0
 	msg := "可以安全停止"
-	if !safe {
+	switch {
+	case len(readErrs) > 0:
+		msg = "无法确认当前状态（fail-closed）：" + strings.Join(readErrs, "；")
+	case !safe:
 		msg = fmt.Sprintf("有 %d 个进行中的操作、%d 个未完成事务；停止时后台会先取消并回滚", len(ops), len(txns))
 	}
 	if ops == nil {
@@ -78,6 +93,33 @@ func (e *Engine) PrepareShutdown() model.ShutdownPreparation {
 		PendingTransactions: mapRecoveryTransactions(txns),
 		Message:             msg,
 	}
+}
+
+// CheckStopSafety guards the plain "stop daemon" action. Unlike shutdown
+// during an in-flight operation (which cancels and rolls back), a stop with
+// managed services present leaves them without gateway listeners: their
+// original host ports live inside the daemon process. Restart/upgrade flows
+// pass force=true because they immediately re-launch the daemon; uninstall
+// flows must instead restore services and resolve transactions first.
+func (e *Engine) CheckStopSafety(force bool) error {
+	if force {
+		return nil
+	}
+	services, err := e.store.ListServices()
+	if err != nil {
+		return fmt.Errorf("读取托管服务失败，已拒绝停止: %w", err)
+	}
+	if len(services) > 0 {
+		return fmt.Errorf("仍有 %d 个托管服务依赖端口网关监听；停止后台后原端口将无法访问。请先恢复这些服务，或使用「重启服务」", len(services))
+	}
+	running, needsRepair, err := e.store.CountUnresolvedTransactions()
+	if err != nil {
+		return fmt.Errorf("读取未完成事务失败，已拒绝停止: %w", err)
+	}
+	if running+needsRepair > 0 {
+		return fmt.Errorf("存在 %d 个未完成事务（其中 %d 个需修复）；请先在「诊断与修复」中处理后再停止后台", running+needsRepair, needsRepair)
+	}
+	return nil
 }
 
 // PrepareUpdate reports whether an in-app upgrade can proceed safely.
@@ -218,6 +260,31 @@ func (e *Engine) DockerContexts(ctx context.Context) model.DockerContexts {
 	return model.DockerContexts{Contexts: out, Selected: "unix://" + current}
 }
 
+// ensureContextSwitchSafe refuses a Docker instance switch while the current
+// instance still owns anything: managed services and in-flight transactions
+// are pinned to the instance they were created on, and switching under them
+// can attach wrong containers or corrupt Compose state. Read errors fail
+// closed: an unreadable board is not a clean board.
+func (e *Engine) ensureContextSwitchSafe() error {
+	services, serr := e.store.ListServices()
+	if serr != nil {
+		return fmt.Errorf("读取托管服务失败，拒绝切换: %w", serr)
+	}
+	if len(services) > 0 {
+		return fmt.Errorf("仍有 %d 个托管服务，请先恢复后再切换 Docker 环境", len(services))
+	}
+	// CountUnresolvedTransactions returns (running, needsRepair, err); both
+	// states block the switch.
+	running, needsRepair, terr := e.store.CountUnresolvedTransactions()
+	if terr != nil {
+		return fmt.Errorf("读取未完成事务失败，拒绝切换: %w", terr)
+	}
+	if running+needsRepair > 0 {
+		return fmt.Errorf("存在 %d 个未完成事务（其中 %d 个需修复），请先完成恢复后再切换 Docker 环境", running+needsRepair, needsRepair)
+	}
+	return nil
+}
+
 // SelectDockerContext stores an OrbSleep-local Docker socket choice.
 func (e *Engine) SelectDockerContext(ctx context.Context, nameOrEndpoint string) (model.DockerContexts, error) {
 	list := e.DockerContexts(ctx)
@@ -240,18 +307,8 @@ func (e *Engine) SelectDockerContext(ctx context.Context, nameOrEndpoint string)
 	current := strings.TrimPrefix(strings.TrimSpace(e.settings.Get().DockerSocket), "unix://")
 	chosenEndpoint := strings.TrimPrefix(chosen.Endpoint, "unix://")
 	if chosenEndpoint != current {
-		// Managed services and in-flight transactions are pinned to the
-		// Docker instance they were created on; switching instances under
-		// them can attach wrong containers or corrupt Compose state.
-		services, serr := e.store.ListServices()
-		if serr != nil {
-			return list, fmt.Errorf("读取托管服务失败: %w", serr)
-		}
-		if len(services) > 0 {
-			return list, fmt.Errorf("仍有 %d 个托管服务，请先恢复后再切换 Docker 环境", len(services))
-		}
-		if _, running, _ := e.store.CountUnresolvedTransactions(); running > 0 {
-			return list, fmt.Errorf("存在未完成事务，请先完成恢复后再切换 Docker 环境")
+		if err := e.ensureContextSwitchSafe(); err != nil {
+			return list, err
 		}
 	}
 	s := e.settings.Get()
@@ -284,7 +341,78 @@ func uniqueStamp() string {
 	return fmt.Sprintf("%s-%s", time.Now().Format("20060102-150405"), rand)
 }
 
-// CreateBackup writes a consistent SQLite snapshot plus settings into a zip.
+// backupFile is one file captured into a backup archive. Path is the absolute
+// location the file must be restored to; Entry is its name inside the zip.
+// Kind "compose" is a managed Compose file snapshot (the DB expects this
+// content); kind "service-backup" is a managed service's stable backup dir
+// (original Compose + metadata), which the serviceBackup: meta points at.
+type backupFile struct {
+	Path  string `json:"path"`
+	Entry string `json:"entry"`
+	Kind  string `json:"kind"`
+	Mode  uint32 `json:"mode"`
+}
+
+// collectBackupFiles gathers the on-disk state that belongs to the current
+// database: every managed service's Compose file and stable backup material.
+// Without them a restored database would claim services are unmanaged while
+// the Compose files still have their ports removed.
+func (e *Engine) collectBackupFiles() ([]backupFile, map[string][]byte, error) {
+	services, err := e.store.ListServices()
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取托管服务失败: %w", err)
+	}
+	var files []backupFile
+	blobs := map[string][]byte{}
+	seenDir := map[string]bool{}
+	seenCompose := map[string]bool{}
+	for _, svc := range services {
+		if svc.ComposeFile != "" && !seenCompose[svc.ComposeFile] {
+			seenCompose[svc.ComposeFile] = true
+			raw, err := os.ReadFile(svc.ComposeFile)
+			if err != nil {
+				return nil, nil, fmt.Errorf("读取 %s 失败: %w", svc.ComposeFile, err)
+			}
+			mode := os.FileMode(0o644)
+			if st, serr := os.Stat(svc.ComposeFile); serr == nil {
+				mode = st.Mode()
+			}
+			entry := fmt.Sprintf("compose/%04d", len(files))
+			files = append(files, backupFile{Path: svc.ComposeFile, Entry: entry, Kind: "compose", Mode: uint32(mode)})
+			blobs[entry] = raw
+		}
+		dir, ok := e.store.GetMeta("serviceBackup:" + svc.ID)
+		if !ok || dir == "" || seenDir[dir] {
+			continue
+		}
+		seenDir[dir] = true
+		entries, rerr := os.ReadDir(dir)
+		if rerr != nil {
+			return nil, nil, fmt.Errorf("读取服务备份目录 %s 失败: %w", dir, rerr)
+		}
+		for _, fe := range entries {
+			if fe.IsDir() {
+				continue
+			}
+			raw, rerr := os.ReadFile(filepath.Join(dir, fe.Name()))
+			if rerr != nil {
+				return nil, nil, fmt.Errorf("读取服务备份文件失败: %w", rerr)
+			}
+			mode := os.FileMode(0o600)
+			if info, ierr := fe.Info(); ierr == nil {
+				mode = info.Mode()
+			}
+			entry := fmt.Sprintf("services/%s/%s", svc.ID, fe.Name())
+			files = append(files, backupFile{Path: filepath.Join(dir, fe.Name()), Entry: entry, Kind: "service-backup", Mode: uint32(mode)})
+			blobs[entry] = raw
+		}
+	}
+	return files, blobs, nil
+}
+
+// CreateBackup writes a consistent snapshot: the SQLite database, settings,
+// and the on-disk Compose/backup material the database refers to. Restoring
+// the database alone would leave files and records inconsistent.
 func (e *Engine) CreateBackup() (model.BackupEntry, error) {
 	dir := filepath.Join(e.settings.Get().BackupDir, "export")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -296,8 +424,12 @@ func (e *Engine) CreateBackup() (model.BackupEntry, error) {
 		return model.BackupEntry{}, fmt.Errorf("备份数据库失败: %w", err)
 	}
 	defer os.Remove(snapshot)
+	files, blobs, err := e.collectBackupFiles()
+	if err != nil {
+		return model.BackupEntry{}, fmt.Errorf("收集 Compose/服务备份失败（请检查托管服务状态）: %w", err)
+	}
 	target := filepath.Join(dir, "OrbSleep-backup-"+stamp+".zip")
-	if err := writeBackupZip(target, snapshot, e.settings.Get(), e.version); err != nil {
+	if err := writeBackupZip(target, snapshot, e.settings.Get(), e.version, files, blobs); err != nil {
 		return model.BackupEntry{}, err
 	}
 	info, _ := os.Stat(target)
@@ -306,16 +438,16 @@ func (e *Engine) CreateBackup() (model.BackupEntry, error) {
 		Path:      target,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		Kind:      "manual",
-		Note:      "手动备份（数据库 + 设置）",
+		Note:      fmt.Sprintf("手动备份（数据库 + 设置 + %d 个关联文件）", len(files)),
 	}
 	if info != nil {
 		entry.SizeBytes = info.Size()
 	}
-	e.logger.Printf("info", "已创建备份 %s", target)
+	e.logger.Printf("info", "已创建备份 %s（含 %d 个关联文件）", target, len(files))
 	return entry, nil
 }
 
-func writeBackupZip(target, dbPath string, s model.Settings, version string) error {
+func writeBackupZip(target, dbPath string, s model.Settings, version string, files []backupFile, blobs map[string][]byte) error {
 	f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -362,6 +494,7 @@ func writeBackupZip(target, dbPath string, s model.Settings, version string) err
 		"version":   version,
 		"createdAt": time.Now().UTC().Format(time.RFC3339),
 		"dataDir":   s.DataDir,
+		"files":     files,
 	}, "", "  ")
 	if err == nil {
 		err = write("manifest.json", manifest)
@@ -370,6 +503,21 @@ func writeBackupZip(target, dbPath string, s model.Settings, version string) err
 		zw.Close()
 		f.Close()
 		return fmt.Errorf("写入备份条目失败: %w", err)
+	}
+	// Associated files come last: a truncated archive then still yields a
+	// valid database-only backup for older daemons to restore.
+	for _, bf := range files {
+		w, werr := zw.CreateHeader(&zip.FileHeader{Name: bf.Entry, Method: zip.Deflate, Modified: time.Now()})
+		if werr != nil {
+			zw.Close()
+			f.Close()
+			return fmt.Errorf("写入备份条目 %s 失败: %w", bf.Entry, werr)
+		}
+		if _, werr := w.Write(blobs[bf.Entry]); werr != nil {
+			zw.Close()
+			f.Close()
+			return fmt.Errorf("写入备份条目 %s 失败: %w", bf.Entry, werr)
+		}
 	}
 	if err := zw.Close(); err != nil {
 		f.Close()
@@ -426,7 +574,22 @@ func (e *Engine) ExportLogs(limit int) (model.LogsExportResult, error) {
 // RestoreBackup validates a backup archive and writes a restore marker. The
 // daemon exits after the RPC returns; main applies the marker before opening
 // SQLite on the next start, which keeps the restore atomic and crash-safe.
+//
+// Restore is fail-closed with respect to in-flight work: running operations
+// and unresolved transactions would be silently erased by the database swap
+// (including rollback_failed ones whose Compose was already modified and
+// whose service record never existed). Managed services themselves are fine:
+// the archive carries their Compose snapshots, so database and files are
+// restored together.
 func (e *Engine) RestoreBackup(idOrPath string) (model.RestoreResult, error) {
+	ops, opsErr := e.store.ListRunningOperations()
+	txns, txnErr := e.store.ListUnresolvedTransactions()
+	if opsErr != nil || txnErr != nil {
+		return model.RestoreResult{}, fmt.Errorf("无法确认当前操作/事务状态（fail-closed）: %v %v", opsErr, txnErr)
+	}
+	if len(ops) > 0 || len(txns) > 0 {
+		return model.RestoreResult{}, fmt.Errorf("存在 %d 个进行中的操作、%d 个未完成事务；请先完成或恢复后再恢复备份", len(ops), len(txns))
+	}
 	var target string
 	for _, entry := range e.ListBackups().Backups {
 		if entry.ID == idOrPath || entry.Path == idOrPath {
@@ -463,6 +626,36 @@ func validateBackupZip(path string) error {
 		return fmt.Errorf("无法读取备份文件: %w", err)
 	}
 	defer r.Close()
+	byName := map[string]*zip.File{}
+	for _, f := range r.File {
+		byName[f.Name] = f
+	}
+	if _, ok := byName["state.sqlite"]; !ok {
+		return fmt.Errorf("备份缺少 state.sqlite")
+	}
+	if f, ok := byName["manifest.json"]; ok {
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return err
+		}
+		var manifest struct {
+			Files []backupFile `json:"files"`
+		}
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return fmt.Errorf("备份 manifest.json 无效: %w", err)
+		}
+		for _, bf := range manifest.Files {
+			if _, ok := byName[bf.Entry]; !ok {
+				return fmt.Errorf("备份缺少清单声明的文件条目 %s", bf.Entry)
+			}
+		}
+	}
+	// The database itself must be a real SQLite file.
 	for _, f := range r.File {
 		if f.Name != "state.sqlite" {
 			continue
@@ -483,8 +676,11 @@ func validateBackupZip(path string) error {
 }
 
 // ApplyPendingRestore is called by orbsleepd before opening SQLite. It replaces
-// state.sqlite with the snapshot from a previously requested backup, preserving
-// the current database as state.sqlite.pre-restore-<ts>.
+// state.sqlite with the snapshot from a previously requested backup and, when
+// the archive carries a file manifest, restores the associated Compose files
+// and service backup material so database and files stay consistent.
+// It preserves the current database as state.sqlite.pre-restore-<ts> and any
+// differing Compose file as <file>.pre-restore-<ts>.
 //
 // Any failure quarantines the marker as restore-failed-<ts>.json and returns a
 // *RestoreError. The caller must keep starting with the existing database:
@@ -519,13 +715,11 @@ func ApplyPendingRestore(dataDir string) error {
 		return fail("打开备份失败: %v", err)
 	}
 	defer r.Close()
-	var src *zip.File
+	byName := map[string]*zip.File{}
 	for _, f := range r.File {
-		if f.Name == "state.sqlite" {
-			src = f
-			break
-		}
+		byName[f.Name] = f
 	}
+	src := byName["state.sqlite"]
 	if src == nil {
 		return fail("备份缺少 state.sqlite")
 	}
@@ -553,9 +747,17 @@ func ApplyPendingRestore(dataDir string) error {
 		return fail("备份数据库完整性校验失败: %v", err)
 	}
 
+	stamp := time.Now().Format("20060102-150405")
+	// Restore the associated files BEFORE swapping the database: if a file
+	// restore fails, the live database stays authoritative and the marker is
+	// quarantined, so the system remains consistent (files untouched).
+	if err := restoreBackupFiles(r, byName, dataDir, stamp); err != nil {
+		return fail("恢复关联文件失败: %v", err)
+	}
+
 	dbPath := filepath.Join(dataDir, "state.sqlite")
 	if _, err := os.Stat(dbPath); err == nil {
-		backup := filepath.Join(dataDir, "state.sqlite.pre-restore-"+time.Now().Format("20060102-150405"))
+		backup := filepath.Join(dataDir, "state.sqlite.pre-restore-"+stamp)
 		if err := copyFile(dbPath, backup); err != nil {
 			return fail("备份当前数据库失败: %v", err)
 		}
@@ -566,7 +768,69 @@ func ApplyPendingRestore(dataDir string) error {
 		return fail("替换数据库失败: %v", err)
 	}
 	_ = os.Remove(marker)
-	fmt.Fprintf(os.Stderr, "已从备份恢复数据库: %s\n", req.BackupPath)
+	fmt.Fprintf(os.Stderr, "已从备份恢复数据库与关联文件: %s\n", req.BackupPath)
+	return nil
+}
+
+// restoreBackupFiles writes the archive's manifest-listed files back to their
+// recorded locations. Safety rules:
+//   - only absolute, cleaned paths without ".." (zip-slip);
+//   - a Compose file that currently differs is preserved as
+//     <file>.pre-restore-<ts> next to itself before being overwritten;
+//   - symlinks are written through (compose.WriteAtomic keeps the link).
+//
+// Archives without a manifest (pre-0.2.2) restore database-only, as before.
+func restoreBackupFiles(r *zip.ReadCloser, byName map[string]*zip.File, dataDir, stamp string) error {
+	manifestRaw, ok := byName["manifest.json"]
+	if !ok {
+		return nil
+	}
+	mrc, err := manifestRaw.Open()
+	if err != nil {
+		return err
+	}
+	manifestData, err := io.ReadAll(mrc)
+	mrc.Close()
+	if err != nil {
+		return err
+	}
+	var manifest struct {
+		Files []backupFile `json:"files"`
+	}
+	if err := json.Unmarshal(manifestData, &manifest); err != nil || len(manifest.Files) == 0 {
+		// Older backup without file entries: nothing to restore on disk.
+		return nil
+	}
+	for _, bf := range manifest.Files {
+		if !filepath.IsAbs(bf.Path) || filepath.Clean(bf.Path) != bf.Path || strings.Contains(bf.Path, "..") {
+			return fmt.Errorf("备份清单包含不安全的路径: %q", bf.Path)
+		}
+		entry, ok := byName[bf.Entry]
+		if !ok {
+			return fmt.Errorf("备份缺少文件条目 %s", bf.Entry)
+		}
+		erc, err := entry.Open()
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(erc)
+		erc.Close()
+		if err != nil {
+			return err
+		}
+		dir := filepath.Dir(bf.Path)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		// Preserve the current file as evidence when it differs from what the
+		// backup expects — the user may have edited it after the backup.
+		if current, rerr := os.ReadFile(bf.Path); rerr == nil && !bytes.Equal(current, data) {
+			_ = copyFile(bf.Path, bf.Path+".pre-restore-"+stamp)
+		}
+		if err := compose.WriteAtomic(bf.Path, data, os.FileMode(bf.Mode)); err != nil {
+			return fmt.Errorf("写入 %s 失败: %w", bf.Path, err)
+		}
+	}
 	return nil
 }
 

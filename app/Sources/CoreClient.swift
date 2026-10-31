@@ -72,11 +72,16 @@ final class CoreClient: @unchecked Sendable {
         return defaultDataDirectory + "/daemon.sock"
     }
 
-    /// 根据方法名决定超时：scan / plan.create 为 60 秒，其余 15 秒。
+    /// 根据方法名决定超时。事务恢复在后台是同步执行的（最长 15 分钟），
+    /// GUI 若沿用默认 15 秒会提前报超时、误导用户操作，因此单独放宽。
     static func timeout(for method: String) -> TimeInterval {
         switch method {
         case "scan", "plan.create":
             return 60
+        case "system.recover", "system.recovery.resolve":
+            return 960
+        case "backup.create":
+            return 120
         default:
             return defaultTimeout
         }

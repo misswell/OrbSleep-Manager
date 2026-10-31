@@ -174,18 +174,27 @@ func (s *Store) ListServices() ([]model.Service, error) {
 	return out, rows.Err()
 }
 
-// GetService returns one service.
+// GetService returns one service. It queries by primary key directly: the
+// previous implementation scanned and JSON-decoded the whole services table.
 func (s *Store) GetService(id string) (model.Service, bool, error) {
-	list, err := s.ListServices()
-	if err != nil {
+	row := s.db.QueryRow(`SELECT id, container_id, container_name, compose_project, compose_service,
+		compose_file, status, bindings, idle_timeout, start_timeout, active_conns, last_active_at,
+		created_at, last_error, excluded_from_sleep, docker_socket FROM services WHERE id = ?`, id)
+	var svc model.Service
+	var bindings string
+	var excl int
+	if err := row.Scan(&svc.ID, &svc.ContainerID, &svc.ContainerName, &svc.ComposeProject,
+		&svc.ComposeService, &svc.ComposeFile, &svc.Status, &bindings, &svc.IdleTimeoutSecs,
+		&svc.StartTimeoutSecs, &svc.ActiveConnections, &svc.LastActiveAt, &svc.CreatedAt,
+		&svc.LastError, &excl, &svc.DockerSocket); err != nil {
+		if err == sql.ErrNoRows {
+			return model.Service{}, false, nil
+		}
 		return model.Service{}, false, err
 	}
-	for _, svc := range list {
-		if svc.ID == id {
-			return svc, true, nil
-		}
-	}
-	return model.Service{}, false, nil
+	json.Unmarshal([]byte(bindings), &svc.Bindings)
+	svc.ExcludedFromSleep = excl != 0
+	return svc, true, nil
 }
 
 // DeleteService removes a managed service record.

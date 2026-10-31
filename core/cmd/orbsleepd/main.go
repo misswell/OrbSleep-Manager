@@ -15,7 +15,7 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.2.1"
+const version = "0.2.2"
 
 func main() {
 	// Keep state, logs and backups readable by the current user only.

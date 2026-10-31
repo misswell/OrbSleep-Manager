@@ -29,6 +29,10 @@ func (e *Engine) reconcileLoop() {
 }
 
 func (e *Engine) reconcile() {
+	// Retry pending transaction recovery BEFORE taking writeMu. Recovery
+	// acquires recoveryMu → writeMu itself; calling it while writeMu is held
+	// would self-deadlock the reconcile loop against recoverAttachTxn.
+	e.retryPendingRecovery()
 	// Never touch gateway routes or proxy config while a transactional
 	// operation (attach/restore/proxy-setup) is mutating them.
 	if !e.writeMu.TryLock() {
@@ -40,16 +44,6 @@ func (e *Engine) reconcile() {
 	defer e.reconcileMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	if running, _ := e.store.ListRunningTransactions(); len(running) > 0 {
-		s := e.settings.Get()
-		e.recoveryMu.Lock()
-		due := time.Since(e.lastRecovery) > 2*time.Minute
-		e.recoveryMu.Unlock()
-		if due && e.proxyAdminReachable(ctx, s.AdminPort) {
-			e.logger.Printf("warn", "仍存在 %d 个未完成事务，重试恢复", len(running))
-			e.RecoverTransactions()
-		}
-	}
 
 	services, err := e.store.ListServices()
 	if err != nil {
@@ -101,6 +95,10 @@ func (e *Engine) reconcile() {
 	for i := range services {
 		orig := services[i]
 		svc := &services[i]
+		// Services pinned to another Docker instance are invisible here:
+		// their proxy mappings live on that instance's proxy, so routing
+		// them through this instance would only create dead listeners.
+		foreignSocket := svc.DockerSocket != "" && svc.DockerSocket != clientSocket
 		var summary *dockerx.ContainerSummary
 		var lastErr string
 		if svc.ContainerID != "" {
@@ -108,7 +106,7 @@ func (e *Engine) reconcile() {
 				summary = &s
 			}
 		}
-		if summary == nil && (svc.DockerSocket == "" || svc.DockerSocket == clientSocket) {
+		if summary == nil && !foreignSocket {
 			// Rebind by name only on the Docker instance the service was
 			// attached on (or a legacy record without a pin). Two Docker
 			// instances can run same-named containers; adopting one from
@@ -147,33 +145,41 @@ func (e *Engine) reconcile() {
 
 		// Keep the host gateway listeners alive for every binding, even while
 		// the container sleeps: the first connection wakes it through the proxy.
-		for _, b := range svc.Bindings {
-			key := fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)
-			// Build routes through the shared helper: in container_ip mode an
-			// unresolvable proxy IP must surface as an error and skip the
-			// listener, never fall back to 127.0.0.1.
-			route, rerr := gatewayRouteFor(svc.ID, svc.ContainerName, b, s, proxyIP)
-			if rerr == nil {
-				rerr = e.gw.Ensure(route)
+		if foreignSocket {
+			// Prune dead routes the service may still have from before the
+			// switch; its own instance re-creates them when selected again.
+			for _, b := range svc.Bindings {
+				e.gw.Remove(fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort))
 			}
-			if rerr != nil {
-				status = "warning"
-				lastErr = rerr.Error()
-				// If a healthy route is already correct, keep it. Otherwise
-				// remove the stale route so it cannot forward to the wrong IP.
-				if e.gw.Matches(route) {
-					keep[key] = true
-				} else {
-					e.gw.Remove(key)
+		} else {
+			for _, b := range svc.Bindings {
+				key := fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)
+				// Build routes through the shared helper: in container_ip mode an
+				// unresolvable proxy IP must surface as an error and skip the
+				// listener, never fall back to 127.0.0.1.
+				route, rerr := gatewayRouteFor(svc.ID, svc.ContainerName, b, s, proxyIP)
+				if rerr == nil {
+					rerr = e.gw.Ensure(route)
 				}
-			} else {
-				keep[key] = true
-			}
-			if summary != nil && containerSummaryPublishes(*summary, model.PortBinding{
-				HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
-			}) {
-				status = "warning"
-				lastErr = fmt.Sprintf("容器又重新发布了端口 %d，与端口网关冲突（可能有人手动恢复了 Compose 文件）", b.HostPort)
+				if rerr != nil {
+					status = "warning"
+					lastErr = rerr.Error()
+					// If a healthy route is already correct, keep it. Otherwise
+					// remove the stale route so it cannot forward to the wrong IP.
+					if e.gw.Matches(route) {
+						keep[key] = true
+					} else {
+						e.gw.Remove(key)
+					}
+				} else {
+					keep[key] = true
+				}
+				if summary != nil && containerSummaryPublishes(*summary, model.PortBinding{
+					HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
+				}) {
+					status = "warning"
+					lastErr = fmt.Sprintf("容器又重新发布了端口 %d，与端口网关冲突（可能有人手动恢复了 Compose 文件）", b.HostPort)
+				}
 			}
 		}
 		svc.ActiveConnections = e.gw.ActiveConns(svc.ID)
@@ -203,6 +209,30 @@ func (e *Engine) reconcile() {
 		}
 	} else if proxyErr != nil || proxyIns != nil {
 		e.logger.Printf("warn", "代理容器未运行，已托管服务的新连接将无法唤醒")
+	}
+}
+
+// retryPendingRecovery re-runs batch recovery for stuck transactions at most
+// once every two minutes, and only when the proxy admin endpoint answers.
+// It must be called WITHOUT writeMu held: recovery takes recoveryMu → writeMu.
+func (e *Engine) retryPendingRecovery() {
+	running, err := e.store.ListRunningTransactions()
+	if err != nil || len(running) == 0 {
+		return
+	}
+	s := e.settings.Get()
+	e.recoveryMu.Lock()
+	due := time.Since(e.lastRecovery) > 2*time.Minute
+	e.recoveryMu.Unlock()
+	if !due {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	reachable := e.proxyAdminReachable(ctx, s.AdminPort)
+	cancel()
+	if reachable {
+		e.logger.Printf("warn", "仍存在 %d 个未完成事务，重试恢复", len(running))
+		e.RecoverTransactions()
 	}
 }
 

@@ -26,6 +26,14 @@ func (e *Engine) RecoverTransaction(id string) error {
 	// config and transaction rows at once.
 	e.recoveryMu.Lock()
 	defer e.recoveryMu.Unlock()
+	// Lock order is recoveryMu → writeMu → per-file Compose lock everywhere.
+	// writeMu is taken here (not inside the recover*Txn helpers) so a caller
+	// that already holds writeMu cannot self-deadlock, and so recovery can
+	// never run concurrently with an in-flight attach/detach.
+	if !e.writeMu.TryLock() {
+		return errors.New("正在执行接入/恢复等操作，请稍后重试")
+	}
+	defer e.writeMu.Unlock()
 	txn, ok, err := e.store.GetTransaction(id)
 	if err != nil {
 		return err
@@ -34,7 +42,7 @@ func (e *Engine) RecoverTransaction(id string) error {
 		return fmt.Errorf("事务 %s 不存在", id)
 	}
 	if txn.Status != "running" && txn.Status != "rollback_failed" && txn.Status != "needs_repair" {
-		return fmt.Errorf("事务 %s 已是终态 %s", id, txn.Status)
+		return fmt.Errorf("事务 %s 已是终态 %s", txn.ID, txn.Status)
 	}
 	e.lastRecovery = time.Now()
 	switch txn.Kind {
@@ -53,6 +61,15 @@ func (e *Engine) RecoverTransactions() {
 	// reconcile loop and a GUI-triggered resolve can never run concurrently.
 	e.recoveryMu.Lock()
 	defer e.recoveryMu.Unlock()
+	// Same lock order as RecoverTransaction: writeMu is acquired by the
+	// entry point. A busy write lock means an attach/detach is in flight —
+	// skip this round (the reconcile retry will come back) instead of
+	// deadlocking or rolling back a live operation.
+	if !e.writeMu.TryLock() {
+		e.logger.Printf("info", "跳过本轮事务恢复：正在执行写操作")
+		return
+	}
+	defer e.writeMu.Unlock()
 	e.lastRecovery = time.Now()
 	txns, err := e.store.ListRunningTransactions()
 	if err != nil {
@@ -86,7 +103,32 @@ func (e *Engine) RecoverTransactions() {
 	}
 }
 
+// txnStillUnresolved re-reads a transaction after the recovery locks were
+// acquired. The list snapshot was taken before the locks: an attach that was
+// in flight when it was listed may have committed by now, and rolling it back
+// from the stale payload would tear down a healthy service.
+func (e *Engine) txnStillUnresolved(txn state.Transaction) (state.Transaction, bool) {
+	fresh, ok, err := e.store.GetTransaction(txn.ID)
+	if err != nil || !ok {
+		return txn, false
+	}
+	switch fresh.Status {
+	case "running", "rollback_failed", "needs_repair":
+		return fresh, true
+	default:
+		return fresh, false
+	}
+}
+
 func (e *Engine) recoverAttachTxn(txn state.Transaction) {
+	// The caller (RecoverTransactions/RecoverTransaction) holds recoveryMu and
+	// writeMu. Re-validate against the store now that the locks exclude any
+	// in-flight operation.
+	txn, ok := e.txnStillUnresolved(txn)
+	if !ok {
+		e.logger.Printf("info", "事务 %s 已在锁等待期间完成，跳过恢复", txn.ID)
+		return
+	}
 	_, payload, err := e.loadTxn(txn.ID)
 	if err != nil {
 		_ = e.store.FinishTransaction(txn.ID, "rollback_failed", "事务数据损坏: "+err.Error(), "rollback_failed")
@@ -95,12 +137,6 @@ func (e *Engine) recoverAttachTxn(txn state.Transaction) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-
-	// Serialize against attach/detach, which hold writeMu for their whole run.
-	// Without this a recovery could edit a Compose file an in-flight attach is
-	// also editing. Lock order: recoveryMu → writeMu → per-file Compose lock.
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
 
 	// If every item reached committed_item before the crash, the transaction is
 	// effectively committed; only the terminal marker was missing.
@@ -364,6 +400,13 @@ func (e *Engine) inspectContainerBestEffort(ctx context.Context, name string) (*
 // recoverDetachTxn restores the managed state for an interrupted restore/remove
 // operation, because the managed record still exists.
 func (e *Engine) recoverDetachTxn(txn state.Transaction) {
+	// Same coordination as attach recovery: the caller holds recoveryMu and
+	// writeMu; re-validate before trusting the snapshot.
+	txn, ok := e.txnStillUnresolved(txn)
+	if !ok {
+		e.logger.Printf("info", "事务 %s 已在锁等待期间完成，跳过恢复", txn.ID)
+		return
+	}
 	var p detachPayload
 	if err := json.Unmarshal([]byte(txn.Data), &p); err != nil {
 		_ = e.store.FinishTransaction(txn.ID, "rollback_failed", "事务数据损坏: "+err.Error(), "rollback_failed")
@@ -371,11 +414,8 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	// Same coordination as attach recovery: recoveryMu is already held by the
-	// caller; writeMu serializes against attach/detach, the per-file lock
-	// against anything else touching this Compose file.
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	// The per-file lock serializes against anything else touching this
+	// Compose file; recoveryMu/writeMu are already held by the caller.
 	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
 	lock, lerr := e.composeLocker.Acquire(lockCtx, p.Service.ComposeFile)
 	lockCancel()

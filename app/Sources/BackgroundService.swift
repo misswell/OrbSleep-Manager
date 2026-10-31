@@ -256,10 +256,16 @@ final class BackgroundService {
     }
 
     /// Stops the 0.1.x LaunchAgent so the new bundled service can take over.
-    func bootoutLegacyJob() async {
+    /// Throws when the job is still loaded afterwards: a migration that
+    /// believes the old agent is gone while launchd keeps it loaded would
+    /// neither restore nor cleanly replace it.
+    func bootoutLegacyJob() async throws {
         try? await runLaunchctl(["bootout", "gui/\(getuid())/\(Self.legacyLabel)"])
         if FileManager.default.fileExists(atPath: oldPlistURL.path) {
             try? await runLaunchctl(["bootout", "gui/\(getuid())", oldPlistURL.path])
+        }
+        if await isLegacyJobLoaded() {
+            throw BackgroundServiceError.commandFailed("launchctl bootout", -1, "旧 LaunchAgent 仍未卸载")
         }
     }
 

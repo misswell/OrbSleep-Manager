@@ -136,7 +136,11 @@ final class UpdateManager {
 
     /// 替换当前 App Bundle，保留旧版本；新版本必须在 45 秒内通过健康握手
     /// （GUI 正常启动且后台服务版本一致后写入 update-ok），否则自动回滚。
-    func install(package: URL) async throws {
+    ///
+    /// - Parameter expectedNewVersion: 更新源声明的目标版本。握手标记必须用
+    ///   **新包** 的版本：此时 Bundle.main 仍返回旧包的缓存 Info.plist，用它
+    ///   比对新版本会让健康握手永远失败、45 秒后必然回滚。
+    func install(package: URL, expectedNewVersion: String) async throws {
         let appURL = Bundle.main.bundleURL
         let work = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbSleepInstall-\(UUID().uuidString)", isDirectory: true)
@@ -145,6 +149,15 @@ final class UpdateManager {
 
         let newApp = try await extractApp(from: package, into: work)
         try await verifySignature(newApp)
+
+        // The handshake must expect exactly the version that was installed:
+        // appcast version, package version and marker have to agree.
+        let newVersion = Bundle(url: newApp)?.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        guard !newVersion.isEmpty, newVersion == expectedNewVersion else {
+            throw UpdateError.invalidPackage(
+                "新包版本 \(newVersion.isEmpty ? "未知" : newVersion) 与更新源版本 \(expectedNewVersion) 不一致，已中止安装"
+            )
+        }
 
         let supportDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/OrbSleep", isDirectory: true)
@@ -173,7 +186,7 @@ final class UpdateManager {
         let inProgress = supportDir.appendingPathComponent("update-in-progress.json")
         try? FileManager.default.removeItem(at: okMarker)
         let markerPayload: [String: String] = [
-            "expectedVersion": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "",
+            "expectedVersion": newVersion,
             "startedAt": ISO8601DateFormatter().string(from: Date()),
         ]
         if let payload = try? JSONSerialization.data(withJSONObject: markerPayload, options: [.sortedKeys]) {
@@ -186,7 +199,7 @@ final class UpdateManager {
         #!/bin/bash
         set -u
         APP="$1"; OLD="$2"; OLDPID="$3"; OKMARK="$4"
-        rm -f "$OKMARK"
+        rm -f "$OKMARK" || exit 1
         sleep 3
         open -n "$APP" >/dev/null 2>&1
         # Wait for the health handshake instead of a bare process check: a GUI
@@ -195,8 +208,16 @@ final class UpdateManager {
             if [ -f "$OKMARK" ]; then exit 0; fi
             sleep 1
         done
-        rm -rf "$APP"
-        mv "$OLD" "$APP"
+        # Rollback must be all-or-nothing: deleting the new app before the old
+        # one is back in place would leave the machine without the app at all.
+        if ! mv "$APP" "$APP.failed-$$"; then
+            exit 1
+        fi
+        if ! mv "$OLD" "$APP"; then
+            mv "$APP.failed-$$" "$APP"
+            exit 1
+        fi
+        rm -rf "$APP.failed-$$"
         open -n "$APP" >/dev/null 2>&1
         """
         try script.write(to: helper, atomically: true, encoding: .utf8)

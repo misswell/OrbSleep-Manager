@@ -600,7 +600,20 @@ func (e *Engine) syncProxyConfig(ctx context.Context, force bool) error {
 	if err != nil {
 		return err
 	}
-	desired := e.desiredProxyConfig(services)
+	// The proxy only runs on the currently selected Docker instance; services
+	// pinned to another instance are managed by that instance's proxy and must
+	// not be pushed into this one's config.
+	clientSocket := strings.TrimPrefix(strings.TrimSpace(e.settings.Get().DockerSocket), "unix://")
+	if c, derr := e.dockerClient(ctx); derr == nil {
+		clientSocket = strings.TrimPrefix(c.Socket(), "unix://")
+	}
+	scoped := make([]model.Service, 0, len(services))
+	for _, svc := range services {
+		if svc.DockerSocket == "" || svc.DockerSocket == clientSocket {
+			scoped = append(scoped, svc)
+		}
+	}
+	desired := e.desiredProxyConfig(scoped)
 	admin, err := e.adminClient()
 	if err != nil {
 		return err

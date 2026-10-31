@@ -192,6 +192,23 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 
 已知边界见 `docs/RELIABILITY-REPORT.md`。
 
+## 第八轮加固（0.2.2，针对 v0.2.1 复审）
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| Recovery 与 Reconcile 死锁 | `writeMu` 的获取上移到 `RecoverTransactions`/`RecoverTransaction` 入口（TryLock，忙时跳过/报错），`recoverAttachTxn`/`recoverDetachTxn` 不再自行加锁；reconcile 的恢复重试移到取 `writeMu` 之前；拿锁后重新校验事务状态，防止对锁等待期间已完成的接入做陈旧回滚。锁序统一为 `recoveryMu → writeMu → Compose 文件锁`。新增 reconcile 死锁回归、写锁忙跳过、锁等待期间事务完成三个测试 |
+| 应用内升级健康握手必然失败 | `install` 改为接收更新源目标版本，读取**新包** Info.plist 校验三者一致后才写握手标记（旧代码用运行中旧包的缓存版本，新版本握手永远失败）；回滚脚本改为先移走新包、恢复旧包成功后再删除，rm/mv 检查退出状态 |
+| Docker Context 切换保护 | 修复 `SelectDockerContext` 检查 `CountUnresolvedTransactions` 返回值错位（原检查第二返回值）；读库失败 fail-closed；`settings.update` 拒绝 `dockerSocket` 补丁，只能走 `docker.context.select`；reconcile 不再为绑定其他实例的服务创建网关监听（并清除残留死路由）；`syncProxyConfig` 只同步当前实例的服务。保护逻辑抽取为 `ensureContextSwitchSafe` 并单测 |
+| 停止后台导致托管服务失联 | 新增 `CheckStopSafety`：有托管服务或未完成事务时拒绝普通停止（`system.shutdown` 无 `force` 即拒绝，GUI/CLI 绕不过）；重启/升级流程传 `force`（立即重启）；`setAutoStart(false)` 先恢复全部托管服务，失败保留自启动 |
+| 备份恢复不一致 | 备份（方案 B）新增 Compose 快照与每服务稳定备份材料（manifest 声明路径）；恢复时按清单还原文件，目标文件有差异先存 `<file>.pre-restore-<ts>` 证据，写入保留符号链接，路径防 zip-slip；`RestoreBackup` 在有进行中操作/未解决事务时拒绝。新增备份→漂移→恢复往返测试 |
+| 卸载遗漏 rollback_failed 事务 | `PrepareShutdown` 改用 `ListUnresolvedTransactions`（覆盖 running/rollback_failed/needs_repair）且读库失败 fail-closed；GUI `prepareForRemoval` 增加 `system.prepareShutdown` 安全检查后才允许删数据 |
+| 0.1.x 迁移失败丢启动项 | 旧 plist 在任何破坏性步骤前读取；bootout 后校验旧 job 确已卸载（未卸载抛错）；阶段 1 备份失败/停机失败、阶段 2 失败均恢复旧 LaunchAgent |
+| P2：server.go 生命周期 | `baseCtx` 在 `New` 时创建（修复未处理任何请求时 Close 调 nil cancel panic）；Accept 后在 `connMu` 内复查 closing 再登记连接，消除 Close 与 WaitGroup 竞争。新增无请求 Close 回归测试 |
+| P2：其他 | `CoreClient` 对 `system.recover`/`recovery.resolve` 用 960 秒超时（同步恢复最长 15 分钟）；dockerClient 检测改 singleflight，并发首个请求不再误报不可用；`doctorPassed` 空列表不再算通过；`UpdateSettings` 的 `ListServices` 错误不再忽略；`GetService` 改主键直查（原为全表扫描）；操作日志上限 400 条并留省略标记（控制整条 JSON 重写的写放大）；`CreatePlan` 不再持有全局写锁（apply 时有内容校验兜底） |
+| 测试环境 | `TestDaemonAPIRoundTrip` 断言依赖"Docker 不可达"，在运行真实 Docker 的机器上必然失败；加环境守卫，CI（无 Docker）照常执行 |
+
+`go vet ./...`、`go test -race -count=1 ./...` 全部通过（新增 10 个回归测试）；Debug app 构建通过。本轮未在真实 OrbStack 上重跑 phase0 与"有托管服务时停止后台/卸载/备份恢复"的手工故障注入，建议发布前在真机补验。
+
 ## 未验证 / 未实现
 
 - 特权端口助手（<1024）、UDP、IPv6、多 Compose 文件自动修改、`extends`/锚点。

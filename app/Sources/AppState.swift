@@ -959,6 +959,21 @@ final class AppState {
                 }
             }
         } else {
+            // After a reboot no daemon would come back: managed services would
+            // keep their ports removed while nothing listens on them. Restore
+            // everything first and refuse when that fails.
+            await refreshServices()
+            if !services.isEmpty {
+                if !(await restoreAllManagedServices()) {
+                    showError("恢复托管服务失败，已保留开机自启动。请先在服务列表中恢复后再关闭。")
+                    return
+                }
+                await refreshServices()
+                if !services.isEmpty {
+                    showError("仍有托管服务未恢复，已保留开机自启动。")
+                    return
+                }
+            }
             try? await backgroundService.unregister()
             await backgroundService.removeLegacyAgent()
         }
@@ -1025,11 +1040,17 @@ final class AppState {
         }
     }
 
-    private func stopServiceLocked() async {
+    /// - Parameter force: 重启/升级流程在自身保护后立即拉起新进程，用 force
+    ///   跳过托管服务检查；普通「停止」不 force，由后台 fail-closed 拒绝。
+    private func stopServiceLocked(force: Bool = false) async {
         lastStopConfirmed = false
         if daemonReachable {
             do {
-                let result = try await client.call("system.shutdown", as: ShutdownResult.self)
+                let result = try await client.call(
+                    "system.shutdown",
+                    params: ["force": .bool(force)],
+                    as: ShutdownResult.self
+                )
                 if result.ok == false {
                     showError("后台服务拒绝了停止请求，未执行后续操作。")
                     return
@@ -1055,7 +1076,7 @@ final class AppState {
             guard !isBusyService else { return }
             isBusyService = true
             defer { isBusyService = false }
-            await stopServiceLocked()
+            await stopServiceLocked(force: true)
             // If the old process never exited, "start" would just re-probe the
             // still-running daemon and report success without a real restart.
             guard lastStopConfirmed else { return }
@@ -1237,6 +1258,21 @@ final class AppState {
         await refreshServices()
         if !services.isEmpty {
             showError("仍有 \(services.count) 个托管服务未恢复，已中止卸载。请先恢复这些服务后再卸载。")
+            return false
+        }
+
+        // 2b. The board must also be free of unresolved work: rollback_failed /
+        // needs_repair transactions whose service record never existed, and
+        // running operations. Their recovery material lives only in the data
+        // directory this flow is about to remove — fail closed instead.
+        do {
+            let prep = try await client.call("system.prepareShutdown", as: ShutdownPreparation.self)
+            if prep.safe == false {
+                showError("存在未完成的操作或事务（\(prep.message ?? "")）。请先在「诊断与修复」中处理后再卸载。")
+                return false
+            }
+        } catch {
+            showError("无法确认卸载安全状态（\(errorMessage(error))）。已中止卸载。")
             return false
         }
 
@@ -1487,7 +1523,8 @@ final class AppState {
 
     /// 自检是否真正通过（必须加载成功且没有失败项）。
     var doctorPassed: Bool {
-        doctorLoadState == .succeeded && doctorChecks.allSatisfy { $0.statusValue != .fail }
+        doctorLoadState == .succeeded && !doctorChecks.isEmpty
+            && doctorChecks.allSatisfy { $0.statusValue != .fail }
     }
 
     // MARK: 操作记录
@@ -1754,7 +1791,7 @@ final class AppState {
                     }
                 }
                 updateStatus = .installing
-                try await updateManager.install(package: package)
+                try await updateManager.install(package: package, expectedNewVersion: update.version)
             } catch {
                 updateStatus = .failed(error.localizedDescription)
                 showError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -1821,6 +1858,20 @@ final class AppState {
             return
         }
 
+        // The old plist is the rollback material for every destructive step
+        // below. Read it before touching launchd: once the job is booted out
+        // there is no second chance to save it.
+        let savedPlist = backgroundService.readOldPlistData()
+        // Restore the old agent after a mid-migration failure. Without this a
+        // backup failure would leave the old service unloaded and unstarted.
+        var legacyBootedOut = false
+        func restoreLegacyAgent() async {
+            if legacyBootedOut, let savedPlist {
+                _ = await backgroundService.reinstallLegacyPlist(data: savedPlist)
+                legacyBootedOut = false
+            }
+        }
+
         if await probeDaemon() && legacy.daemonExists {
             await refreshStatus(silent: true)
         }
@@ -1845,7 +1896,11 @@ final class AppState {
                 showError("迁移中止：安全检查失败（\(errorMessage(error))）。")
                 return
             }
-            _ = try? await client.call("system.shutdown", as: ShutdownResult.self)
+            _ = try? await client.call(
+                "system.shutdown",
+                params: ["force": .bool(true)],
+                as: ShutdownResult.self
+            )
             if !(await waitForDaemonToStop(seconds: 10)) {
                 backgroundService.terminateLegacyDaemon()
                 _ = await waitForDaemonToStop(seconds: 8)
@@ -1860,19 +1915,33 @@ final class AppState {
                     return
                 }
             }
-            await backgroundService.bootoutLegacyJob()
+            do {
+                try await backgroundService.bootoutLegacyJob()
+                legacyBootedOut = true
+            } catch {
+                showError("无法卸载旧 LaunchAgent（\(errorMessage(error))）。已中止迁移，旧服务保持原状。")
+                return
+            }
             if !(await waitForDaemonToStop(seconds: 5)) {
                 showError("旧后台服务仍未退出，已中止迁移。")
+                await restoreLegacyAgent()
                 return
             }
             if !backupDataFilesForMigration() {
+                await restoreLegacyAgent()
                 return
             }
         }
 
-        // 阶段 2：移除旧 LaunchAgent（内容先留作回滚材料）。
-        let savedPlist = backgroundService.readOldPlistData()
-        await backgroundService.bootoutLegacyJob()
+        // 阶段 2：移除旧 LaunchAgent（内容已留作回滚材料）。
+        do {
+            try await backgroundService.bootoutLegacyJob()
+            legacyBootedOut = true
+        } catch {
+            showError("无法卸载旧 LaunchAgent（\(errorMessage(error))）。已中止迁移。")
+            await restoreLegacyAgent()
+            return
+        }
         try? backgroundService.removeOldPlist()
         _ = await waitForDaemonToStop(seconds: 5)
 
@@ -1970,7 +2039,12 @@ final class AppState {
                 showError("仍有 \(services.count) 个托管服务，暂不能清理旧组件。")
                 return
             }
-            await backgroundService.bootoutLegacyJob()
+            do {
+                try await backgroundService.bootoutLegacyJob()
+            } catch {
+                showError("无法卸载旧 LaunchAgent（\(errorMessage(error))）。已中止清理。")
+                return
+            }
             try? backgroundService.removeOldPlist()
             do {
                 let removed = try await backgroundService.cleanupLegacyBinaries()

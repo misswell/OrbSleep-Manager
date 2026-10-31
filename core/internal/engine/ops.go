@@ -1,11 +1,17 @@
 package engine
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
 	"orbsleep/internal/model"
 )
+
+// maxOperationLogEntries bounds one operation's log. Every add() re-serializes
+// the whole log into a single UPDATE; without a cap a long batch attach would
+// rewrite an ever-growing JSON blob on every step.
+const maxOperationLogEntries = 400
 
 type opLogger struct {
 	e  *Engine
@@ -39,6 +45,14 @@ func (l *opLogger) add(level, msg string) {
 		Level:   level,
 		Message: msg,
 	})
+	if len(l.op.Log) > maxOperationLogEntries {
+		dropped := len(l.op.Log) - maxOperationLogEntries
+		l.op.Log = append([]model.LogEntry{{
+			At:      time.Now().UTC().Format(time.RFC3339),
+			Level:   "warn",
+			Message: fmt.Sprintf("…（日志过长，已省略最早的 %d 条）", dropped),
+		}}, l.op.Log[dropped:]...)
+	}
 	cp := l.op
 	l.mu.Unlock()
 	l.e.logger.Printf(level, "%s: %s", cp.ID, msg)

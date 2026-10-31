@@ -37,10 +37,10 @@ type planSnapshot struct {
 }
 
 // CreatePlan validates the selected containers and produces a dry-run plan.
+// It is deliberately read-only: no writeMu is held. An attach that races the
+// plan is caught at apply time — attachOne re-reads the Compose file and
+// refuses when it no longer matches the plan's snapshot.
 func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (model.Plan, error) {
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-
 	plan := model.Plan{
 		ID:        newID("plan"),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),

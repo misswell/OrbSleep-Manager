@@ -37,9 +37,8 @@ type Server struct {
 	// baseCtx is canceled by Close so in-flight request handlers stop doing
 	// work instead of running to completion (or their own 10-minute timeout)
 	// while the process is shutting down.
-	baseCtx     context.Context
-	baseCancel  context.CancelFunc
-	baseCtxOnce sync.Once
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
 }
 
 type request struct {
@@ -88,7 +87,16 @@ func New(path string, eng *engine.Engine) (*Server, error) {
 		ln.Close()
 		return nil, err
 	}
-	return &Server{eng: eng, ln: ln, path: path, closing: make(chan struct{}), conns: map[net.Conn]struct{}{}}, nil
+	// The base context must exist from the start: Close() cancels it, and a
+	// daemon that never served a request has no lazily-created cancel func —
+	// calling nil there would panic.
+	baseCtx, baseCancel := context.WithCancel(context.Background())
+	return &Server{
+		eng: eng, ln: ln, path: path,
+		closing: make(chan struct{}),
+		conns:   map[net.Conn]struct{}{},
+		baseCtx: baseCtx, baseCancel: baseCancel,
+	}, nil
 }
 
 // Path returns the socket path.
@@ -109,10 +117,21 @@ func (s *Server) Serve() error {
 			}
 			return err
 		}
+		// Register the connection under connMu and re-check closing first.
+		// Close closes every tracked connection and then waits on wg; a conn
+		// accepted between Accept returning and registration must either be
+		// tracked (and closed + waited) or see closing and drop itself.
 		s.connMu.Lock()
+		select {
+		case <-s.closing:
+			s.connMu.Unlock()
+			conn.Close()
+			return nil
+		default:
+		}
 		s.conns[conn] = struct{}{}
-		s.connMu.Unlock()
 		s.wg.Add(1)
+		s.connMu.Unlock()
 		go func() {
 			defer s.wg.Done()
 			s.handleConn(conn)
@@ -127,7 +146,7 @@ func (s *Server) Serve() error {
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closing)
-		s.baseCtxOnce.Do(s.baseCancel)
+		s.baseCancel()
 		s.ln.Close()
 		// Close idle GUI connections so shutdown cannot hang on a client that
 		// holds the socket open without sending requests.
@@ -195,9 +214,6 @@ func (s *Server) dispatch(req request) response {
 		resp.Error = &apiError{Code: "invalid_request", Message: "未知方法: " + req.Method}
 		return resp
 	}
-	s.baseCtxOnce.Do(func() {
-		s.baseCtx, s.baseCancel = context.WithCancel(context.Background())
-	})
 	ctx, cancel := context.WithTimeout(s.baseCtx, 10*time.Minute)
 	defer cancel()
 	result, err := h(ctx, req.Params)
@@ -220,7 +236,24 @@ func (s *Server) handlers() map[string]handler {
 		"ping": func(ctx context.Context, _ json.RawMessage) (any, error) {
 			return map[string]any{"pong": true, "version": s.eng.Version()}, nil
 		},
-		"system.shutdown": func(ctx context.Context, _ json.RawMessage) (any, error) {
+		"system.shutdown": func(ctx context.Context, params json.RawMessage) (any, error) {
+			// Fail-closed stop guard: a plain stop with managed services would
+			// leave them without gateway listeners (their original host ports
+			// live inside this process), and unresolved transactions would be
+			// left dangling. Restart/upgrade/uninstall flows pass force=true
+			// after their own protections (immediate relaunch, service restore,
+			// transaction resolution).
+			var p struct {
+				Force bool `json:"force"`
+			}
+			if len(params) > 0 {
+				if err := decode(params, &p); err != nil {
+					return nil, err
+				}
+			}
+			if err := s.eng.CheckStopSafety(p.Force); err != nil {
+				return nil, err
+			}
 			// Respond first, then let Serve() unwind and main finish the
 			// in-flight transactions before the process exits.
 			go func() {

@@ -38,6 +38,7 @@ type Engine struct {
 	cli        composeCLI
 	dockerErr  string
 	lastDetect time.Time
+	detectCh   chan detectResult
 	lastErr    model.LastError
 	scanCache  []model.Container
 	scanAt     time.Time
@@ -372,8 +373,12 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 		}
 	}
 	if v, ok := patch["dockerSocket"]; ok {
-		if str, ok := v.(string); ok {
-			s.DockerSocket = str
+		// The Docker socket decides which containers attach/recovery operate
+		// on. Changing it silently here would bypass every guard of
+		// docker.context.select (managed services, unresolved transactions,
+		// reachability). It must go through SelectDockerContext.
+		if str, ok := v.(string); ok && strings.TrimPrefix(strings.TrimSpace(str), "unix://") != strings.TrimPrefix(strings.TrimSpace(s.DockerSocket), "unix://") {
+			return s, errors.New("Docker Socket 只能通过 docker.context.select 切换（该入口会检查托管服务与未完成事务）")
 		}
 	}
 	if s.AdminPort < 1 || s.AdminPort > 65535 || s.WebPort < 1 || s.WebPort > 65535 {
@@ -403,7 +408,12 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 		}
 	}
 	// Refuse a range change that would orphan already managed services.
-	services, _ := e.store.ListServices()
+	// A failed read is not a clean board: fail closed instead of letting the
+	// change through unchecked.
+	services, err := e.store.ListServices()
+	if err != nil {
+		return s, fmt.Errorf("读取托管服务失败，拒绝修改端口范围: %w", err)
+	}
 	for _, svc := range services {
 		for _, b := range svc.Bindings {
 			if b.ProxyPort < s.ProxyPortStart || b.ProxyPort > s.ProxyPortEnd {
@@ -413,9 +423,6 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 	}
 	if err := e.settings.Save(s); err != nil {
 		return s, err
-	}
-	if old.DockerSocket != s.DockerSocket {
-		e.invalidateDocker()
 	}
 	e.logger.Printf("info", "设置已更新: 空闲超时 %ds，端口范围 %d-%d", s.IdleTimeoutSecs, s.ProxyPortStart, s.ProxyPortEnd)
 	e.triggerReconcile()
@@ -448,23 +455,47 @@ func (e *Engine) Logs(limit int) ([]model.LogEntry, error) {
 	return out, nil
 }
 
+// detectResult is shared by every goroutine waiting on one detection run:
+// without singleflight, concurrent first callers each saw "Docker 不可用"
+// while the very first detection was still in progress.
+type detectResult struct {
+	c   *dockerx.Client
+	err error
+}
+
 func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
-	e.mu.Lock()
-	if e.docker != nil {
-		c := e.docker
-		e.mu.Unlock()
-		return c, nil
-	}
-	if time.Since(e.lastDetect) < 3*time.Second {
-		msg := e.dockerErr
-		e.mu.Unlock()
-		if msg == "" {
-			msg = "Docker 不可用"
+	for {
+		e.mu.Lock()
+		if e.docker != nil {
+			c := e.docker
+			e.mu.Unlock()
+			return c, nil
 		}
-		return nil, errors.New(msg)
+		if e.detectCh != nil {
+			ch := e.detectCh
+			e.mu.Unlock()
+			// A detection is already running: wait for its result instead of
+			// failing this request spuriously.
+			select {
+			case res := <-ch:
+				return res.c, res.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if !e.lastDetect.IsZero() && time.Since(e.lastDetect) < 3*time.Second {
+			msg := e.dockerErr
+			e.mu.Unlock()
+			if msg == "" {
+				msg = "Docker 不可用"
+			}
+			return nil, errors.New(msg)
+		}
+		e.lastDetect = time.Now()
+		e.detectCh = make(chan detectResult, 1)
+		e.mu.Unlock()
+		break
 	}
-	e.lastDetect = time.Now()
-	e.mu.Unlock()
 
 	detectCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
@@ -481,10 +512,14 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 	} else {
 		c, err = dockerx.Detect(detectCtx)
 	}
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	ch := e.detectCh
+	e.detectCh = nil
 	if err != nil {
 		e.dockerErr = err.Error()
+		e.mu.Unlock()
+		ch <- detectResult{err: err}
 		return nil, err
 	}
 	e.docker = c
@@ -492,6 +527,8 @@ func (e *Engine) dockerClient(ctx context.Context) (*dockerx.Client, error) {
 	if cli, cliErr := dockercli.Find(c.DockerHost()); cliErr == nil {
 		e.cli = cli
 	}
+	e.mu.Unlock()
+	ch <- detectResult{c: c}
 	return c, nil
 }
 
