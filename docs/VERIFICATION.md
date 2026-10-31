@@ -207,7 +207,24 @@ cd app && xcodegen generate && xcodebuild -project OrbSleepManager.xcodeproj \
 | P2：其他 | `CoreClient` 对 `system.recover`/`recovery.resolve` 用 960 秒超时（同步恢复最长 15 分钟）；dockerClient 检测改 singleflight，并发首个请求不再误报不可用；`doctorPassed` 空列表不再算通过；`UpdateSettings` 的 `ListServices` 错误不再忽略；`GetService` 改主键直查（原为全表扫描）；操作日志上限 400 条并留省略标记（控制整条 JSON 重写的写放大）；`CreatePlan` 不再持有全局写锁（apply 时有内容校验兜底） |
 | 测试环境 | `TestDaemonAPIRoundTrip` 断言依赖"Docker 不可达"，在运行真实 Docker 的机器上必然失败；加环境守卫，CI（无 Docker）照常执行 |
 
-`go vet ./...`、`go test -race -count=1 ./...` 全部通过（新增 10 个回归测试）；Debug app 构建通过。本轮未在真实 OrbStack 上重跑 phase0 与"有托管服务时停止后台/卸载/备份恢复"的手工故障注入，建议发布前在真机补验。
+`go vet ./...`、`go test -race -count=1 ./...` 全部通过（新增 11 个回归测试，含异实例 reconcile 隔离）；Debug app 构建通过。
+
+真实 OrbStack 故障注入（2026-10-31，新增 `scripts/phase1_lifecycle.py`，独立数据目录、复用现有代理容器）：
+
+```
+▶ A1 有托管服务时 system.shutdown（无 force）被拒绝，进程与监听正常   OK
+▶ A2 force 停止 → 进程退出                                          OK
+▶ A3 重启后监听在 API 之前恢复，原端口立即可达                        OK
+▶ B1 backup.create（含 Compose 快照）                                OK
+▶ B3 恢复备份：Compose 还原为托管内容、漂移以 .pre-restore 保留、
+     服务仍托管、原端口可达                                          OK
+▶ B4 CLI restore 后 Compose 逐字节还原、容器直接发布                  OK
+▶ C2 注入 rollback_failed 事务后：prepareShutdown.safe=false、
+     system.shutdown 拒绝、backup.restore 拒绝（fail-closed）         OK
+▶ C3 清除注入事务后 prepareShutdown.safe=true                        OK
+```
+
+同日 `phase0.py`（隔离数据目录）全流程通过：接入 → 原地址 200 → 停止唤醒 → 空闲自动停止 → 恢复逐字节一致。首个 phase0 运行曾报失败，但守护进程日志显示各步（含恢复与连通性）均成功，系与 phase1 清理窗口重叠（共享代理容器）的环境竞争，干净重跑通过。
 
 ## 未验证 / 未实现
 

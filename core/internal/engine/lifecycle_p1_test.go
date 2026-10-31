@@ -4,10 +4,12 @@ import (
 	"archive/zip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"orbsleep/internal/gateway"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 )
@@ -394,4 +396,50 @@ func TestBackupWithoutServicesHasNoFileEntries(t *testing.T) {
 			t.Fatalf("unexpected file entry %q in a service-free backup", f.Name)
 		}
 	}
+}
+
+// P1-03 isolation: services pinned to a different Docker instance must not
+// get gateway listeners from this instance's reconcile, and stale routes for
+// them are pruned. Two instances can run same-named containers.
+func TestReconcileSkipsForeignSocketServices(t *testing.T) {
+	admin := newFakeAdmin(t)
+	docker := newFakeDocker(t, "demo-web-1", "abc123", nil)
+	e, _ := testEngine(t, admin, docker, &fakeCLI{configFn: composeConfigFor(nil), docker: docker})
+	hostPort := freePort(t)
+	bindings := []model.Binding{{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 80, ProxyPort: freePort(t), Protocol: "tcp"}}
+	svc := model.Service{ID: "svc-foreign",
+		// The pinned instance runs a container with this ID; the fake daemon
+		// on this instance does not know it, like a real cross-instance case.
+		ContainerID: "foreign-id", ContainerName: "demo-web-1",
+		ComposeProject: "demo", ComposeService: "web",
+		ComposeFile: filepath.Join(t.TempDir(), "docker-compose.yml"),
+		Status:      "managed_running", StartTimeoutSecs: 1,
+		DockerSocket: "/tmp/other-docker.sock", // pinned to a different instance
+		Bindings:     bindings}
+	if err := e.store.UpsertService(svc); err != nil {
+		t.Fatal(err)
+	}
+	// A stale listener from before the switch must be pruned.
+	stale := gateway.Route{Key: svc.ID + "|127.0.0.1|" + itoa(hostPort), ServiceID: svc.ID,
+		BindHost: "127.0.0.1", BindPort: hostPort, TargetHost: "127.0.0.1", TargetPort: bindings[0].ProxyPort}
+	if err := e.gw.Ensure(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	e.reconcile()
+
+	if keys := e.gw.RouteKeys(); len(keys) != 0 {
+		t.Fatalf("foreign-socket service must not keep listeners, got %v", keys)
+	}
+	got, ok, _ := e.store.GetService(svc.ID)
+	if !ok {
+		t.Fatal("record missing")
+	}
+	if got.Status != "missing" || !strings.Contains(got.LastError, "Docker 实例") {
+		t.Fatalf("foreign service must warn about its instance: %+v", got)
+	}
+}
+
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }
