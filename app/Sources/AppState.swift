@@ -1865,6 +1865,9 @@ final class AppState {
         if !fm.createFile(atPath: dir.appendingPathComponent("update-ok").path, contents: Data()) {
             return
         }
+        // The update proved healthy: trim the rollback copies to two now, so a
+        // machine that updates often does not accumulate whole app bundles.
+        UpdateManager.cleanupAppBackups(in: dir.appendingPathComponent("app-backup", isDirectory: true), keeping: 2)
         try? fm.removeItem(at: inProgress)
         // Remove the handshake file once the script had a chance to see it.
         try? await Task.sleep(nanoseconds: 10_000_000_000)

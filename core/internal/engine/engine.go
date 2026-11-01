@@ -566,14 +566,14 @@ func (e *Engine) cliRunner() (composeCLI, error) {
 	c := e.docker
 	gen := e.dockerGeneration
 	e.mu.Unlock()
-	if cli != nil && gen == e.dockerGeneration {
-		// Cached runner matches the current environment generation.
+	if cli != nil {
+		// Every environment switch clears the cached runner in the same critical
+		// section that bumps the generation, so a non-nil runner read under the
+		// lock is by definition the current environment's. Comparing
+		// e.dockerGeneration a second time outside the lock was both redundant
+		// and a data race against invalidateDocker.
 		return cli, nil
 	}
-	e.mu.Lock()
-	c = e.docker
-	gen = e.dockerGeneration
-	e.mu.Unlock()
 	if c == nil {
 		return nil, errors.New("Docker 不可用")
 	}

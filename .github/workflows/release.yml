@@ -85,6 +85,10 @@ jobs:
           go vet ./...
           go test -race ./...
 
+      - name: Run update rollback fault injection
+        shell: bash
+        run: ./scripts/update_rollback_check.sh
+
       - name: Import Developer ID certificate
         shell: bash
         run: |

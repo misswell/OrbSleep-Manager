@@ -323,6 +323,53 @@ P2：`Status()` 的 LastError 在本轮计算完成后读取（不返回旧值�
 
 新增 6 个回归测试（共 23 个本轮以来新增）；`go vet ./...`、`go test -race -count=1 ./...` 全部通过；App 构建通过。真机（2026-10-31）：`phase1_lifecycle.py` A/B/C 全过、`phase0.py` 全流程通过。
 
+## 第十二轮加固（0.2.8，针对 v0.2.7 复审）
+
+复审结论：修复方向正确，但部分修复只写进了 Commit 描述与验证文档，没有完整落到生产代码。本轮把恢复事务做成真正的闭环，并补齐审查列出的 10 个缺失故障注入场景。
+
+P0（恢复事务闭环）：
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| 回滚失败后 Journal 被删，半成品状态无据可查 | 所有已记账失败的唯一出口 `abandonRestoreTransaction`：回滚关联文件 → 还原原库/WAL/SHM → 隔离请求；**只有两步回滚都确认成功才删 Journal**，否则保留 Journal 与快照作为唯一描述。`TestRestoreKeepsEvidenceWhenRollbackCannotComplete`（原始文件回滚失败后重启：Journal/快照仍在，第二次 `ApplyPendingRestore` 返回且不再触碰任何文件） |
+| 用「快照里有没有 sidecar」推断数据库是否已 rename | 快照无论 swap 是否发生都持有原 WAL/SHM，那个信号证明不了任何事。改为在 `DATABASE_COMMITTING` 之前持久化暂存库的 SHA-256（`DatabaseSHA256`），恢复时与活库逐字节比对：一致 = rename 已落地、只补做记录与清理；不一致才真正移动 sidecar + `os.Rename` + 目录同步。`TestRestoreCompletesWhenRenameLandedBeforeJournalWrite`、`TestRestoreDoesNotTrustSnapshotSidecarsAsCompletionProof`（占位摘要 + 快照 WAL 存在 + 活库仍是原库 → 必须真的执行替换，且活 WAL 进快照不被销毁） |
+| 数据库回滚与文件回滚是两套，可能留下「旧库 + 已回滚文件」 | `restoreOriginalDatabase` 成为统一的库回滚：主文件处理完**继续走 sidecar 分支**（swap 可能已把活 WAL 搬进快照，提前返回会丢已提交记录）；快照没有的活 sidecar 必须删除，否则旧主文件旁挂着新库的 WAL。`HadOriginalDB` 三态：`nil`（旧版写入器未记录）绝不删活库、`true` 快照缺原库即报错并保留 Journal、`false` 才删除恢复自己创建的库。`TestRestoreRollbackDatabaseTriState` |
+| 暂存库/备份 ZIP 在恢复登记后消失 | `TestRestoreRebuildsLostStagedDatabaseFromBackup`（暂存丢失、备份仍在 → 从归档重建并继续提交）；`TestRestoreRollsBackWhenStagedAndBackupAreBothLost`（两者皆失 → 报「暂存数据库丢失」「已回滚到原始状态」，Compose/库/WAL 全部复原）；`TestRestoreRefusesDeletedBackupBeforeJournalling`（请求时即拒绝：不写 Journal、不建快照、活数据未变、请求被隔离） |
+| 未知阶段仍可能动手 | `ApplyPendingRestore` 新增 `default`：阶段无法映射到磁盘状态时 fail-closed，保留请求与 Journal。`TestRestoreUnknownPhaseFailsClosed`；Journal 不可读同样隔离且不触碰文件（`TestRestoreCorruptJournalQuarantinesWithoutTouching`） |
+
+P1：
+
+| 问题 | 修复 |
+|---|---|
+| maintenance 标志未挡住全部写入口 | `ensureNoUnresolvedWork` 第一行检查维护标志，由 `beginSafeWrite` 与全部同步写入口共用。`TestMaintenanceGateFreezesConcurrentBusinessWrites`：顺序断言 `UpdateSettings`/`ServiceAction(start)`/`ServiceAction(updatePolicy)`/`ProxySetup` 均返回「冻结」，再 32 个并发调用（写锁竞争失败也算拒绝，但不得有任何成功、设置不变），重复恢复请求被拒，`Health`/`RecoveryList` 读侧仍可用，清除标志后冻结消失 |
+| Compose 注册表只在测试 Fixture 里注册 | `attachOne` 在任何编辑前调用 `registerKnownComposePath`，注册失败即中止接入——不托管一个恢复路径认不出的文件；detach 不注销，服务删除后其文件仍可被历史备份寻址。`TestDeletedServiceComposeFileStaysRestorable` 走真实接入路径断言生产写入注册表，并把注册表清空作对照（`RestoreBackup` 报「拒绝恢复」） |
+| 快照/暂存/Journal/marker 写入留在 page cache | 新增 `writeFileSynced`/`copyFileSynced`（flush + 检查 `Close` 错误 + 同步所在目录）用于请求 marker、Journal、原始库与 sidecar 快照、回滚还原；rename 与 sidecar 移动后同步源、目标两侧目录 |
+| `state.sqlite` 解压仍受 64MiB 限制 | 上限在 `validateBackupZip` 与解压端共用同一组常量（512 条目、普通条目 64MiB、`state.sqlite` 256MiB、总量 1GiB），`extractZipEntry` 显式接收上限。`TestStagedDatabaseExceedsPerFileCap`：65MiB 且带真实 SQLite 头的库通过校验、按 256MiB 可解压、按 64MiB 必须拒绝并清理临时文件（`-short` 跳过） |
+| 清理顺序可让「有 marker 无 Journal」被当成新请求重放 | `finishRestoreCleanup` 先删 marker → 同步目录 → 再删 Journal → 同步；marker 删不掉（权限）时保留 Journal，下次启动重跑清理。`TestFinishRestoreCleanupKeepsJournalWhileMarkerIsStuck`（dataDir 置 0500 制造 EACCES，本轮不清、下轮清）、`TestRestoreCommittedPhaseNeverReplaysOverLaterEdits` |
+| 代理端口只保留第一条绑定 | `PublishedPort` 改为持有**全部** `HostBinding`：逐条判定，回环外绑定（`""`/`0.0.0.0`/`::`/可路由地址）报 `proxy_port_exposed`，没有 127.0.0.1 绑定报 `proxy_port_not_loopback`，端口不符报 `proxy_port_mismatch`；`buildPlanItem` 的内联重复检查收敛到同一函数 |
+| UpdateManager 部分复制失败后无法回滚 | `restorePreviousApp`（static、`-> Never`、可注入失败）：先把安装位置上的半套新包移到 `failed-*`，放回旧包，**从磁盘重读 Info.plist** 校验 Bundle ID 与版本号（`Bundle(url:)` 会命中刚被替换路径的缓存），通过后才删残留；任何一步失败都不让安装位置为空。`copyItem` / 助手脚本写入 / 助手启动三个 catch 站点全部走同一路径 |
+
+P2：`cliRunner` 不再在锁外二次读 `dockerGeneration`（环境切换在同一临界区清空缓存并递增代际，锁内读到非 nil 即当前代际）；`ApplyPlan` 的过期计划删除移入 `plansMu` 临界区；`CreatePlan` 入库前复查代际，切换则报「请重新扫描」。`sanitizeRestoreMode` 只保留低 9 位、剥掉 world-writable 与 setuid/setgid/目录位、0 兜底 0644（`TestSanitizeRestoreModeStripsPrivilegedBits` 固定 `0o7777 → 0o775` 契约）。App 备份裁剪按文件名 `backupTimestamp` 排序（Finder 复制会保留内容时间，用 `contentModificationDate` 会先把最新回滚候选删掉），`failed-*` 证据不参与裁剪，健康握手成功后收敛为 2 份。
+
+## 恢复与更新故障注入覆盖（审查 §5 的 10 个场景）
+
+| # | 场景 | 测试 |
+|---|---|---|
+| 1 | Journal 写入后、Compose 写入前崩溃 | `TestRestoreCrashBeforeFileCommitTouchesNothing`（新增） |
+| 2 | Compose 写入后、数据库提交前崩溃 | `TestRestoreJournalResumesAfterCrashInDatabasePhase`（既有） |
+| 3 | rename 成功后、Journal 更新前崩溃 | `TestRestoreCompletesWhenRenameLandedBeforeJournalWrite`、`TestRestoreDoesNotTrustSnapshotSidecarsAsCompletionProof`（新增） |
+| 4 | 暂存库丢失、原始 WAL 存在 | `TestRestoreRebuildsLostStagedDatabaseFromBackup`、`TestRestoreRollbackDatabaseTriState`（新增） |
+| 5 | 原始文件回滚失败后重启 | `TestRestoreKeepsEvidenceWhenRollbackCannotComplete`（新增） |
+| 6 | 备份 ZIP 在恢复请求登记后被删除 | `TestRestoreRefusesDeletedBackupBeforeJournalling`、`TestRestoreRollsBackWhenStagedAndBackupAreBothLost`（新增） |
+| 7 | maintenance 状态下并发调用业务 API | `TestMaintenanceGateFreezesConcurrentBusinessWrites`（新增，32 并发） |
+| 8 | 一个代理端口同时有 IPv4 回环与公网绑定 | `TestPlanValidatesProxyPublishedPorts` 的 "every binding is checked, not just the first"（生产端 0.2.8 才真正保留全部绑定） |
+| 9 | 已删除服务的历史 Compose 文件恢复 | `TestDeletedServiceComposeFileStaysRestorable`（新增，注册表由生产接入路径写入） |
+| 10 | 新 App 部分复制失败后的旧版本恢复 | `app/Tests/UpdateRollbackProbe.swift`（新增 4 项：半套包回滚、旧包缺失不放空安装位、恢复身份不符拒绝、按文件名时间戳裁剪）经 `make swift-check` 与 release workflow 执行 |
+
+故障注入一律用磁盘上的崩溃态夹具驱动真实 `ApplyPendingRestore`（Journal 由生产 `writeRestoreJournal` 写出），断言的是磁盘结果而非内部调用次数；Swift 探针直接编译生产 `UpdateManager.swift` 运行真实函数。`core/internal/engine/restore_p0_test.go` 新增 16 个测试。
+
+验证（2026-11-01）：`gofmt -l core` 无输出；`go vet ./...` 通过；`go test -race -count=1 ./...` 全部包 `ok`（engine 13.0s）；`make app` `** BUILD SUCCEEDED **`（`SWIFT_STRICT_CONCURRENCY: complete`）；`make swift-check` 通过，并对「还原失败未把残留移回」做变异检验——删掉该行后探针以 `FAIL 安装位置不得为空` 退出 1。本轮**未**复跑真机 `make phase0`/`make phase1`（需 OrbStack，发布前补跑）。
+
 ## 未验证 / 未实现
 - 每实例独立代理（容器名/管理端口/发布端口范围按 Docker 实例隔离）：当前一台机器一个代理容器；跨实例接入由 plan 阶段 `proxy_not_on_current_instance` 阻塞兜底。
 

@@ -3,7 +3,9 @@ package engine
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,6 +124,9 @@ func (e *Engine) beginSafeWrite() (func(), error) {
 // its stale snapshot. Database read errors fail closed. Recovery operations
 // themselves are the only callers exempt from this gate.
 func (e *Engine) ensureNoUnresolvedWork() error {
+	if e.maintenance.Load() {
+		return errors.New("有待应用的备份恢复请求；在后台重启应用该请求前已冻结所有写入操作")
+	}
 	txns, err := e.store.ListUnresolvedTransactions()
 	if err != nil {
 		return fmt.Errorf("读取未完成事务失败，已拒绝操作: %w", err)
@@ -793,12 +798,17 @@ func (e *Engine) RestoreBackup(idOrPath string) (model.RestoreResult, error) {
 		return model.RestoreResult{}, err
 	}
 	marker := filepath.Join(e.dataDir, "restore-request.json")
-	payload, _ := json.Marshal(map[string]any{
+	payload, err := json.Marshal(map[string]any{
 		"backupPath":  target,
 		"requestedAt": time.Now().UTC().Format(time.RFC3339),
 		"allow":       allow,
 	})
-	if err := os.WriteFile(marker, payload, 0o600); err != nil {
+	if err != nil {
+		return model.RestoreResult{}, fmt.Errorf("序列化恢复请求失败: %w", err)
+	}
+	// The request has to survive the restart that applies it, so the write is
+	// fsynced rather than left in the page cache of a process about to exit.
+	if err := writeFileSynced(marker, payload, 0o600); err != nil {
 		return model.RestoreResult{}, fmt.Errorf("写入恢复请求失败: %w", err)
 	}
 	// From this point every new business write is refused until the daemon
@@ -904,7 +914,7 @@ func ApplyPendingRestore(dataDir string) error {
 		// No pending request. A leftover journal means the previous restore
 		// completed but crashed during cleanup — finish it.
 		if j, jerr := readRestoreJournal(journalPath); jerr == nil && j != nil && j.Phase == journalDatabaseCommitted {
-			finishRestoreCleanup(dataDir, j)
+			finishRestoreCleanup(dataDir)
 		}
 		return nil
 	}
@@ -921,76 +931,31 @@ func ApplyPendingRestore(dataDir string) error {
 		case journalOriginalsSaved:
 			// The database was never swapped. Roll the files back to their
 			// journalled original state and quarantine the request: retrying
-			// automatically would loop on a deterministic failure.
-			rbErr := rollbackJournalFiles(j)
-			quarantineRestoreMarker(dataDir, marker)
-			_ = os.Remove(journalPath)
-			cause := "恢复在文件阶段中断，已回滚到原始状态"
-			if rbErr != nil {
-				cause = fmt.Sprintf("恢复中断且回滚不完整（原始文件保留于 %s）: %v", j.OrigDir, rbErr)
-			}
-			return &RestoreError{Cause: cause}
+			// automatically would loop on a deterministic failure. The journal
+			// survives an incomplete rollback as the only description of what
+			// was touched.
+			return abandonRestoreTransaction(dataDir, j, marker, journalPath, "恢复在文件阶段中断")
 		case journalFilesCommitted, journalDatabaseCommitting:
-			// Decide by the actual state on disk, not by the phase string
-			// alone: the crash may have happened before or after the rename.
-			dbPath := filepath.Join(dataDir, "state.sqlite")
-			_, tmpErr := os.Stat(filepath.Join(dataDir, ".restore-state.tmp"))
-			tmpExists := tmpErr == nil
-			if !tmpExists && j.Phase == journalDatabaseCommitting {
-				// The rename may already have happened. When the staged
-				// database is gone and the snapshot holds the original
-				// sidecars, the swap completed — finish the cleanup.
-				if _, err := os.Stat(filepath.Join(j.OrigDir, "state.sqlite-wal")); err == nil {
-					if _, err2 := os.Stat(dbPath); err2 == nil {
-						finishRestoreCleanup(dataDir, j)
-						return nil
-					}
-				}
-			}
-			// Files are already the backup version; finish the database swap.
+			// The files are already the backup version. Whether the database
+			// swap completed is decided inside completeRestoreDatabase by the
+			// journalled digest, so a missing staged file is re-created from the
+			// archive rather than guessed at from leftover sidecars.
 			staged := filepath.Join(dataDir, ".restore-state.tmp")
-			if !tmpExists {
-				// The staged database vanished without the swap completing —
-				// rebuild it from the archive so the swap can proceed.
-				if j.BackupPath == "" {
-					quarantineRestoreMarker(dataDir, marker)
-					_ = os.Remove(journalPath)
-					return &RestoreError{Cause: "暂存数据库丢失且无法从备份重建"}
+			if _, tmpErr := os.Stat(staged); tmpErr != nil {
+				if err := rebuildStagedDatabase(j, staged); err != nil {
+					return abandonRestoreTransaction(dataDir, j, marker, journalPath, err.Error())
 				}
-				zr, zerr := zip.OpenReader(j.BackupPath)
-				if zerr != nil {
-					quarantineRestoreMarker(dataDir, marker)
-					_ = os.Remove(journalPath)
-					return &RestoreError{Cause: fmt.Sprintf("打开备份失败: %v", zerr)}
-				}
-				var src *zip.File
-				for _, f := range zr.File {
-					if f.Name == "state.sqlite" {
-						src = f
-						break
-					}
-				}
-				if src == nil {
-					zr.Close()
-					quarantineRestoreMarker(dataDir, marker)
-					_ = os.Remove(journalPath)
-					return &RestoreError{Cause: "备份缺少 state.sqlite"}
-				}
-				if err := extractZipEntry(src, staged); err != nil {
-					zr.Close()
-					quarantineRestoreMarker(dataDir, marker)
-					_ = os.Remove(journalPath)
-					return &RestoreError{Cause: fmt.Sprintf("重建暂存数据库失败: %v", err)}
-				}
-				zr.Close()
 			}
-			if err := completeRestoreDatabase(dataDir, j, marker, journalPath, staged); err != nil {
-				return err
-			}
-			return nil
+			return completeRestoreDatabase(dataDir, j, marker, journalPath, staged)
 		case journalDatabaseCommitted:
-			finishRestoreCleanup(dataDir, j)
+			finishRestoreCleanup(dataDir)
 			return nil
+		default:
+			// An unknown phase cannot be mapped onto on-disk state; touching
+			// anything would risk a second overwrite. Fail closed and keep both
+			// the request and the journal as evidence.
+			return &RestoreError{Cause: fmt.Sprintf(
+				"无法识别的恢复阶段 %q，已停止自动处理（保留恢复日志与原始快照 %s）", j.Phase, j.OrigDir)}
 		}
 	}
 
@@ -1019,7 +984,7 @@ func ApplyPendingRestore(dataDir string) error {
 		return &RestoreError{Cause: "备份缺少 state.sqlite"}
 	}
 	temp := filepath.Join(dataDir, ".restore-state.tmp")
-	if err := extractZipEntry(src, temp); err != nil {
+	if err := extractZipEntry(src, temp, maxZipStateBytes); err != nil {
 		quarantineRestoreMarker(dataDir, marker)
 		return &RestoreError{Cause: fmt.Sprintf("解压备份数据库失败: %v", err)}
 	}
@@ -1048,21 +1013,11 @@ func ApplyPendingRestore(dataDir string) error {
 		return &RestoreError{Cause: fmt.Sprintf("写入恢复日志失败: %v", err)}
 	}
 	if err := commitRestoreFiles(j, byName, journalPath); err != nil {
-		rbErr := rollbackJournalFiles(j)
-		quarantineRestoreMarker(dataDir, marker)
-		_ = os.Remove(journalPath)
-		cause := fmt.Sprintf("恢复关联文件失败: %v", err)
-		if rbErr != nil {
-			cause += fmt.Sprintf("；回滚不完整（原始文件保留于 %s）: %v", j.OrigDir, rbErr)
-		}
-		return &RestoreError{Cause: cause}
+		return abandonRestoreTransaction(dataDir, j, marker, journalPath, fmt.Sprintf("恢复关联文件失败: %v", err))
 	}
 	j.Phase = journalFilesCommitted
 	if err := writeRestoreJournal(journalPath, j); err != nil {
-		rollbackJournalFiles(j)
-		quarantineRestoreMarker(dataDir, marker)
-		_ = os.Remove(journalPath)
-		return &RestoreError{Cause: fmt.Sprintf("记录恢复阶段失败: %v", err)}
+		return abandonRestoreTransaction(dataDir, j, marker, journalPath, fmt.Sprintf("记录恢复阶段失败: %v", err))
 	}
 
 	if err := completeRestoreDatabase(dataDir, j, marker, journalPath, temp); err != nil {
@@ -1091,6 +1046,15 @@ type restoreJournal struct {
 	Stamp      string        `json:"stamp"`
 	OrigDir    string        `json:"origDir"`
 	Files      []journalFile `json:"files"`
+	// DatabaseSHA256 is the digest of the staged backup database, recorded
+	// before DATABASE_COMMITTING. It is the only acceptable proof that the
+	// rename completed: the snapshot's WAL/SHM copies exist whether or not the
+	// swap ever ran, so their presence proves nothing.
+	DatabaseSHA256 string `json:"databaseSha256,omitempty"`
+	// HadOriginalDB records whether state.sqlite existed before the restore.
+	// nil means an older writer left it unknown, and rollback must not delete
+	// the live database on that guess.
+	HadOriginalDB *bool `json:"hadOriginalDb,omitempty"`
 }
 
 // journalFile records one overwritten target and its original state. Saved is
@@ -1154,76 +1118,154 @@ func writeRestoreJournal(path string, j *restoreJournal) error {
 
 // completeRestoreDatabase performs the database swap using the journalled
 // snapshot. The sidecars are MOVED into the snapshot (never deleted), the
-// DATABASE_COMMITTING phase is persisted before the rename, and every failure
-// restores the original database, sidecars and files. Cleanup happens only
-// after a fully committed restore.
+// staged database's digest is journalled before DATABASE_COMMITTING, and every
+// failure returns through abandonRestoreTransaction. Completion is decided by
+// that digest — never by which files happen to sit in the snapshot, because
+// the snapshot holds the original WAL/SHM whether or not the swap ran.
 func completeRestoreDatabase(dataDir string, j *restoreJournal, marker, journalPath, stagedDB string) error {
 	dbPath := filepath.Join(dataDir, "state.sqlite")
-	move := func(from, to string) error {
-		if err := os.Rename(from, to); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
+	stagedSum, err := fileSHA256(stagedDB)
+	if err != nil {
+		return abandonRestoreTransaction(dataDir, j, marker, journalPath, "校验暂存数据库失败: "+err.Error())
 	}
-	// Restore the original database and sidecars from the snapshot.
-	restoreOriginalDB := func() error {
-		if err := copyFile(filepath.Join(j.OrigDir, "state.sqlite"), dbPath); err != nil && !os.IsNotExist(err) {
-			return err
+	j.DatabaseSHA256 = stagedSum
+	if liveSum, lerr := fileSHA256(dbPath); lerr == nil && liveSum == stagedSum {
+		// The live database already carries the backup's bytes: a previous run
+		// renamed it and only died before recording the phase.
+		j.Phase = journalDatabaseCommitted
+		if err := writeRestoreJournal(journalPath, j); err != nil {
+			return abandonRestoreTransaction(dataDir, j, marker, journalPath, "记录数据库完成阶段失败: "+err.Error())
 		}
-		if err := copyFile(filepath.Join(j.OrigDir, "state.sqlite-wal"), dbPath+"-wal"); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		if err := copyFile(filepath.Join(j.OrigDir, "state.sqlite-shm"), dbPath+"-shm"); err != nil && !os.IsNotExist(err) {
-			return err
-		}
+		_ = os.Remove(stagedDB)
+		finishRestoreCleanup(dataDir)
 		return nil
-	}
-	fail := func(cause string) error {
-		// Files may already be the backup version and the database may be
-		// swapped or untouched: restore everything the snapshot holds.
-		rbFiles := rollbackJournalFiles(j)
-		rbDB := restoreOriginalDB()
-		quarantineRestoreMarker(dataDir, marker)
-		if rbFiles == nil && rbDB == nil {
-			// Rollback fully succeeded: the journal did its job and is no
-			// longer needed.
-			_ = os.Remove(journalPath)
-			return &RestoreError{Cause: cause + "；已回滚到原始状态"}
-		}
-		// Rollback incomplete: keep the journal and snapshot as evidence and
-		// leave the request quarantined — never retry automatically.
-		cause += fmt.Sprintf("；回滚不完整（文件: %v；数据库: %v；原始状态保留于 %s）", rbFiles, rbDB, j.OrigDir)
-		return &RestoreError{Cause: cause}
 	}
 
 	// Persist the committing phase BEFORE touching anything, so a crash here
-	// is resumable by inspecting the actual database state.
+	// is resumable by comparing the live database against the journalled digest.
 	j.Phase = journalDatabaseCommitting
 	if err := writeRestoreJournal(journalPath, j); err != nil {
-		return fail("记录数据库提交阶段失败: " + err.Error())
+		return abandonRestoreTransaction(dataDir, j, marker, journalPath, "记录数据库提交阶段失败: "+err.Error())
 	}
-	if err := move(dbPath+"-wal", filepath.Join(j.OrigDir, "state.sqlite-wal")); err != nil {
-		return fail("移出 WAL 失败: " + err.Error())
-	}
-	if err := move(dbPath+"-shm", filepath.Join(j.OrigDir, "state.sqlite-shm")); err != nil {
-		return fail("移出 SHM 失败: " + err.Error())
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := moveIntoSnapshot(dbPath+suffix, filepath.Join(j.OrigDir, "state.sqlite"+suffix), dataDir, j.OrigDir); err != nil {
+			return abandonRestoreTransaction(dataDir, j, marker, journalPath, "移出 "+suffix+" 失败: "+err.Error())
+		}
 	}
 	if err := os.Rename(stagedDB, dbPath); err != nil {
-		return fail("替换数据库失败: " + err.Error())
+		return abandonRestoreTransaction(dataDir, j, marker, journalPath, "替换数据库失败: "+err.Error())
 	}
+	syncDir(dataDir)
 	j.Phase = journalDatabaseCommitted
 	if err := writeRestoreJournal(journalPath, j); err != nil {
-		return fail("记录数据库完成阶段失败: " + err.Error())
+		return abandonRestoreTransaction(dataDir, j, marker, journalPath, "记录数据库完成阶段失败: "+err.Error())
 	}
-	_ = os.Remove(marker)
-	_ = os.Remove(journalPath)
+	finishRestoreCleanup(dataDir)
 	return nil
 }
 
-// finishRestoreCleanup removes the journal evidence of a completed restore.
-func finishRestoreCleanup(dataDir string, j *restoreJournal) {
-	_ = os.Remove(filepath.Join(dataDir, "restore-request.json"))
-	_ = os.Remove(filepath.Join(dataDir, "restore-journal.json"))
+// abandonRestoreTransaction is the single failure exit for a restore that has
+// already journalled state. It rolls the associated files back, puts the
+// original database and its sidecars back, quarantines the request, and keeps
+// the journal plus snapshot as recovery evidence whenever either rollback step
+// could not be completed: deleting the journal on an unverified rollback would
+// throw away the only description of the half-applied state.
+func abandonRestoreTransaction(dataDir string, j *restoreJournal, marker, journalPath, cause string) error {
+	rbFiles := rollbackJournalFiles(j)
+	rbDB := restoreOriginalDatabase(j, dataDir)
+	quarantineRestoreMarker(dataDir, marker)
+	if rbFiles == nil && rbDB == nil {
+		if err := os.Remove(journalPath); err != nil && !os.IsNotExist(err) {
+			return &RestoreError{Cause: cause + "；已回滚到原始状态，但恢复日志未能清除（下次启动会重放幂等回滚）: " + err.Error()}
+		}
+		syncDir(dataDir)
+		return &RestoreError{Cause: cause + "；已回滚到原始状态"}
+	}
+	return &RestoreError{Cause: fmt.Sprintf(
+		"%s；回滚不完整（文件: %v；数据库: %v）；已保留恢复日志与原始快照 %s，请在「诊断与修复」中人工处理",
+		cause, rbFiles, rbDB, j.OrigDir)}
+}
+
+// restoreOriginalDatabase returns the database trio (main file, WAL, SHM) to
+// exactly what the snapshot holds, so a failed swap cannot leave a database
+// paired with rolled-back files.
+func restoreOriginalDatabase(j *restoreJournal, dataDir string) error {
+	dbPath := filepath.Join(dataDir, "state.sqlite")
+	snapDB := filepath.Join(j.OrigDir, "state.sqlite")
+	_, err := os.Stat(snapDB)
+	switch {
+	case err == nil:
+		if err := copyFileSynced(snapDB, dbPath); err != nil {
+			return fmt.Errorf("还原原始数据库失败: %w", err)
+		}
+	case os.IsNotExist(err):
+		// The sidecar pass below still has to run: the swap may already have
+		// moved a live WAL into the snapshot, and dropping it would lose
+		// committed records even when the main file needs no action.
+		if j.HadOriginalDB == nil {
+			// A journal from an older writer does not say whether the database
+			// existed before the restore; leaving it untouched is the only
+			// choice that cannot delete live data.
+			break
+		}
+		if *j.HadOriginalDB {
+			return fmt.Errorf("原始数据库快照缺失于 %s，无法还原", j.OrigDir)
+		}
+		// The restore created this database: removing it returns the data
+		// directory to its pre-restore state.
+		if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("移除恢复写入的数据库失败: %w", err)
+		}
+	default:
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		src := filepath.Join(j.OrigDir, "state.sqlite"+suffix)
+		_, serr := os.Stat(src)
+		switch {
+		case serr == nil:
+			if err := copyFileSynced(src, dbPath+suffix); err != nil {
+				return fmt.Errorf("还原 %s 失败: %w", suffix, err)
+			}
+		case os.IsNotExist(serr):
+			// The snapshot had no such sidecar, so any live one belongs to the
+			// swapped-in database and must not survive next to the old main
+			// file.
+			if err := os.Remove(dbPath + suffix); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("移除残留 %s 失败: %w", suffix, err)
+			}
+		default:
+			return serr
+		}
+	}
+	syncDir(dataDir)
+	return nil
+}
+
+// finishRestoreCleanup removes the evidence of a committed restore: the marker
+// first, then the journal, with a directory sync between them. The order is
+// what makes a crash safe — a leftover marker whose journal is still present is
+// resolved by the DATABASE_COMMITTED branch, while a marker with no journal is
+// read as a brand-new request and would replay the restore over any edit made
+// after it succeeded.
+func finishRestoreCleanup(dataDir string) {
+	marker := filepath.Join(dataDir, "restore-request.json")
+	journalPath := filepath.Join(dataDir, "restore-journal.json")
+	if _, err := os.Stat(marker); err == nil {
+		if rerr := os.Remove(marker); rerr != nil {
+			// Keep the journal: the next start re-runs this cleanup instead of
+			// treating the request as new.
+			fmt.Fprintf(os.Stderr, "恢复已完成但清理恢复请求失败（保留恢复日志，下次启动重试）: %v\n", rerr)
+			return
+		}
+		syncDir(dataDir)
+	}
+	if _, err := os.Stat(journalPath); err == nil {
+		if rerr := os.Remove(journalPath); rerr != nil {
+			fmt.Fprintf(os.Stderr, "恢复已完成但清理恢复日志失败: %v\n", rerr)
+		}
+		syncDir(dataDir)
+	}
 	for _, stale := range restoreFailedMarkers(dataDir) {
 		_ = os.Remove(stale)
 	}
@@ -1261,7 +1303,7 @@ func rollbackJournalFiles(j *restoreJournal) error {
 			note(err)
 			continue
 		}
-		mode := os.FileMode(f.OriginalMode)
+		mode := os.FileMode(f.OriginalMode & 0o777)
 		if mode == 0 {
 			// A journal without a recorded mode (hand-crafted or from an
 			// older writer) must not produce an unreadable 0000 file.
@@ -1344,10 +1386,14 @@ func (e *Engine) liveRestoreAllowlist() *restoreAllowlist {
 
 // registerKnownComposePath records a Compose path OrbSleep took under
 // management. The registry persists after the service record is deleted so a
-// later backup restore can still address the file.
-func registerKnownComposePath(e *Engine, path string) {
+// later backup restore can still address the file — restoring an old backup has
+// to be able to write back a compose file whose service was removed since, so
+// nothing unregisters on detach. The attach path calls this before it touches
+// the file: a silently dropped registration would leave that file outside every
+// later allowlist and reject its own restore.
+func registerKnownComposePath(e *Engine, path string) error {
 	if path == "" {
-		return
+		return errors.New("Compose 文件路径为空，无法登记")
 	}
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
@@ -1358,36 +1404,18 @@ func registerKnownComposePath(e *Engine, path string) {
 	}
 	for _, existing := range known {
 		if existing == path {
-			return
+			return nil
 		}
 	}
 	known = append(known, path)
-	if raw, err := json.Marshal(known); err == nil {
-		_ = e.store.SetMeta("knownComposePaths", string(raw))
+	raw, err := json.Marshal(known)
+	if err != nil {
+		return fmt.Errorf("登记 Compose 文件失败: %w", err)
 	}
-}
-
-// unregisterKnownComposePath drops a path when OrbSleep stops managing it.
-func unregisterKnownComposePath(e *Engine, path string) {
-	if path == "" {
-		return
+	if err := e.store.SetMeta("knownComposePaths", string(raw)); err != nil {
+		return fmt.Errorf("登记 Compose 文件失败: %w", err)
 	}
-	known := []string{}
-	if raw, ok := e.store.GetMeta("knownComposePaths"); ok {
-		_ = json.Unmarshal([]byte(raw), &known)
-	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	var kept []string
-	for _, existing := range known {
-		if existing != path {
-			kept = append(kept, existing)
-		}
-	}
-	if raw, err := json.Marshal(kept); err == nil {
-		_ = e.store.SetMeta("knownComposePaths", string(raw))
-	}
+	return nil
 }
 
 // extendAllowlistFromBackup adds recovery-material directories referenced by
@@ -1410,7 +1438,7 @@ func (e *Engine) extendAllowlistFromBackup(backupPath string, live *restoreAllow
 	}
 	tmp := filepath.Join(os.TempDir(), fmt.Sprintf(".orbsleep-allowlist-%d.sqlite", time.Now().UnixNano()))
 	defer os.Remove(tmp)
-	if err := extractZipEntry(dbEntry, tmp); err != nil {
+	if err := extractZipEntry(dbEntry, tmp, maxZipStateBytes); err != nil {
 		return live
 	}
 	db, err := sql.Open("sqlite", "file:"+tmp+"?_pragma=busy_timeout(3000)")
@@ -1538,9 +1566,13 @@ func resolveRestoreTarget(path string) string {
 	return path
 }
 
-// extractZipEntry decompresses one archive entry to path with hard size caps.
-func extractZipEntry(src *zip.File, path string) error {
-	if src.UncompressedSize64 > maxZipEntryBytes {
+// extractZipEntry decompresses one archive entry to path with a hard size cap.
+// maxSize is chosen by the CALLER per entry kind: the validation pass allows
+// the database snapshot to be larger than an ordinary file, so reusing the
+// per-file cap here would accept a backup at request time and then fail to
+// restore it after a restart.
+func extractZipEntry(src *zip.File, path string, maxSize int64) error {
+	if int64(src.UncompressedSize64) > maxSize {
 		return fmt.Errorf("条目 %s 过大（%d 字节）", src.Name, src.UncompressedSize64)
 	}
 	rc, err := src.Open()
@@ -1552,15 +1584,132 @@ func extractZipEntry(src *zip.File, path string) error {
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(out, io.LimitReader(rc, maxZipEntryBytes+1))
-	out.Close()
+	n, err := io.Copy(out, io.LimitReader(rc, maxSize+1))
+	if serr := out.Sync(); err == nil {
+		err = serr
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	if n > maxSize {
+		_ = os.Remove(path)
+		return fmt.Errorf("条目 %s 超过大小上限", src.Name)
+	}
+	// The staged database must be on the platter before the journal claims it
+	// exists: a journal that survives a power loss while its staged file does
+	// not is what makes the recovery decision untrustworthy.
+	syncDir(filepath.Dir(path))
+	return nil
+}
+
+// copyFileSynced copies src to dst and flushes both the data and the directory
+// entry, so a snapshot recorded in the journal is really readable afterwards.
+func copyFileSynced(src, dst string) error {
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	if n > maxZipEntryBytes {
-		return fmt.Errorf("条目 %s 超过大小上限", src.Name)
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
 	}
+	_, err = io.Copy(out, in)
+	if serr := out.Sync(); err == nil {
+		err = serr
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	syncDir(filepath.Dir(dst))
 	return nil
+}
+
+// writeFileSynced writes data durably: flush, close error checked, directory
+// entry synced.
+func writeFileSynced(path string, data []byte, mode os.FileMode) error {
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	_, err = out.Write(data)
+	if serr := out.Sync(); err == nil {
+		err = serr
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	syncDir(filepath.Dir(path))
+	return nil
+}
+
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	d.Close()
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// moveIntoSnapshot relocates a live file into the snapshot directory and syncs
+// both directories so the move survives a crash in either direction.
+func moveIntoSnapshot(from, to, fromDir, toDir string) error {
+	if err := os.Rename(from, to); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	syncDir(fromDir)
+	syncDir(toDir)
+	return nil
+}
+
+// rebuildStagedDatabase recreates the staged backup database after a crash
+// destroyed or consumed it, so a resumed restore never has to guess whether the
+// swap happened.
+func rebuildStagedDatabase(j *restoreJournal, staged string) error {
+	if j.BackupPath == "" {
+		return errors.New("暂存数据库丢失且恢复日志未记录备份路径，无法重建")
+	}
+	zr, err := zip.OpenReader(j.BackupPath)
+	if err != nil {
+		return fmt.Errorf("暂存数据库丢失且打开备份失败: %w", err)
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if f.Name == "state.sqlite" {
+			if err := extractZipEntry(f, staged, maxZipStateBytes); err != nil {
+				return fmt.Errorf("重建暂存数据库失败: %w", err)
+			}
+			return nil
+		}
+	}
+	return errors.New("暂存数据库丢失且备份缺少 state.sqlite")
 }
 
 const (
@@ -1673,14 +1822,14 @@ func snapshotRestoreOriginals(staged []stagedRestoreFile, dataDir, origDir, stam
 			Target:       st.bf.Path,
 			Entry:        st.bf.Entry,
 			OriginalMode: uint32(os.FileMode(0o644)),
-			RestoreMode:  uint32(st.bf.Mode),
+			RestoreMode:  uint32(sanitizeRestoreMode(st.bf.Mode)),
 		}
 		if st.current != nil {
-			if info, ierr := os.Stat(st.bf.Path); ierr == nil {
-				entry.OriginalMode = uint32(info.Mode())
+			if info, ierr := os.Stat(st.bf.Path); ierr == nil && info.Mode().IsRegular() {
+				entry.OriginalMode = uint32(info.Mode() & 0o777)
 			}
 			saved := filepath.Join(origDir, fmt.Sprintf("%04d-%s", i, filepath.Base(st.bf.Path)))
-			if err := os.WriteFile(saved, st.current, 0o600); err != nil {
+			if err := writeFileSynced(saved, st.current, 0o600); err != nil {
 				return nil, err
 			}
 			entry.Saved = saved
@@ -1689,20 +1838,50 @@ func snapshotRestoreOriginals(staged []stagedRestoreFile, dataDir, origDir, stam
 	}
 	// Snapshot the database and both sidecars: the swap later MOVES the live
 	// sidecars here, so no committed WAL record can ever be lost to a partial
-	// sidecar removal.
-	if _, err := os.Stat(dbPath); err == nil {
-		if err := copyFile(dbPath, filepath.Join(origDir, "state.sqlite")); err != nil {
+	// sidecar removal. Every copy is fsynced and both directories synced before
+	// the journal is allowed to claim ORIGINALS_SAVED — otherwise a power loss
+	// leaves a journal whose rollback evidence was never written.
+	hadDB := false
+	switch _, err := os.Stat(dbPath); {
+	case err == nil:
+		hadDB = true
+		if err := copyFileSynced(dbPath, filepath.Join(origDir, "state.sqlite")); err != nil {
 			return nil, fmt.Errorf("备份当前数据库失败: %w", err)
 		}
+	case os.IsNotExist(err):
+	default:
+		return nil, fmt.Errorf("读取当前数据库失败，已中止恢复: %w", err)
 	}
+	j.HadOriginalDB = &hadDB
 	for _, suffix := range []string{"-wal", "-shm"} {
-		if _, err := os.Stat(dbPath + suffix); err == nil {
-			if err := copyFile(dbPath+suffix, filepath.Join(origDir, "state.sqlite"+suffix)); err != nil {
+		switch _, err := os.Stat(dbPath + suffix); {
+		case err == nil:
+			if err := copyFileSynced(dbPath+suffix, filepath.Join(origDir, "state.sqlite"+suffix)); err != nil {
 				return nil, fmt.Errorf("备份 %s 失败: %w", suffix, err)
 			}
+		case os.IsNotExist(err):
+		default:
+			return nil, fmt.Errorf("读取 %s 失败，已中止恢复: %w", suffix, err)
 		}
 	}
+	syncDir(origDir)
+	syncDir(dataDir)
 	return j, nil
+}
+
+// sanitizeRestoreMode reduces an archive-declared mode to permission bits. A
+// backup must not be able to hand OrbSleep's own files setuid/setgid/sticky or
+// make them world-writable; the mode type bits Go stores alongside are dropped
+// the same way.
+func sanitizeRestoreMode(raw uint32) os.FileMode {
+	mode := os.FileMode(raw) & 0o777
+	if mode&0o002 != 0 {
+		mode &^= 0o002
+	}
+	if mode == 0 {
+		mode = 0o644
+	}
+	return mode
 }
 
 // commitRestoreFiles writes the staged files in order, recording each commit
@@ -1778,21 +1957,6 @@ func restoreFailedMarkerExists(dataDir string) bool {
 func restoreFailedMarkers(dataDir string) []string {
 	matches, _ := filepath.Glob(filepath.Join(dataDir, "restore-failed-*.json"))
 	return matches
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
 }
 
 func backupIDFromPath(name string) string {

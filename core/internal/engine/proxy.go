@@ -86,11 +86,54 @@ func containerIP(ins *dockerx.ContainerInspect) string {
 
 // proxyPublishedPorts returns the proxy's container ports that are published to
 // the macOS host. The gateway can only reach those ports.
-// PublishedPort is one host-side binding of the proxy container.
+// HostBinding is one host-side publication of a container port.
+type HostBinding struct {
+	HostIP   string // "" is Docker's wildcard address, i.e. every interface
+	HostPort int
+}
+
+// PublishedPort is one proxy container port together with EVERY host binding
+// published for it. Docker can publish the same container port on the loopback
+// and on a routable address at once, so keeping only the first binding would
+// let a public exposure through the safety check.
 type PublishedPort struct {
 	ContainerPort int
-	HostPort      int
-	HostIP        string // "" means all interfaces
+	Bindings      []HostBinding
+}
+
+// loopbackV4Port returns the host port published on exactly 127.0.0.1, the only
+// address the gateway can dial, or 0 when the port has no such binding.
+func (p PublishedPort) loopbackV4Port() int {
+	for _, b := range p.Bindings {
+		if b.HostIP == "127.0.0.1" {
+			return b.HostPort
+		}
+	}
+	return 0
+}
+
+// routableBindings describes every binding that publishes the proxy beyond the
+// local IPv4 loopback: the wildcard address or a routable interface. An IPv6
+// loopback is not an exposure but is unreachable for the IPv4 gateway, so the
+// caller handles it separately.
+func (p PublishedPort) routableBindings() []string {
+	var out []string
+	for _, b := range p.Bindings {
+		if b.HostIP == "127.0.0.1" || b.HostIP == "::1" {
+			continue
+		}
+		addr := b.HostIP
+		switch addr {
+		case "", "0.0.0.0", "::":
+			if addr == "" {
+				addr = "0.0.0.0"
+			}
+			out = append(out, fmt.Sprintf("%s:%d（所有网卡）", addr, b.HostPort))
+		default:
+			out = append(out, fmt.Sprintf("%s:%d", addr, b.HostPort))
+		}
+	}
+	return out
 }
 
 // proxyPublishedPorts returns the proxy's actual TCP host bindings keyed by
@@ -115,13 +158,16 @@ func (e *Engine) proxyPublishedPorts(ctx context.Context) (map[int]PublishedPort
 		if proto != "tcp" || port <= 0 {
 			continue
 		}
+		pp := PublishedPort{ContainerPort: port}
 		for _, b := range bindings {
 			hostPort, perr := strconv.Atoi(b.HostPort)
 			if perr != nil || hostPort <= 0 {
 				continue
 			}
-			out[port] = PublishedPort{ContainerPort: port, HostPort: hostPort, HostIP: b.HostIP}
-			break
+			pp.Bindings = append(pp.Bindings, HostBinding{HostIP: b.HostIP, HostPort: hostPort})
+		}
+		if len(pp.Bindings) > 0 {
+			out[port] = pp
 		}
 	}
 	return out, nil

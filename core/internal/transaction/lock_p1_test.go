@@ -80,7 +80,12 @@ func TestFileLockerHandoffUnderCancelRace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = l.Acquire(ctx, target) // will usually time out while queued
+			// The grant can land just after the deadline: a caller that is handed
+			// the lock has to give it back, otherwise the flock stays held by an
+			// abandoned fd and every later acquire waits forever.
+			if lock, err := l.Acquire(ctx, target); err == nil {
+				lock.Release()
+			}
 		}()
 		time.Sleep(time.Millisecond) // let the waiter queue up
 		cancel()

@@ -78,8 +78,11 @@ func (e *Engine) ApplyPlan(planID string) (string, error) {
 	envChanged := entry.dockerGeneration != e.dockerGeneration
 	e.mu.Unlock()
 	if envChanged {
-		e.plansMu.Unlock()
+		// Drop the stale plan while still holding plansMu: deleting after the
+		// unlock raced with concurrent CreatePlan, expiry sweeps and other
+		// ApplyPlan calls on the same map.
 		delete(e.plans, planID)
+		e.plansMu.Unlock()
 		return "", errors.New("该计划生成于 Docker 环境切换之前，请重新扫描并生成计划")
 	}
 	entry.applying = true
@@ -240,6 +243,15 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	defer lock.Release()
 	if _, serr := e.ensureComposeSnapshot(snap.composeFile); serr != nil {
 		return nil, &attachError{Err: serr}
+	}
+	// Register the path in the persistent Compose registry before any edit: the
+	// restore allowlist is captured from this registry, so an unregistered file
+	// would be rejected the day its own backup is restored — and a service
+	// deleted later takes its database record with it, leaving the file
+	// addressable by nothing else. A registration failure aborts the attach
+	// rather than managing a file the recovery path cannot name.
+	if rerr := registerKnownComposePath(e, snap.composeFile); rerr != nil {
+		return nil, &attachError{Err: rerr}
 	}
 	s := e.settings.Get()
 	cli, err := e.cliRunner()

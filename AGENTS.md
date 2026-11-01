@@ -7,6 +7,7 @@
 - `docs/PROTOCOL.md`：GUI ↔ daemon 的 NDJSON 协议，**唯一契约**。改协议必须同时改 `core/internal/model`、`core/internal/api`、`app/Sources/Models.swift` 与文档。
 - `scripts/phase0.py`：真实 OrbStack 端到端验收。
 - `scripts/phase1_lifecycle.py`：生命周期故障注入验收（停止保护、备份一致性、卸载 fail-closed；使用独立数据目录，不触碰真实数据）。
+- `app/Tests/UpdateRollbackProbe.swift` + `scripts/update_rollback_check.sh`：更新回滚故障注入探针。`app/Tests` **不是** Xcode 目标（`project.yml` 只编译 `Sources`），由 `make swift-check` 用 `xcrun swiftc` 直接编译生产 `UpdateManager.swift` 运行真实函数；改更新/回滚逻辑必须跑它。
 
 ## 构建与测试
 
@@ -16,6 +17,7 @@ make test           # go test ./...
 make app            # xcodegen + xcodebuild（产物 app/build/Debug）
 make phase0         # 需要 OrbStack；会创建/清理测试 Compose 项目
 make phase1         # 需要 OrbStack；生命周期故障注入（独立数据目录）
+make swift-check    # 编译生产 UpdateManager 运行更新回滚故障注入（无需 Xcode 工程）
 ```
 
 ## 不可破坏的规则
@@ -31,6 +33,9 @@ make phase1         # 需要 OrbStack；生命周期故障注入（独立数据�
 - 代理配置快照必须用 `Config.Clone()`；`Remove`/`Upsert` 不得原地复用切片。回滚后要逐服务比对基线。
 - 接入必须在修改前持久化 `transactions`（基线 + 每项备份 + 阶段）；改 Compose 前必须写入 `compose_write_pending` 和预期新内容。启动恢复先于 API。备份清理必须保留 `failed`/`rollback_failed`/`running` 操作的证据，并先清备份后清历史。
 - `restore/remove` 必须持久化 `detach` 事务（含真实 `WorkingDir`）；恢复前释放对应网关监听，失败回退托管；不得覆盖外部修改的 Compose；缺少预期恢复快照时不得覆盖。
+- 恢复事务的唯一失败出口（`abandonRestoreTransaction`）只有在文件与数据库两步回滚都确认成功后才允许删除 Journal；否则保留 Journal 与快照作为半成品证据。数据库是否已被替换只以 `DATABASE_COMMITTING` 前记录的暂存库 SHA-256 判定，禁止用快照里 sidecar 的存在与否推断（快照无论是否 swap 都持有原 WAL/SHM）。
+- 接入必须在修改 Compose 之前把文件路径登记进 `knownComposePaths`，登记失败即中止接入；detach 不注销——否则服务删除后其历史备份文件无法进入恢复白名单。
+- 有待应用恢复请求时必须先于一切业务写入检查维护标志（`ensureNoUnresolvedWork`），`Health`/列表等读侧保持可用。
 - 共享 Compose 文件缺失时，必须按其他托管服务的当前状态重建并移除其旧端口，禁止直接用单个服务备份整文件覆盖。
 - 事务完成判断必须按 ComposeFile 分组，只校验每个文件的最终内容。
 - 回滚不得复用已取消的业务上下文；依赖不可用时事务保持 `running`，不得标记终态。关闭超时不得关闭仍可能被事务使用的资源。

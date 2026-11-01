@@ -654,9 +654,11 @@ func managedServiceFixture(t *testing.T, e *Engine, admin *fakeAdmin, docker *fa
 	if err := e.store.SetMeta("serviceBackup:"+svc.ID, backupDir); err != nil {
 		t.Fatal(err)
 	}
-	// Mirror the real attach path: register the managed Compose file so a
-	// later backup restore may address it.
-	registerKnownComposePath(e, snap.composeFile)
+	// The real attach path registers this call (attachOne); the fixture seeds the
+	// managed record directly, so it has to register the same way.
+	if err := registerKnownComposePath(e, snap.composeFile); err != nil {
+		t.Fatal(err)
+	}
 	// Baseline proxy config and a listener for the managed route.
 	admin.mu.Lock()
 	admin.cfg = proxy.Config{Services: []proxy.ServiceConfig{{Name: svc.ContainerName, Ports: []string{fmt.Sprintf("%d:80", bindings[0].ProxyPort)}, IdleTimeoutSecs: 1800, StartTimeoutSecs: 60}}}

@@ -58,6 +58,8 @@ OrbSleepManager.app/Contents/
 | `scripts/embed-service.sh` | 构建时把 `orbsleepd`/`orbsleepctl` 与 plist 放进应用包 |
 | `scripts/phase0.py` | 端到端验收脚本（需要 OrbStack） |
 | `scripts/phase1_lifecycle.py` | 生命周期故障注入验收（停止保护 / 备份一致性 / 卸载 fail-closed；隔离数据目录） |
+| `app/Tests/UpdateRollbackProbe.swift` | 更新回滚故障注入探针：直接编译生产 `UpdateManager.swift` 运行真实函数 |
+| `scripts/update_rollback_check.sh` | 用 `xcrun swiftc` 编译并运行上述探针（无需 Xcode 工程） |
 
 ## 开发
 
@@ -67,6 +69,7 @@ make test           # go test ./...
 make app            # xcodegen + xcodebuild，产物 app/build/Debug/OrbSleepManager.app
 make phase0         # 真实 OrbStack 端到端验收
 make phase1         # 生命周期故障注入验收（隔离数据目录）
+make swift-check    # 更新回滚故障注入（编译生产 UpdateManager，无需 Xcode 工程）
 ```
 
 `make app` 的 post-build 阶段会调用 `scripts/embed-service.sh`，自动把后台服务与 LaunchAgent 放进 Debug 应用包，因此打开 Debug 构建也能直接使用「一键配置并启动」。

@@ -720,7 +720,9 @@ func TestRestoreIsAtomicAndRollsBackOnFailure(t *testing.T) {
 		if err := e.store.UpsertService(svc); err != nil {
 			t.Fatal(err)
 		}
-		registerKnownComposePath(e, svc.ComposeFile)
+		if err := registerKnownComposePath(e, svc.ComposeFile); err != nil {
+			t.Fatal(err)
+		}
 		bd := filepath.Join(e.settings.Get().BackupDir, "services", svc.ID)
 		if err := os.MkdirAll(bd, 0o700); err != nil {
 			t.Fatal(err)
@@ -1202,8 +1204,9 @@ func TestRestoreMovesSidecarsIntoSnapshot(t *testing.T) {
 	}
 }
 
-// Published-port validation: empty bindings, host-port mismatch and
-// non-loopback bindings all block the plan.
+// Published-port validation: empty bindings, host-port mismatch, IPv6-only
+// loopback and any routable binding block the plan — including a routable
+// binding that sits alongside a correct loopback one.
 func parseProxyPorts(ports map[string][]dockerx.PortBinding) map[int]PublishedPort {
 	out := map[int]PublishedPort{}
 	for key, bindings := range ports {
@@ -1214,8 +1217,17 @@ func parseProxyPorts(ports map[string][]dockerx.PortBinding) map[int]PublishedPo
 		if proto != "tcp" {
 			continue
 		}
-		hostPort, _ := strconv.Atoi(bindings[0].HostPort)
-		out[port] = PublishedPort{ContainerPort: port, HostPort: hostPort, HostIP: bindings[0].HostIP}
+		pp := PublishedPort{ContainerPort: port}
+		for _, b := range bindings {
+			hostPort, err := strconv.Atoi(b.HostPort)
+			if err != nil || hostPort <= 0 {
+				continue
+			}
+			pp.Bindings = append(pp.Bindings, HostBinding{HostIP: b.HostIP, HostPort: hostPort})
+		}
+		if len(pp.Bindings) > 0 {
+			out[port] = pp
+		}
 	}
 	return out
 }
@@ -1233,6 +1245,15 @@ func TestPlanValidatesProxyPublishedPorts(t *testing.T) {
 		{"non-loopback binding", map[string][]dockerx.PortBinding{
 			"21001/tcp": {{HostIP: "0.0.0.0", HostPort: "21001"}},
 		}, "proxy_port_exposed"},
+		{"wildcard host ip means every interface", map[string][]dockerx.PortBinding{
+			"21001/tcp": {{HostIP: "", HostPort: "21001"}},
+		}, "proxy_port_exposed"},
+		{"ipv6 loopback only is unreachable for the gateway", map[string][]dockerx.PortBinding{
+			"21001/tcp": {{HostIP: "::1", HostPort: "21001"}},
+		}, "proxy_port_not_loopback"},
+		{"every binding is checked, not just the first", map[string][]dockerx.PortBinding{
+			"21001/tcp": {{HostIP: "127.0.0.1", HostPort: "21001"}, {HostIP: "0.0.0.0", HostPort: "21001"}},
+		}, "proxy_port_exposed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1247,7 +1268,7 @@ func TestPlanValidatesProxyPublishedPorts(t *testing.T) {
 				t.Fatalf("expected %s blocker, got %s (%s)", tc.code, gotCode, gotMsg)
 			}
 			// A correct loopback binding passes.
-			ok := map[int]PublishedPort{21001: {ContainerPort: 21001, HostPort: 21001, HostIP: "127.0.0.1"}}
+			ok := map[int]PublishedPort{21001: {ContainerPort: 21001, Bindings: []HostBinding{{HostIP: "127.0.0.1", HostPort: 21001}}}}
 			checkProxyPublishedPort(ok, 21001, func(code, msg string) {
 				t.Fatalf("valid binding must pass, got %s: %s", code, msg)
 			})

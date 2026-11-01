@@ -176,19 +176,12 @@ final class UpdateManager {
         // bundle is the newest); the health handshake trims to two once the
         // update is confirmed healthy, so the active rollback candidate is
         // never removed early.
-        cleanupOldAppBackups(in: backupRoot, keeping: 3)
+        Self.cleanupAppBackups(in: backupRoot, keeping: 3)
         do {
             try FileManager.default.copyItem(at: newApp, to: appURL)
         } catch {
-            do {
-                try FileManager.default.moveItem(at: oldApp, to: appURL)
-                guard Bundle(url: appURL)?.infoDictionary?["CFBundleIdentifier"] as? String == Self.expectedBundleID else {
-                    throw UpdateError.installFailed("旧版本还原后校验失败")
-                }
-            } catch {
-                throw UpdateError.installFailed("替换应用失败且旧版本还原未成功：\(error.localizedDescription)")
-            }
-            throw UpdateError.installFailed("替换应用失败，已恢复旧版本：\(error.localizedDescription)")
+            try Self.restorePreviousApp(appURL: appURL, oldApp: oldApp, backupRoot: backupRoot,
+                                        expectedVersion: currentVersion, cause: error)
         }
 
         // Health handshake markers: the GUI writes `update-ok` after it has
@@ -239,15 +232,8 @@ final class UpdateManager {
         } catch {
             // Same contract as a helper start failure: the app directory must
             // never be left empty or half-replaced.
-            let failed = backupRoot.appendingPathComponent("OrbSleepManager.failed-\(UUID().uuidString).app")
-            do {
-                try FileManager.default.moveItem(at: appURL, to: failed)
-                try FileManager.default.moveItem(at: oldApp, to: appURL)
-                try FileManager.default.removeItem(at: failed)
-            } catch {
-                try? FileManager.default.moveItem(at: failed, to: appURL)
-            }
-            throw UpdateError.installFailed("无法准备更新辅助脚本，已恢复旧版本：\(error.localizedDescription)")
+            try Self.restorePreviousApp(appURL: appURL, oldApp: oldApp, backupRoot: backupRoot,
+                                        expectedVersion: currentVersion, cause: error)
         }
 
         let process = Process()
@@ -256,40 +242,78 @@ final class UpdateManager {
         do {
             try process.run()
         } catch {
-            // The helper never started: nobody else will restore the old app,
-            // and appURL currently holds the NEW bundle. appURL must never be
-            // empty, so move the new bundle to a failed directory first, put
-            // the old bundle back, verify it, and only then drop the failed
-            // copy.
-            let failed = backupRoot.appendingPathComponent("OrbSleepManager.failed-\(UUID().uuidString).app")
-            do {
-                try FileManager.default.moveItem(at: appURL, to: failed)
-                try FileManager.default.moveItem(at: oldApp, to: appURL)
-                guard let restored = Bundle(url: appURL),
-                      restored.infoDictionary?["CFBundleIdentifier"] as? String == Self.expectedBundleID else {
-                    throw UpdateError.installFailed("旧版本还原后校验失败")
-                }
-                try FileManager.default.removeItem(at: failed)
-            } catch {
-                // Restoring the old bundle failed too: move the new bundle
-                // back so the install location is never empty.
-                try? FileManager.default.moveItem(at: failed, to: appURL)
-                throw UpdateError.installFailed("无法启动更新辅助脚本且回滚失败（应用已还原为新版本）：\(error.localizedDescription)")
-            }
-            throw UpdateError.installFailed("无法启动更新辅助脚本：已恢复旧版本。\(error.localizedDescription)")
+            // The helper never started, so nobody else will put the old bundle
+            // back while appURL holds the new one.
+            try Self.restorePreviousApp(appURL: appURL, oldApp: oldApp, backupRoot: backupRoot,
+                                        expectedVersion: currentVersion, cause: error)
         }
         NSApp.terminate(nil)
     }
 
-    /// Keeps the newest `keeping` rollback copies, deletes the rest.
-    private func cleanupOldAppBackups(in backupRoot: URL, keeping: Int) {
+    /// Puts the saved old bundle back at the install path and never returns
+    /// normally: it always throws the update failure the caller reported.
+    ///
+    /// A `copyItem` that dies half-way can leave an incomplete bundle AT the
+    /// install path, which makes `moveItem(oldApp → appURL)` throw "file already
+    /// exists". So the residue is moved aside first, the old bundle is restored,
+    /// its identity re-read from disk, and only then is the residue dropped —
+    /// the install path is never left empty or half-replaced.
+    static func restorePreviousApp(appURL: URL, oldApp: URL, backupRoot: URL,
+                                   expectedVersion: String, cause: Error) throws -> Never {
+        let fm = FileManager.default
+        var residue: URL?
+        if fm.fileExists(atPath: appURL.path) {
+            let aside = backupRoot.appendingPathComponent("OrbSleepManager.failed-\(UUID().uuidString).app")
+            do {
+                try fm.moveItem(at: appURL, to: aside)
+                residue = aside
+            } catch {
+                throw UpdateError.installFailed("替换应用失败（\(cause.localizedDescription)），且无法移开安装位置上的残留包：\(error.localizedDescription)")
+            }
+        }
+        do {
+            try fm.moveItem(at: oldApp, to: appURL)
+        } catch {
+            // Put the residue back rather than leave the install path empty.
+            if let aside = residue { try? fm.moveItem(at: aside, to: appURL) }
+            throw UpdateError.installFailed("替换应用失败（\(cause.localizedDescription)），旧版本还原也未成功：\(error.localizedDescription)")
+        }
+        let info = Self.bundleInfo(at: appURL)
+        guard info?["CFBundleIdentifier"] as? String == Self.expectedBundleID,
+              info?["CFBundleShortVersionString"] as? String == expectedVersion else {
+            throw UpdateError.installFailed("旧版本还原后校验失败（期望 \(expectedVersion)），请从更新源手动重新安装")
+        }
+        if let aside = residue { try? fm.removeItem(at: aside) }
+        throw UpdateError.installFailed("替换应用失败，已恢复旧版本：\(cause.localizedDescription)")
+    }
+
+    /// Reads a bundle's Info.plist straight from disk. `Bundle(url:)` can hand
+    /// back a cached Info.plist for a path that was just replaced, which would
+    /// verify the wrong build.
+    private static func bundleInfo(at url: URL) -> [String: Any]? {
+        let plist = url.appendingPathComponent("Contents/Info.plist")
+        guard let data = FileManager.default.contents(atPath: plist.path),
+              let object = try? PropertyListSerialization.propertyList(from: data, format: nil) else { return nil }
+        return object as? [String: Any]
+    }
+
+    /// Keeps the newest `keeping` rollback copies, deletes the rest. Abandoned
+    /// new bundles (`*.failed-*.app`) are evidence and are never counted here.
+    static func cleanupAppBackups(in backupRoot: URL, keeping: Int) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: backupRoot, includingPropertiesForKeys: [.contentModificationDateKey]) else {
             return
         }
         let apps = entries
-            .filter { $0.pathExtension == "app" }
+            .filter { $0.pathExtension == "app" && !$0.lastPathComponent.contains(".failed-") }
             .sorted { (a, b) in
+                // Rollback copies are named OrbSleepManager-<version>-<ISO8601>
+                // .app, so the trailing timestamp is exact and sorts
+                // monotonically. A bundle's content-modification date can predate
+                // the copy (Finder preserves it), which would let the sweep drop
+                // the rollback candidate it just saved.
+                let ta = backupTimestamp(a), tb = backupTimestamp(b)
+                if !ta.isEmpty, !tb.isEmpty, ta != tb { return ta > tb }
                 let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
                 let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
                 return da > db
@@ -297,6 +321,14 @@ final class UpdateManager {
         for stale in apps.dropFirst(max(0, keeping)) {
             try? fm.removeItem(at: stale)
         }
+    }
+
+    /// The `yyyy-MM-dd'T'HH-mm-ssZ` suffix of a rollback copy's name, or "" when
+    /// the name does not carry one.
+    private static func backupTimestamp(_ url: URL) -> String {
+        let name = url.deletingPathExtension().lastPathComponent
+        guard name.hasPrefix("OrbSleepManager-"), name.count >= 20 else { return "" }
+        return String(name.suffix(20))
     }
 
     // MARK: - 包处理

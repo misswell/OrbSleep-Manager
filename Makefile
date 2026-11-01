@@ -2,7 +2,7 @@ SHELL := /bin/bash
 BIN := $(CURDIR)/bin
 APP := $(CURDIR)/app
 
-.PHONY: all build build-core test vet app phase0 phase1 release clean install-agent uninstall-agent
+.PHONY: all build build-core test vet swift-check app phase0 phase1 release clean install-agent uninstall-agent
 
 all: build
 
@@ -19,6 +19,10 @@ test:
 
 vet:
 	cd core && go vet ./...
+
+# 更新回滚故障注入：编译真实的 UpdateManager 并在临时目录注入失败
+swift-check:
+	./scripts/update_rollback_check.sh
 
 app:
 	cd app && xcodegen generate
