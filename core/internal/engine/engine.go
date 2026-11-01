@@ -69,7 +69,14 @@ type Engine struct {
 	composeLocker *transaction.FileLocker
 	txns          *transaction.Manager
 	maintenance   atomic.Bool
-	findCLI       func(dockerHost string) (composeCLI, error)
+	// maintenanceDetail carries the operator-facing reason for the freeze; it is
+	// written before maintenance is set so a reader never sees a bare flag.
+	maintenanceDetail atomic.Value
+	findCLI           func(dockerHost string) (composeCLI, error)
+	// registryErr records a startup failure registering managed services'
+	// Compose paths. Detach is refused while it is set: deleting the service
+	// record would drop the last reference to a file a later restore needs.
+	registryErr error
 
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
@@ -119,6 +126,22 @@ func New(version, dataDir string) (*Engine, error) {
 	} else if migrated {
 		logger.Printf("info", "已迁移旧设置：低端口助手未实现，已自动关闭")
 	}
+	// Upgrade migration: services attached by older versions have no entry in
+	// the known-Compose-path registry, and deleting one of them would drop the
+	// last reference to a file a later backup restore has to write. Every
+	// managed path is registered before the API accepts any write.
+	if err := migrateKnownComposePaths(store); err != nil {
+		logger.Printf("error", "迁移已知 Compose 路径失败: %v", err)
+		e.registryErr = err
+	}
+	// Startup gate: a restore transaction that ApplyPendingRestore could not
+	// resolve leaves a request or journal on disk. Business writes stay frozen
+	// until it is resolved — reading (health, lists, diagnostics) still works,
+	// and the process keeps running instead of bouncing through launchd.
+	if blocked, reason := restoreGateState(dataDir); blocked {
+		e.freezeWrites(reason)
+		logger.Printf("warn", "%s", reason)
+	}
 	e.gw.SetActivityHook(func(serviceID string, at time.Time) {
 		e.activityMu.Lock()
 		e.activity[serviceID] = at
@@ -137,9 +160,18 @@ func New(version, dataDir string) (*Engine, error) {
 // Start launches the background loops.
 func (e *Engine) Start() {
 	e.logger.Printf("info", "OrbSleep daemon %s 启动，数据目录 %s", e.version, e.dataDir)
-	// Roll back transactions interrupted by a crash before restoring listeners
-	// and accepting new work.
-	e.RecoverTransactions()
+	if frozen, reason := e.writesFrozen(); frozen {
+		// Transaction recovery writes Compose files from its own stale snapshots.
+		// Running it while an unresolved restore transaction describes those same
+		// files could overwrite the state the operator still has to inspect, so
+		// the recovery is deferred until the restore is resolved. Listeners are
+		// still rebuilt: serving traffic reads no files that recovery would edit.
+		e.logger.Printf("warn", "跳过启动事务恢复（写入已冻结）: %s", reason)
+	} else {
+		// Roll back transactions interrupted by a crash before restoring listeners
+		// and accepting new work.
+		e.RecoverTransactions()
+	}
 	e.ReconcileOrphanOperations()
 	// Restore host port listeners before the API accepts requests, so a daemon
 	// restart does not leave a window where managed services are unreachable.

@@ -269,13 +269,18 @@ type Health struct {
 	PendingTransactions int         `json:"pendingTransactions"`
 	// Transactions whose recovery failed (rollback_failed / needs_repair):
 	// invisible to auto-recovery, must surface in the GUI and block uninstall.
-	NeedsRepairTransactions int       `json:"needsRepairTransactions"`
-	RunningOperations       int       `json:"runningOperations"`
-	RestoreFailed           bool      `json:"restoreFailed"`
-	LaunchAgentLoaded       bool      `json:"launchAgentLoaded"`
-	LegacyLaunchAgent       bool      `json:"legacyLaunchAgent"`
-	LegacyBinaries          []string  `json:"legacyBinaries"`
-	LastError               LastError `json:"lastError"`
+	NeedsRepairTransactions int  `json:"needsRepairTransactions"`
+	RunningOperations       int  `json:"runningOperations"`
+	RestoreFailed           bool `json:"restoreFailed"`
+	// WriteFrozen is true while an unresolved backup restore transaction (or a
+	// pending restore request) freezes every business write. FreezeReason is the
+	// operator-facing explanation; both are read-only diagnostics.
+	WriteFrozen       bool      `json:"writeFrozen"`
+	FreezeReason      string    `json:"freezeReason"`
+	LaunchAgentLoaded bool      `json:"launchAgentLoaded"`
+	LegacyLaunchAgent bool      `json:"legacyLaunchAgent"`
+	LegacyBinaries    []string  `json:"legacyBinaries"`
+	LastError         LastError `json:"lastError"`
 }
 
 // RecoveryTransaction is a durable in-flight transaction exposed to the GUI.

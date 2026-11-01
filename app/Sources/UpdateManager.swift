@@ -201,31 +201,9 @@ final class UpdateManager {
 
         let helper = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbSleep-relaunch-\(UUID().uuidString).sh")
-        let script = """
-        #!/bin/bash
-        set -u
-        APP="$1"; OLD="$2"; OLDPID="$3"; OKMARK="$4"
-        rm -f "$OKMARK" || exit 1
-        sleep 3
-        open -n "$APP" >/dev/null 2>&1
-        # Wait for the health handshake instead of a bare process check: a GUI
-        # that starts but never reaches a healthy daemon still counts as failed.
-        for _ in $(seq 1 45); do
-            if [ -f "$OKMARK" ]; then exit 0; fi
-            sleep 1
-        done
-        # Rollback must be all-or-nothing: deleting the new app before the old
-        # one is back in place would leave the machine without the app at all.
-        if ! mv "$APP" "$APP.failed-$$"; then
-            exit 1
-        fi
-        if ! mv "$OLD" "$APP"; then
-            mv "$APP.failed-$$" "$APP"
-            exit 1
-        fi
-        rm -rf "$APP.failed-$$"
-        open -n "$APP" >/dev/null 2>&1
-        """
+        let failureMarker = supportDir.appendingPathComponent("app-update-failed.txt")
+        try? FileManager.default.removeItem(at: failureMarker)
+        let script = Self.relaunchScript()
         do {
             try script.write(to: helper, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
@@ -238,7 +216,11 @@ final class UpdateManager {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [helper.path, appURL.path, oldApp.path, "\(ProcessInfo.processInfo.processIdentifier)", okMarker.path]
+        process.arguments = [
+            helper.path, appURL.path, oldApp.path,
+            "\(ProcessInfo.processInfo.processIdentifier)", okMarker.path,
+            currentVersion, failureMarker.path,
+        ]
         do {
             try process.run()
         } catch {
@@ -248,6 +230,66 @@ final class UpdateManager {
                                         expectedVersion: currentVersion, cause: error)
         }
         NSApp.terminate(nil)
+    }
+
+    /// The relaunch/rollback helper. Its contract is that the install path is
+    /// never left empty: every destructive move is preceded by one that keeps
+    /// both bundles recoverable, and EVERY move is checked — including the
+    /// compensating move back.
+    ///
+    /// Arguments: APP OLD OLDPID OKMARK EXPECTED_VERSION FAILURE_MARKER.
+    /// Exits 0 when the new build was healthy or the rollback succeeded; a
+    /// non-zero code means a human is needed, and the failure marker records
+    /// where both bundles are.
+    ///
+    /// The script is a separate function (not an inline literal) so the
+    /// fault-injection probe can execute the real thing with shims on PATH.
+    static func relaunchScript() -> String {
+        return """
+        #!/bin/bash
+        set -u
+        APP="$1"; OLD="$2"; OLDPID="$3"; OKMARK="$4"; EXPECTVER="$5"; FAILMARK="$6"
+        rm -f "$OKMARK" || exit 1
+        sleep 3
+        open -n "$APP" >/dev/null 2>&1
+        # Wait for the health handshake instead of a bare process check: a GUI
+        # that starts but never reaches a healthy daemon still counts as failed.
+        for _ in $(seq 1 45); do
+            if [ -f "$OKMARK" ]; then exit 0; fi
+            sleep 1
+        done
+
+        # Nothing could be put back. Leave BOTH bundles in place as evidence and
+        # write down exactly where they are; never delete a usable copy.
+        fail_recovery() {
+            echo "OrbSleep 更新回滚失败：$1" >&2
+            {
+                echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                echo "install=$APP"
+                echo "saved=$OLD"
+            } > "$FAILMARK" 2>/dev/null
+            exit 3
+        }
+
+        RESCUE="$APP.rollback-$$"
+        if ! mv "$APP" "$RESCUE"; then
+            fail_recovery "无法移开新版本，安装位置保持原状（${APP}）"
+        fi
+        if ! mv "$OLD" "$APP"; then
+            # Put the residue back so the install path is not empty.
+            if ! mv "$RESCUE" "$APP"; then
+                fail_recovery "旧版本与残留新版本都无法放回，请手动处理：install=${APP} saved=${OLD} rescue=${RESCUE}"
+            fi
+            fail_recovery "旧版本无法移回安装位置（备份仍在 ${OLD}）"
+        fi
+        # Prove the bundle at the install path really is the saved version:
+        # Bundle.main caches Info.plist, only a disk read tells the truth.
+        if ! /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null | grep -qx "$EXPECTVER"; then
+            fail_recovery "恢复后的版本校验不通过（期望 ${EXPECTVER}），备份仍在 ${OLD}"
+        fi
+        rm -rf "$RESCUE"
+        open -n "$APP" >/dev/null 2>&1
+        """
     }
 
     /// Puts the saved old bundle back at the install path and never returns
@@ -273,15 +315,33 @@ final class UpdateManager {
         }
         do {
             try fm.moveItem(at: oldApp, to: appURL)
-        } catch {
+        } catch let moveError {
             // Put the residue back rather than leave the install path empty.
-            if let aside = residue { try? fm.moveItem(at: aside, to: appURL) }
-            throw UpdateError.installFailed("替换应用失败（\(cause.localizedDescription)），旧版本还原也未成功：\(error.localizedDescription)")
+            // If even that fails, fall back to a copy of the saved bundle: the
+            // backup lives on the same volume, so a copy can refill the install
+            // path when a move could not. Only when both fail is a human needed,
+            // and then the message names every surviving bundle.
+            if let aside = residue {
+                do {
+                    try fm.moveItem(at: aside, to: appURL)
+                } catch let residueError {
+                    do {
+                        try fm.copyItem(at: oldApp, to: appURL)
+                    } catch let copyError {
+                        throw UpdateError.installFailed(
+                            "替换应用失败（\(cause.localizedDescription)），旧版本无法还原：\(moveError.localizedDescription)；残留放回失败：\(residueError.localizedDescription)；从备份复制失败：\(copyError.localizedDescription)。请手动处理：安装位置 \(appURL.path)，备份 \(oldApp.path)，残留 \(aside.path)"
+                        )
+                    }
+                }
+            }
+            throw UpdateError.installFailed("替换应用失败（\(cause.localizedDescription)），旧版本还原也未成功：\(moveError.localizedDescription)")
         }
         let info = Self.bundleInfo(at: appURL)
         guard info?["CFBundleIdentifier"] as? String == Self.expectedBundleID,
               info?["CFBundleShortVersionString"] as? String == expectedVersion else {
-            throw UpdateError.installFailed("旧版本还原后校验失败（期望 \(expectedVersion)），请从更新源手动重新安装")
+            throw UpdateError.installFailed(
+                "旧版本还原后校验失败（期望 \(expectedVersion)），请从更新源手动重新安装。备份保留在 \(oldApp.path)，安装位置保留在 \(appURL.path)"
+            )
         }
         if let aside = residue { try? fm.removeItem(at: aside) }
         throw UpdateError.installFailed("替换应用失败，已恢复旧版本：\(cause.localizedDescription)")

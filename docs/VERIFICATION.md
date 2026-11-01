@@ -378,3 +378,50 @@ P2：`cliRunner` 不再在锁外二次读 `dockerGeneration`（环境切换在�
 - 独立 `docker run` 容器的自动迁移。
 - 自动更新、菜单栏常驻；直接分发构建已用 Developer ID 签名并完成 Apple 公证（v0.1.5）。
 - GUI 未做屏幕截图验证（当前会话无屏幕录制权限）；已通过编译、真实协议往返与应用运行/连接验证。
+
+## 第十三轮加固（0.2.9，针对 v0.2.8 复审）
+
+复审结论：v0.2.8 方向正确，但恢复事务仍有三处数据一致性缺口，且两个 P1 只修了「新路径」，没有覆盖升级/回迁失败。本轮把恢复事务做成可证明的状态机，并把每一条修复落到故障注入测试。
+
+P0：
+
+| 复审问题 | 修复与验证 |
+|---|---|
+| 回滚过程中崩溃，重启后可能反过来继续执行恢复 | Journal 新增 `ROLLING_BACK` / `ROLLBACK_FAILED` 阶段。`abandonRestoreTransaction` **先持久化 ROLLING_BACK 并 fsync**，再动任何文件；写不进回滚意图时不做任何修改、保留日志并冻结写入。启动遇到 ROLLING_BACK 只继续回滚，`ROLLBACK_FAILED` 终态保留证据并要求人工处理。`TestRestoreRollingBackResumeContinuesRollback`、`TestRestoreRollingBackResumeRestoresDatabaseAfterFilesLanded`（回滚中途两个崩溃点：文件未回滚 / 文件已回滚但库未回滚） |
+| 无 Marker 的未完成 Journal 被忽略，半完成恢复被当成正常状态 | 无请求但存在非终态 Journal：`DATABASE_COMMITTED` 只做清理，`ROLLING_BACK` 继续回滚，其余阶段一律回滚（隔离后的请求可能已把文件放回，正向续跑会把数据库提交压在已回滚文件上）；损坏 Journal fail-closed。`Engine.New` 在打开 SQLite 后按磁盘状态判定 `restoreGateState`，冻结所有业务写入（`Health.writeFrozen`/`freezeReason` 可读），只保留健康/列表/诊断等读接口；启动时若有冻结则跳过会写 Compose 的事务恢复。`TestRestoreWithoutMarkerNeverResumesForward`、`TestEngineFreezesWritesWhenJournalStaysUnresolved` |
+| 主库摘要相同会跳过 WAL 恢复，备份恢复形同虚设 | 「rename 已落地」的证明改为三要素：阶段 `DATABASE_COMMITTING` + 暂存文件已被 rename 消费（不存在）+ 活库摘要等于不可变日志摘要。活库与备份主文件相同但暂存文件仍在时**必须**真正执行替换：把活 WAL/SHM 移入快照再 rename。真实 SQLite 测试 `TestRestoreReplacesWALWhenMainFileMatchesBackup`：主文件与备份逐字节相同、WAL 含更新记录 → 恢复后主库=备份、活 WAL 消失并完整保留在快照，重新打开库读到的是备份代际而不是 WAL 里的新记录。`TestRestoreResumePerformsSwapWhenDigestMatches` 覆盖摘要匹配时的正向续跑 |
+
+P1：
+
+| 问题 | 修复与验证 |
+|---|---|
+| `DatabaseSHA256` 不是不可变提交凭据 | 摘要随第一次 Journal 写入一起记录，之后**永不覆盖**；续跑/重建时与磁盘逐字节比对，不一致先尝试从摘要绑定的归档重建，仍不一致即拒绝提交并回滚。`TestRestoreRefusesStagedDatabaseThatDriftedFromTheJournalledDigest` |
+| 备份 ZIP 可在重启前被替换 | 恢复请求 marker 记录整包 SHA-256（`archiveSha256`），事务 Journal 记录 `backupSha256`；登记时与恢复时、每次续跑与每次重建前都校验。`TestRestoreRefusesArchiveSwappedAfterTransactionStarted` |
+| 重建暂存库没做完整性检查 | `rebuildStagedDatabase` 先校验归档摘要，再解压并对**副本**跑 `PRAGMA integrity_check`（检查会改写 SQLite 头的 journal-mode 字节，不能污染要与摘要比对的暂存文件）；新鲜恢复路径同样改为在副本上检查，因此暂存字节始终等于归档字节。`TestRestoreRebuildsLostStagedDatabaseFromBackup`（摘要链一致） |
+| Marker 隔离失败仍可能删 Journal | `quarantineRestoreMarker` 返回 `error`；隔离文件名带纳秒戳与重试序号，绝不覆盖既有证据；只有文件回滚、库回滚、回滚校验、目录同步、隔离全部成功才删 Journal，否则保留（回滚失败记 `ROLLBACK_FAILED`，仅隔离失败保持 `ROLLING_BACK` 以便下轮幂等重试）。回滚后用 `verifyRollbackState` 逐文件/逐库逐字节复核，「已回滚到原始状态」只在复核通过时才输出。`TestRestoreMarkerQuarantineFailureKeepsJournal`（注入 rename 失败 → 日志保留在 ROLLING_BACK、请求仍在；解除注入后重试完成） |
+| 旧版本托管服务没有 Compose 注册迁移 | `Engine.New` 对 services 表全部 ComposeFile 执行登记；登记表损坏时记录 `registryErr` 并拒绝删除托管记录（`deleteServiceRecord` 删除前再幂等登记一次，登记失败即拒绝删除）。`TestStartupMigratesComposePathRegistryForExistingServices`、`TestDeleteServiceRefusesCorruptRegistry` |
+| 更新回滚二次失败仍被 `try?` 吞掉 | `restorePreviousApp`：旧包移回失败时先尝试放回残留，再退化为「从同卷备份复制」，三条路径全失败才报人工恢复，文案给出安装位置/备份/残留三个绝对路径；身份校验失败同样保留备份并给路径。Bash 助手改为「每个 mv 都检查 + PlistBuddy 校验恢复版本 + 人工恢复标记（写入 install/saved 路径）」，失败时绝不删除任何可用的包。`app/Tests/UpdateRollbackProbe.swift` 新增 5 项**真实脚本**故障注入：握手成功不回滚、45 秒超时回滚并清理临时目录、旧包移回失败保住安装位置并写标记、第二次与补偿 mv 都失败时进入人工恢复且两个包都保留、恢复版本不符拒绝成功。 |
+| 目录 fsync 错误被吞 | `syncDir` 改为返回 error，贯穿 Journal 写入、快照复制、暂存解压、Sidecar 移入快照、数据库 rename 后的目录同步；失败按提交失败处理（回滚），不再把未持久化当成成功。 |
+
+P2：`CreatePlan` 入库改为在同一个环境锁内完成「代际校验 + 淘汰过期计划 + 写入 map」（`publishPlan`，锁序 `e.mu → e.plansMu`），消除校验与入库之间的切换窗口。
+
+### 本轮崩溃矩阵（全部由磁盘崩溃态夹具驱动真实 `ApplyPendingRestore`）
+
+| 方向 | 崩溃点 | 测试 |
+|---|---|---|
+| 提交 | Journal 写入后、文件未提交 | `TestRestoreCrashBeforeFileCommitTouchesNothing` |
+| 提交 | 文件已提交、库未提交 | `TestRestoreJournalResumesAfterCrashInDatabasePhase` |
+| 提交 | rename 已落地、Journal 未记录 | `TestRestoreCompletesWhenRenameLandedBeforeJournalWrite` |
+| 提交 | 暂存库丢失 / 归档丢失 | `TestRestoreRebuildsLostStagedDatabaseFromBackup`、`TestRestoreRollsBackWhenStagedAndBackupAreBothLost` |
+| 提交 | 主库与备份相同但 WAL 有新记录 | `TestRestoreReplacesWALWhenMainFileMatchesBackup` |
+| 提交 | 暂存库摘要漂移 / 归档被替换 | `TestRestoreRefusesStagedDatabaseThatDriftedFromTheJournalledDigest`、`TestRestoreRefusesArchiveSwappedAfterTransactionStarted` |
+| 回滚 | ROLLING_BACK 写入后、文件回滚前 | `TestRestoreRollingBackResumeContinuesRollback` |
+| 回滚 | 文件已回滚、库未回滚 | `TestRestoreRollingBackResumeRestoresDatabaseAfterFilesLanded` |
+| 回滚 | 回滚证据丢失 / 隔离失败 | `TestRestoreKeepsEvidenceWhenRollbackCannotComplete`、`TestRestoreMarkerQuarantineFailureKeepsJournal` |
+| 重启 | Marker 存在 / 不存在 / Journal 损坏 / Journal 未知阶段 | `TestRestoreRollingBackResumeContinuesRollback`、`TestRestoreWithoutMarkerNeverResumesForward`、`TestRestoreCorruptJournalQuarantinesWithoutTouching`、`TestRestoreUnknownPhaseFailsClosed` |
+| 重启 | Journal 残留时的写入门禁 | `TestEngineFreezesWritesWhenJournalStaysUnresolved` |
+
+验证（2026-11-01，本轮实际执行）：`gofmt -l core` 无输出；`go vet ./...` 通过；`go test -race -count=1 ./...` 全部包 `ok`（engine 8.99s）；`make app` `** BUILD SUCCEEDED **`；`make swift-check` 通过（9 项，含 5 项真实 Bash 脚本故障注入）。本轮**未**执行 `make phase0`/`make phase1`：OrbStack 未运行（`~/.orbstack/run/docker.sock` 不存在），发布包的实际容器行为需在本机启动 OrbStack 后补跑。
+
+### 已知限制
+- 在升级到 0.2.9 **之前**就被删除的旧服务没有任何注册表或服务记录，其历史备份中的 Compose 路径不会被恢复白名单信任；这类备份需要人工恢复（这是刻意的信任边界，不从归档数据库接受新的写路径）。

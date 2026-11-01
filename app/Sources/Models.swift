@@ -825,6 +825,8 @@ struct Health: Codable, Sendable, Hashable {
     var needsRepairTransactions: Int?
     var runningOperations: Int?
     var restoreFailed: Bool?
+    var writeFrozen: Bool?
+    var freezeReason: String?
     var launchAgentLoaded: Bool?
     var legacyLaunchAgent: Bool?
     var legacyBinaries: [String]?

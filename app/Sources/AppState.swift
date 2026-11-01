@@ -278,6 +278,7 @@ final class AppState {
     @ObservationIgnored private var didAutoDoctorAlert = false
     @ObservationIgnored private var didReportRestoreFailure = false
     @ObservationIgnored private var didReportNeedsRepair = false
+    @ObservationIgnored private var didReportWriteFrozen = false
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var operationTask: Task<Void, Never>?
     @ObservationIgnored private var errorDismissTask: Task<Void, Never>?
@@ -1645,6 +1646,14 @@ final class AppState {
             if (value.needsRepairTransactions ?? 0) > 0, !didReportNeedsRepair {
                 didReportNeedsRepair = true
                 showError("有恢复失败的事务需要人工重试，请在「诊断与修复」中处理。")
+            }
+            // A restore transaction that startup could not resolve keeps every
+            // business write frozen. Say so once, with the daemon's reason, so
+            // the user stops retrying and looks at diagnostics instead.
+            if value.writeFrozen == true, !didReportWriteFrozen {
+                didReportWriteFrozen = true
+                let reason = value.freezeReason.flatMap { $0.isEmpty ? nil : $0 } ?? "存在未完成的备份恢复事务"
+                showError("写入已冻结：\(reason)。健康检查与诊断仍可用，请先在「诊断与修复」中处理恢复事务。")
             }
         } catch {
             if !daemonReachable { health = nil } else { handle(error) }

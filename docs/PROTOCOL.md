@@ -230,6 +230,21 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 
 `proxy.installed` 表示代理容器当前存在（`docker compose down` 后为 false）；`running` 表示容器在运行；`adminReachable` 表示管理 API 可从 macOS 访问。
 
+### Health（`system.health`）
+
+`Health` 在 `Status` 基础上增加运行状态计数与恢复诊断字段：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `pendingTransactions` | int | 未完成事务数 |
+| `needsRepairTransactions` | int | 需人工修复的事务数（不在自动恢复范围） |
+| `runningOperations` | int | 进行中的操作数 |
+| `restoreFailed` | bool | 存在被隔离的失败恢复请求（`restore-failed-*.json`） |
+| `writeFrozen` | bool | 写入已冻结：存在未完成的备份恢复事务或未应用的恢复请求 |
+| `freezeReason` | string | 冻结原因（可直接展示给用户） |
+
+`writeFrozen=true` 时健康检查、服务/操作列表、诊断等读接口保持可用，但所有业务写操作（接入、恢复/卸载、启停、代理安装、设置修改、切换 Docker 环境）都会被拒绝并附带 `freezeReason`。恢复事务被解决（回滚完成或恢复成功）后才解除冻结。
+
 ### Settings
 
 ```json

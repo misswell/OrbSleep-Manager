@@ -210,26 +210,35 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 	}
 	entry.plan = plan
 
-	// Re-check the environment generation directly before the plan is stored,
-	// not only before the container walk: a switch during the walk would
-	// otherwise publish a plan the UI can show and select, whose items describe
-	// containers of a Docker instance that is already gone.
-	e.mu.Lock()
-	envChanged := e.dockerGeneration != planGeneration
-	e.mu.Unlock()
-	if envChanged {
+	// Publish under the SAME environment lock that guards the generation: a
+	// switch during the container walk must not publish a plan the UI can show
+	// and select, whose items describe containers of a Docker instance that is
+	// already gone. Checking the generation and then inserting into the map as
+	// two steps left exactly that window open.
+	if !e.publishPlan(entry, planGeneration) {
 		return plan, errors.New("生成计划期间 Docker 环境已切换，请重新扫描")
 	}
+	return plan, nil
+}
 
+// publishPlan stores a plan only while its Docker generation is current, and
+// evicts expired entries in the same critical section. Lock order is
+// e.mu → e.plansMu; no path may acquire them in the opposite order.
+func (e *Engine) publishPlan(entry *planEntry, planGeneration int) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.dockerGeneration != planGeneration {
+		return false
+	}
 	e.plansMu.Lock()
+	defer e.plansMu.Unlock()
 	for id, p := range e.plans {
 		if time.Since(p.createdAt) > 10*time.Minute {
 			delete(e.plans, id)
 		}
 	}
-	e.plans[plan.ID] = entry
-	e.plansMu.Unlock()
-	return plan, nil
+	e.plans[entry.plan.ID] = entry
+	return true
 }
 
 // checkProxyPublishedPort validates that the proxy port the gateway is about to

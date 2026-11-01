@@ -523,6 +523,33 @@ var deleteServiceRecord = func(e *Engine, id string) error {
 	// The known-compose-path registry entry is intentionally kept: a backup
 	// created while the service was managed must stay restorable after the
 	// service is removed.
+	if e.registryErr != nil {
+		return fmt.Errorf("已知 Compose 路径登记表未能完整迁移（%v）；为避免丢失备份恢复所需的文件路径，已拒绝删除托管记录", e.registryErr)
+	}
+	svc, ok, err := e.store.GetService(id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if svc.ComposeFile != "" {
+		// Register right before the record disappears. A service attached by an
+		// older version (or by a test fixture) may have no entry yet, and
+		// deleting the record first would leave no reference to the file. A
+		// registration failure refuses the deletion instead of dropping the path
+		// silently.
+		if err := registerKnownComposePathInStore(e.store, svc.ComposeFile); err != nil {
+			return fmt.Errorf("登记服务 %s 的 Compose 文件失败，已拒绝删除托管记录: %w", svc.ContainerName, err)
+		}
+		registered, rerr := knownComposePathRegistered(e.store, svc.ComposeFile)
+		if rerr != nil {
+			return fmt.Errorf("校验 Compose 路径登记表失败，已拒绝删除托管记录: %w", rerr)
+		}
+		if !registered {
+			return fmt.Errorf("服务 %s 的 Compose 文件 %s 未登记，删除托管记录会让备份恢复失去该路径，已拒绝", svc.ContainerName, svc.ComposeFile)
+		}
+	}
 	return e.store.DeleteService(id)
 }
 

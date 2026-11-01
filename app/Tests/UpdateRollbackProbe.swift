@@ -65,10 +65,247 @@ enum UpdateRollbackProbe {
             try missingOldBundleKeepsInstallPathNonEmpty()
             try mismatchedRestoredIdentityIsRejected()
             try backupTrimKeepsNewestRollbackCandidate()
+            try bashHelperSucceedsWhenHandshakeArrives()
+            try bashHelperRollsBackWhenHandshakeTimesOut()
+            try bashHelperKeepsInstallPathWhenOldMoveFails()
+            try bashHelperEntersManualRecoveryWhenEveryMoveBackFails()
+            try bashHelperRejectsBundleWithWrongVersion()
         } catch {
             fail("探针抛出未预期错误", describe(error))
         }
         print("OK 更新回滚故障注入探针全部通过")
+    }
+
+    // MARK: - 真实 Bash 回滚脚本故障注入
+
+    /// 运行生产脚本本体（UpdateManager.relaunchScript()），用 PATH 上的 shim
+    /// 控制 open/sleep/mv 的行为。脚本必须无论在哪一步失败都留下可恢复的证据。
+    private struct HelperRun {
+        var status: Int32
+        var stderr: String
+    }
+
+    private static func runHelper(appURL: URL, oldApp: URL, expectedVersion: String,
+                                  failMarker: URL, mvFails: Set<Int> = [],
+                                  openWritesOK: Bool) throws -> HelperRun {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let state = root.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        let okMarker = root.appendingPathComponent("update-ok")
+
+        // mv: counts invocations and fails the configured ones, then delegates
+        // to the real binary.
+        let mvShim = """
+        #!/bin/bash
+        count_file="$SHIM_STATE/mv.count"
+        n=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" > "$count_file"
+        for f in $MV_FAIL; do
+            if [ "$f" = "$n" ]; then
+                echo "shim: injected mv failure #$n" >&2
+                exit 1
+            fi
+        done
+        exec /bin/mv "$@"
+        """
+        // sleep is a no-op so the 45-iteration handshake loop completes instantly.
+        let sleepShim = "#!/bin/bash\nexit 0\n"
+        // open only simulates a healthy launch when asked to.
+        let openShim = """
+        #!/bin/bash
+        if [ "${OPEN_WRITES_OK:-0}" = "1" ] && [ -n "${OKMARK:-}" ]; then
+            : > "$OKMARK"
+        fi
+        exit 0
+        """
+        for (name, body) in [("mv", mvShim), ("sleep", sleepShim), ("open", openShim)] {
+            let path = bin.appendingPathComponent(name)
+            try body.write(to: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
+        }
+
+        let scriptURL = root.appendingPathComponent("relaunch.sh")
+        try UpdateManager.relaunchScript().write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [
+            scriptURL.path, appURL.path, oldApp.path, "12345",
+            okMarker.path, expectedVersion, failMarker.path,
+        ]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = bin.path + ":" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        env["SHIM_STATE"] = state.path
+        env["MV_FAIL"] = mvFails.sorted().map(String.init).joined(separator: " ")
+        env["OKMARK"] = okMarker.path
+        env["OPEN_WRITES_OK"] = openWritesOK ? "1" : "0"
+        process.environment = env
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        process.standardOutput = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+        return HelperRun(status: process.terminationStatus, stderr: String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// 握手成功：脚本只能退出 0，安装位置保持新版本，不做任何回滚。
+    private static func bashHelperSucceedsWhenHandshakeArrives() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appURL = root.appendingPathComponent("OrbSleepManager.app")
+        let backupRoot = root.appendingPathComponent("app-backup")
+        try FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+        try makeBundle(at: appURL, version: "0.9.9")
+        let oldApp = backupRoot.appendingPathComponent("OrbSleepManager-0.2.8-saved.app")
+        try makeBundle(at: oldApp, version: "0.2.8")
+
+        let run = try runHelper(appURL: appURL, oldApp: oldApp, expectedVersion: "0.2.8",
+                                  failMarker: root.appendingPathComponent("app-update-failed.txt"), openWritesOK: true)
+        if run.status != 0 {
+            fail("握手成功必须退出 0", "status \(run.status) \(run.stderr)")
+        }
+        if version(at: appURL) != "0.9.9" {
+            fail("握手成功时不得回滚", "安装位置版本 \(version(at: appURL))")
+        }
+        if !FileManager.default.fileExists(atPath: oldApp.path) {
+            fail("握手成功时不得消耗旧包备份", "备份不见了")
+        }
+    }
+
+    /// 45 秒健康握手超时：脚本必须回滚到旧版本，并清理移开的残留。
+    private static func bashHelperRollsBackWhenHandshakeTimesOut() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let appURL = root.appendingPathComponent("OrbSleepManager.app")
+        let backupRoot = root.appendingPathComponent("app-backup")
+        try fm.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+        try makeBundle(at: appURL, version: "0.9.9")
+        let oldApp = backupRoot.appendingPathComponent("OrbSleepManager-0.2.8-saved.app")
+        try makeBundle(at: oldApp, version: "0.2.8")
+
+        let run = try runHelper(appURL: appURL, oldApp: oldApp, expectedVersion: "0.2.8",
+                                  failMarker: root.appendingPathComponent("app-update-failed.txt"), openWritesOK: false)
+        if run.status != 0 {
+            fail("超时回滚必须成功退出", "status \(run.status) \(run.stderr)")
+        }
+        if version(at: appURL) != "0.2.8" {
+            fail("超时后安装位置必须是旧版本", "实际 \(version(at: appURL))")
+        }
+        if fm.fileExists(atPath: oldApp.path) {
+            fail("旧包必须被移回安装位置", "备份仍在 \(oldApp.path)")
+        }
+        let leftovers = names(in: root).filter { $0.contains(".rollback-") }
+        if !leftovers.isEmpty {
+            fail("成功回滚后必须清理临时目录", leftovers.joined(separator: "、"))
+        }
+        if fm.fileExists(atPath: root.appendingPathComponent("app-update-failed.txt").path) {
+            fail("成功回滚不得写人工恢复标记", "标记存在")
+        }
+    }
+
+    /// 旧包移回失败（第二次 mv 失败）：安装位置必须保住半套新包，并进入明确的
+    /// 人工恢复状态，而不是静默空掉。
+    private static func bashHelperKeepsInstallPathWhenOldMoveFails() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let appURL = root.appendingPathComponent("OrbSleepManager.app")
+        let backupRoot = root.appendingPathComponent("app-backup")
+        try fm.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+        try makeBundle(at: appURL, version: "0.9.9", marker: "truncated")
+        let oldApp = backupRoot.appendingPathComponent("OrbSleepManager-0.2.8-saved.app")
+        try makeBundle(at: oldApp, version: "0.2.8")
+
+        // 第一次 mv（移开新包）成功，第二次（放回旧包）失败，第三次（放回残留）成功。
+        let run = try runHelper(appURL: appURL, oldApp: oldApp, expectedVersion: "0.2.8",
+                                  failMarker: root.appendingPathComponent("app-update-failed.txt"),
+                                  mvFails: [2], openWritesOK: false)
+        if run.status != 3 {
+            fail("旧包移回失败必须进入人工恢复状态", "status \(run.status) \(run.stderr)")
+        }
+        if !fm.fileExists(atPath: appURL.path) {
+            fail("安装位置不得为空", "残留与旧包都不在安装位置")
+        }
+        if version(at: appURL) != "0.9.9" {
+            fail("无法放回旧包时必须保住残留", "实际 \(version(at: appURL))")
+        }
+        let marker = root.appendingPathComponent("app-update-failed.txt")
+        guard let text = try? String(contentsOf: marker, encoding: .utf8) else {
+            fail("必须写入人工恢复标记", "标记缺失")
+        }
+        if !text.contains(oldApp.path) {
+            fail("人工恢复标记必须记录备份位置", text)
+        }
+    }
+
+    /// 第二次和补偿用的第三次 mv 都失败：安装位置无法避免地空了，但两个包都
+    /// 不得被删除，必须留下人工恢复标记与准确路径。
+    private static func bashHelperEntersManualRecoveryWhenEveryMoveBackFails() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let appURL = root.appendingPathComponent("OrbSleepManager.app")
+        let backupRoot = root.appendingPathComponent("app-backup")
+        try fm.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+        try makeBundle(at: appURL, version: "0.9.9", marker: "truncated")
+        let oldApp = backupRoot.appendingPathComponent("OrbSleepManager-0.2.8-saved.app")
+        try makeBundle(at: oldApp, version: "0.2.8")
+
+        let run = try runHelper(appURL: appURL, oldApp: oldApp, expectedVersion: "0.2.8",
+                                  failMarker: root.appendingPathComponent("app-update-failed.txt"),
+                                  mvFails: [2, 3], openWritesOK: false)
+        if run.status != 3 {
+            fail("双重失败必须进入人工恢复状态", "status \(run.status) \(run.stderr)")
+        }
+        if !run.stderr.contains("手动处理") {
+            fail("必须提示人工处理", run.stderr)
+        }
+        // 两个包都还在：一个在备份位置，一个在 rescue 位置。
+        if !fm.fileExists(atPath: oldApp.path) {
+            fail("备份包不得被删除", oldApp.path)
+        }
+        let rescue = try fm.contentsOfDirectory(atPath: root.path).filter { $0.contains(".rollback-") }
+        if rescue.isEmpty {
+            fail("残留新包不得被删除", "没有 rollback 目录")
+        }
+        let marker = root.appendingPathComponent("app-update-failed.txt")
+        guard let text = try? String(contentsOf: marker, encoding: .utf8) else {
+            fail("必须写入人工恢复标记", "标记缺失")
+        }
+        if !text.contains(oldApp.path) || !text.contains(appURL.path) {
+            fail("人工恢复标记必须记录两个位置", text)
+        }
+    }
+
+    /// 放回安装位置的包版本不符：必须进入人工恢复状态并保留备份，不能报告成功。
+    private static func bashHelperRejectsBundleWithWrongVersion() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let appURL = root.appendingPathComponent("OrbSleepManager.app")
+        let backupRoot = root.appendingPathComponent("app-backup")
+        try fm.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+        try makeBundle(at: appURL, version: "0.9.9")
+        let oldApp = backupRoot.appendingPathComponent("OrbSleepManager-0.2.8-saved.app")
+        try makeBundle(at: oldApp, version: "0.0.1")
+
+        let run = try runHelper(appURL: appURL, oldApp: oldApp, expectedVersion: "0.2.8",
+                                  failMarker: root.appendingPathComponent("app-update-failed.txt"), openWritesOK: false)
+        if run.status != 3 {
+            fail("版本不符必须进入人工恢复状态", "status \(run.status) \(run.stderr)")
+        }
+        if !run.stderr.contains("版本校验不通过") {
+            fail("必须说明版本校验失败", run.stderr)
+        }
+        if !fm.fileExists(atPath: appURL.path) {
+            fail("版本不符时不得清空安装位置", "安装位置已空")
+        }
     }
 
     /// 半套新包占住了安装位置：先把残留移开，再把旧包放回，最后才丢弃残留。

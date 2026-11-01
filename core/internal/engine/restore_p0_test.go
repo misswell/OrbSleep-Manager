@@ -317,10 +317,11 @@ func TestRestoreCompletesWhenRenameLandedBeforeJournalWrite(t *testing.T) {
 }
 
 // Review item 3, the other direction: the snapshot carries a WAL copy whether or
-// not the swap ran, so sidecar presence (and a stale journalled digest) must not
-// be read as completion. The live database is still the original here, so the
-// resume has to perform the swap.
-func TestRestoreDoesNotTrustSnapshotSidecarsAsCompletionProof(t *testing.T) {
+// not the swap ran, so sidecar presence must not be read as completion. The
+// journalled digest is also the immutable contract of the transaction — a
+// staged file whose bytes no longer match it (and an archive that yields the
+// same mismatch) can never be committed.
+func TestRestoreRefusesStagedDatabaseThatDriftedFromTheJournalledDigest(t *testing.T) {
 	dir := t.TempDir()
 	backupDB := distinctDatabase(t, "resume-backup-db")
 	l := buildCrashRestore(t, dir, crashRestore{
@@ -330,14 +331,47 @@ func TestRestoreDoesNotTrustSnapshotSidecarsAsCompletionProof(t *testing.T) {
 		snapshotWAL: []byte("original-wal-records"),
 	})
 
+	err := ApplyPendingRestore(dir)
+	if err == nil || !strings.Contains(err.Error(), "摘要与恢复日志不一致") {
+		t.Fatalf("a drifted staged database must be refused, got %v", err)
+	}
+	if raw := readAll(t, l.db); !bytes.Equal(raw, l.liveDB) {
+		t.Fatal("the database was committed despite the digest mismatch")
+	}
+	if got := readAll(t, l.db+"-wal"); string(got) != "original-wal-records" {
+		t.Fatalf("the original WAL must be back next to the original database: %q", got)
+	}
+	if kept := readAll(t, filepath.Join(l.origDir, "state.sqlite-wal")); string(kept) != "original-wal-records" {
+		t.Fatalf("original WAL records lost: %q", kept)
+	}
+	mustNotExist(t, l.journal)
+	if n := failedMarkerCount(t, dir); n != 1 {
+		t.Fatalf("request must be quarantined as evidence, got %d markers", n)
+	}
+}
+
+// The resume path that still has to perform the swap: the live database is the
+// original, the staged file matches the journalled digest, and the original WAL
+// must be preserved inside the snapshot.
+func TestRestoreResumePerformsSwapWhenDigestMatches(t *testing.T) {
+	dir := t.TempDir()
+	backupDB := distinctDatabase(t, "resume-swap-backup-db")
+	l := buildCrashRestore(t, dir, crashRestore{
+		phase: journalDatabaseCommitting, committed: true,
+		backupDB:    backupDB,
+		digest:      sha256Hex(backupDB),
+		liveWAL:     []byte("committed-wal-records"),
+		snapshotWAL: []byte("committed-wal-records"),
+	})
+
 	if err := ApplyPendingRestore(dir); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	if raw := readAll(t, l.db); !bytes.Equal(raw, backupDB) {
-		t.Fatal("the database swap never ran: completion was decided from leftover sidecars")
+		t.Fatal("the database swap never ran")
 	}
 	mustNotExist(t, l.db+"-wal")
-	if kept := readAll(t, filepath.Join(l.origDir, "state.sqlite-wal")); string(kept) != "original-wal-records" {
+	if kept := readAll(t, filepath.Join(l.origDir, "state.sqlite-wal")); string(kept) != "committed-wal-records" {
 		t.Fatalf("original WAL records lost: %q", kept)
 	}
 	mustNotExist(t, l.journal)
@@ -423,7 +457,7 @@ func TestRestoreKeepsEvidenceWhenRollbackCannotComplete(t *testing.T) {
 	if jerr != nil {
 		t.Fatalf("journal must survive an unverified rollback: %v", jerr)
 	}
-	if err := json.Unmarshal(raw, &kept); err != nil || kept.Phase != journalOriginalsSaved {
+	if err := json.Unmarshal(raw, &kept); err != nil || kept.Phase != journalRollbackFailed {
 		t.Fatalf("journal = %+v err %v", kept, err)
 	}
 	if failedMarkerCount(t, dir) != 1 {
@@ -431,10 +465,12 @@ func TestRestoreKeepsEvidenceWhenRollbackCannotComplete(t *testing.T) {
 	}
 	halfApplied := readAll(t, l.composeFile)
 
-	// Restart with the request already quarantined: nothing is touched, no retry
-	// loop, and the evidence is still there for the operator.
-	if err := ApplyPendingRestore(dir); err != nil {
-		t.Fatalf("second start must leave the unresolved state alone: %v", err)
+	// Restart with the request already quarantined: the terminal ROLLBACK_FAILED
+	// phase is reported as blocked, nothing is touched, no retry loop runs, and
+	// the evidence is still there for the operator.
+	err = ApplyPendingRestore(dir)
+	if err == nil || !strings.Contains(err.Error(), "回滚未能完成") {
+		t.Fatalf("a terminal rollback failure must be reported, got %v", err)
 	}
 	if got := readAll(t, l.composeFile); !bytes.Equal(got, halfApplied) {
 		t.Fatalf("half-applied compose changed between restarts:\n%s", got)
