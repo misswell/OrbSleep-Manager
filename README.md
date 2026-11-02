@@ -1,6 +1,14 @@
 # OrbSleep Manager
 
-macOS 上的 OrbStack / Docker 容器「按需休眠」管理器。扫描现有 Compose 容器，确认后自动把宿主机端口接管到 macOS 端口网关，再由 [Lazy TCP Proxy](https://github.com/mountain-pass/lazy-tcp-proxy) 负责冷启动与空闲停止。访问地址保持原样，GUI 关闭后后台仍然工作。
+macOS 上的通用容器「按需休眠」管理器。自动发现本机的容器运行时（OrbStack、Docker Desktop、Colima、Rancher Desktop、Finch、Lima、Podman socket、自定义 Docker Context），支持多个环境同时启用；容器无论由 Docker Compose 还是 `docker run` / GUI / API 创建，都可以安全接入。接入后宿主机端口由 macOS 端口网关接管，[Lazy TCP Proxy](https://github.com/mountain-pass/lazy-tcp-proxy) 负责冷启动与空闲停止——每个环境有自己独立的代理容器与端口段。访问地址保持原样，GUI 关闭后后台仍然工作。
+
+```text
+客户端 → 127.0.0.1:8080（macOS 端口网关）→ 该环境的代理发布端口 → Lazy TCP Proxy → 业务容器:80
+```
+
+- **多环境并行**：「容器环境」页自动发现 + 手动添加 Socket；每个环境独立扫描、独立代理、独立休眠策略，互不干扰（一个环境离线不影响其他环境）。
+- **非 Compose 容器**：`docker run`/GUI/API 创建的容器走「快照重建」策略——完整保存创建配置（环境变量、挂载、匿名卷、网络别名、资源限制等），重建期间原容器保留为回滚锚点，验证通过后才删除；恢复时按快照原样还原。
+- **诚实能力声明**：远程 Docker（SSH/TCP）与 Podman 接入当前明确不支持并在界面标注；不把不支持的容器从扫描列表隐藏。详见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
 ```text
 客户端 → 127.0.0.1:8080（macOS 端口网关）→ 代理发布端口 → Lazy TCP Proxy → 业务容器:80
@@ -58,6 +66,9 @@ OrbSleepManager.app/Contents/
 | `scripts/embed-service.sh` | 构建时把 `orbsleepd`/`orbsleepctl` 与 plist 放进应用包 |
 | `scripts/phase0.py` | 端到端验收脚本（需要 OrbStack） |
 | `scripts/phase1_lifecycle.py` | 生命周期故障注入验收（停止保护 / 备份一致性 / 卸载 fail-closed；隔离数据目录） |
+| `scripts/phase2_docrun.py` | 非 Compose 容器（docker run / 快照重建）端到端验收，含两处崩溃注入 |
+| `scripts/phase3_multienv.py` | OrbStack + Colima 双环境并行验收（发现 / 启停 / 端口段 / 离线韧性） |
+| `docs/COMPATIBILITY.md` | 运行时 × 创建方式兼容性矩阵（已实测 / 未实测 / 不支持） |
 | `app/Tests/UpdateRollbackProbe.swift` | 更新回滚故障注入探针：直接编译生产 `UpdateManager.swift` 运行真实函数 |
 | `scripts/update_rollback_check.sh` | 用 `xcrun swiftc` 编译并运行上述探针（无需 Xcode 工程） |
 

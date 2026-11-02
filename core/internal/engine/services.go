@@ -46,8 +46,11 @@ func (e *Engine) ServiceAction(ctx context.Context, id, action string, params ma
 	switch action {
 	case "start", "stop":
 		// Serialise lifecycle changes with attach/restore/proxy transactions.
-		if !e.writeMu.TryLock() {
-			return nil, errors.New("正在执行接入/恢复等操作，请稍后重试")
+		// A reconcile pass legitimately holds the write lock for its whole
+		// iteration; wait a bounded window instead of failing a synchronous
+		// user action on a transient race.
+		if err := e.lockWriteBounded(5 * time.Second); err != nil {
+			return nil, err
 		}
 		defer e.writeMu.Unlock()
 		if err := e.ensureNoUnresolvedWork(); err != nil {
@@ -114,8 +117,8 @@ func (e *Engine) containerAction(ctx context.Context, svc model.Service, action 
 }
 
 func (e *Engine) updatePolicy(id string, params map[string]any) (map[string]any, error) {
-	if !e.writeMu.TryLock() {
-		return nil, errors.New("正在执行接入/恢复等操作，请稍后重试")
+	if err := e.lockWriteBounded(5 * time.Second); err != nil {
+		return nil, err
 	}
 	defer e.writeMu.Unlock()
 	if err := e.ensureNoUnresolvedWork(); err != nil {

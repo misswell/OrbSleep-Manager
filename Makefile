@@ -2,7 +2,7 @@ SHELL := /bin/bash
 BIN := $(CURDIR)/bin
 APP := $(CURDIR)/app
 
-.PHONY: all build build-core test vet swift-check app phase0 phase1 release clean install-agent uninstall-agent
+.PHONY: all build build-core test vet swift-check app phase0 phase1 phase2 phase3 release clean install-agent uninstall-agent
 
 all: build
 
@@ -34,6 +34,12 @@ phase0: build-core
 
 phase1: build-core
 	python3 scripts/phase1_lifecycle.py
+
+phase2: build-core
+	python3 scripts/phase2_docrun.py
+
+phase3: build-core
+	python3 scripts/phase3_multienv.py
 
 release:
 	./scripts/package-release.sh

@@ -2,11 +2,14 @@
 
 ## 结构
 
-- `core/`：Go 模块 `orbsleep`。`cmd/orbsleepd`（守护进程）、`cmd/orbsleepctl`（CLI）、`internal/engine`（业务核心）、`internal/compose`（Compose 定点修改）、`internal/gateway`（macOS TCP 网关）、`internal/proxy`（Lazy TCP Proxy 管理与配置）、`internal/dockerx`（Docker API over Unix Socket）、`internal/state`（SQLite）。
+- `core/`：Go 模块 `orbsleep`。`cmd/orbsleepd`（守护进程）、`cmd/orbsleepctl`（CLI）、`internal/engine`（业务核心）、`internal/runtime`（统一运行时接口 + dockerapi 适配器 + 环境发现）、`internal/deployment/docrun`（非 Compose 容器快照重建策略）、`internal/compose`（Compose 定点修改）、`internal/gateway`（macOS TCP 网关）、`internal/proxy`（Lazy TCP Proxy 管理与配置）、`internal/dockerx`（Docker API over Unix Socket）、`internal/state`（SQLite，含 environments 表）。
 - `app/`：SwiftUI 客户端，XcodeGen 工程（`app/project.yml`），产物 `app/build/Debug/OrbSleepManager.app`。`app/Support/` 存放随包分发的 LaunchAgent plist；post-build 阶段 `scripts/embed-service.sh` 把 `orbsleepd`/`orbsleepctl` 放进 `Contents/Resources`，GUI 通过 `SMAppService` 注册后台服务。
 - `docs/PROTOCOL.md`：GUI ↔ daemon 的 NDJSON 协议，**唯一契约**。改协议必须同时改 `core/internal/model`、`core/internal/api`、`app/Sources/Models.swift` 与文档。
 - `scripts/phase0.py`：真实 OrbStack 端到端验收。
 - `scripts/phase1_lifecycle.py`：生命周期故障注入验收（停止保护、备份一致性、卸载 fail-closed；使用独立数据目录，不触碰真实数据）。
+- `scripts/phase2_docrun.py`：非 Compose 容器（快照重建）端到端验收，含两处崩溃注入（重命名锚点后崩溃 / 替换容器创建后崩溃）。
+- `scripts/phase3_multienv.py`：OrbStack + Colima 双环境并行验收（需要 `colima start`）。
+- `docs/COMPATIBILITY.md`：兼容性矩阵；无法真实验证的运行时必须标注"未实测/不支持"，禁止宣称支持。
 - `app/Tests/UpdateRollbackProbe.swift` + `scripts/update_rollback_check.sh`：更新回滚故障注入探针。`app/Tests` **不是** Xcode 目标（`project.yml` 只编译 `Sources`），由 `make swift-check` 用 `xcrun swiftc` 直接编译生产 `UpdateManager.swift` 运行真实函数；改更新/回滚逻辑必须跑它。
 
 ## 构建与测试
@@ -17,10 +20,17 @@ make test           # go test ./...
 make app            # xcodegen + xcodebuild（产物 app/build/Debug）
 make phase0         # 需要 OrbStack；会创建/清理测试 Compose 项目
 make phase1         # 需要 OrbStack；生命周期故障注入（独立数据目录）
+make phase2         # 需要 OrbStack；docker run 容器快照重建验收（独立数据目录）
+make phase3         # 需要 OrbStack + Colima；双环境并行验收（独立数据目录）
 make swift-check    # 编译生产 UpdateManager 运行更新回滚故障注入（无需 Xcode 工程）
 ```
 
 ## 不可破坏的规则
+
+- 多环境：一次接入计划只能操作一个环境（`mixed_environments` 阻塞）；每个环境独立代理容器（`orbsleep-lazy-tcp-proxy` / `…-<env8>`）与不相交端口段；默认环境保留历史容器名/项目名/全局端口段。
+- docrun 策略：接入前必须持久化完整快照（txn payload + 服务备份目录）；原容器重命名为回滚锚点、验证通过后才允许删除；恢复只信 `container-snapshot.json`；托管容器被外部修改（指纹不符）时禁止自动恢复。
+- 裸 Docker API 创建容器必须用 `runtime.CreateRequestBody`（NetworkingConfig 要包 EndpointsConfig；别名同时写 Aliases 与 DNSNames，读取时合并并过滤容器自身标识）。
+- 远程 Docker（tcp/ssh）与 Podman 的接入能力是 `false`，不得因为"能连上 socket"就放开。
 
 - 不切换用户的全局 Docker Context；所有 docker 命令显式使用检测到的 socket（`DOCKER_HOST`）。
 - 不执行 `docker system prune`，不删除数据卷、镜像、业务文件。

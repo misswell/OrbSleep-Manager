@@ -692,6 +692,22 @@ func (e *Engine) adminClient() (*proxy.AdminClient, error) {
 	return proxy.NewAdminClient(fmt.Sprintf("127.0.0.1:%d", s.AdminPort), key), nil
 }
 
+// lockWriteBounded acquires writeMu, waiting up to window for an in-flight
+// reconcile/attach/restore to finish. It returns an operator-facing error
+// when the wait expires; it never proceeds without the lock.
+func (e *Engine) lockWriteBounded(window time.Duration) error {
+	deadline := time.Now().Add(window)
+	for {
+		if e.writeMu.TryLock() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("正在执行接入/恢复等操作，请稍后重试")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // setLastErrorQuiet records a last error without flooding the daemon log:
 // used by frequently polled read paths (system.health) where the condition
 // is usually transient.

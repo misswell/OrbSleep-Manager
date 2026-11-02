@@ -480,6 +480,12 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		return nil, ae
 	}
 
+	// 0. Pre-join the proxy container to the target's networks (idempotent):
+	// the proxy performs its own join when the service registers, and on
+	// slower engines that internal join can cancel and drop the admin
+	// response. Joining here keeps the admin write fast everywhere.
+	e.prejoinProxyNetworks(ctx, snap.envID, ins)
+
 	// 1. Register the service in the proxy. The undo step is registered before
 	// the write so an uncertain result (write applied but verification failed)
 	// is always followed by a restore attempt.
@@ -603,7 +609,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		if err != nil {
 			return fail(err)
 		}
-		if err := e.gw.Ensure(route); err != nil {
+		if err := e.gwEnsureWithRetry(route, 20*time.Second); err != nil {
 			return fail(fmt.Errorf("启动端口网关失败（%s:%d）: %w", hostLabel(b.HostIP), b.HostPort, err))
 		}
 	}
@@ -641,6 +647,52 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 	}
 	logger.add("info", fmt.Sprintf("%s 接入成功：%s → 代理 → 容器", snap.containerName, bindingsText(snap.bindings)))
 	return &appliedItem{snap: snap, serviceID: svcID, backupPath: backupPath, managedContent: out}, nil
+}
+
+// gwEnsureWithRetry binds a gateway route, tolerating a lingering holder of
+// the host port. VM-forwarded runtimes (Colima) tear their port forwarders
+// down asynchronously after a recreate; the original port can stay bound for
+// seconds. Every caller of gw.Ensure during attach/detach goes through here.
+func (e *Engine) gwEnsureWithRetry(route gateway.Route, window time.Duration) error {
+	deadline := time.Now().Add(window)
+	var lastErr error
+	for {
+		lastErr = e.gw.Ensure(route)
+		if lastErr == nil || !strings.Contains(lastErr.Error(), "address already in use") {
+			return lastErr
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// prejoinProxyNetworks connects the environment's proxy container to every
+// network the target container sits on. Errors are logged, not fatal: the
+// proxy retries the join itself, and some networks (host/none) cannot be
+// joined at all.
+func (e *Engine) prejoinProxyNetworks(ctx context.Context, envID string, ins *dockerx.ContainerInspect) {
+	if ins == nil {
+		return
+	}
+	spec := e.proxySpecForEnv(envID)
+	c, err := e.clientForEnv(ctx, envID)
+	if err != nil {
+		return
+	}
+	for name := range ins.NetworkSettings.Networks {
+		if strings.HasPrefix(name, "orbsleep") {
+			continue
+		}
+		jctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := c.ConnectNetwork(jctx, name, spec.ContainerName, nil)
+		cancel()
+		if err != nil && !dockerx.IsErrNotFound(err) {
+			// "already exists" style errors mean the join is already in place.
+			e.logger.Printf("info", "代理预加入网络 %s：%v（若已加入可忽略）", name, err)
+		}
+	}
 }
 
 // rollbackApplied reverts previously successful items of a failed plan. It only
@@ -813,20 +865,11 @@ func (e *Engine) ensureGatewayForService(ctx context.Context, serviceID string) 
 			return err
 		}
 		// A container that has just been recreated may hold the host port for a
-		// short moment after Docker reports it running. Retry briefly on
-		// address-in-use before declaring the managed state unreachable.
-		var lastErr error
-		for attempt := 0; attempt < 6; attempt++ {
-			if lastErr = e.gw.Ensure(route); lastErr == nil {
-				break
-			}
-			if !strings.Contains(lastErr.Error(), "address already in use") {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-		if lastErr != nil {
-			return lastErr
+		// short moment after Docker reports it running (and VM-forwarded
+		// runtimes release their forwarders asynchronously). Retry within a
+		// bounded window before declaring the managed state unreachable.
+		if err := e.gwEnsureWithRetry(route, 20*time.Second); err != nil {
+			return err
 		}
 	}
 	return nil

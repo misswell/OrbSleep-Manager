@@ -271,7 +271,32 @@ func (e *Engine) EnvironmentAction(ctx context.Context, id, action string) (mode
 		return model.EnvironmentList{}, err
 	}
 	if !ok {
-		return model.EnvironmentList{}, fmt.Errorf("环境 %s 不存在", id)
+		// A discovered (not yet registered) environment is materialised on
+		// first action — enabling it IS the act of registering it.
+		if action != "enable" && action != "test" {
+			return model.EnvironmentList{}, fmt.Errorf("环境 %s 不存在", id)
+		}
+		var found *runtime.Candidate
+		for _, cand := range runtime.Discover() {
+			if runtime.EnvID(cand.Endpoint) == id {
+				c := cand
+				found = &c
+				break
+			}
+		}
+		if found == nil {
+			return model.EnvironmentList{}, fmt.Errorf("环境 %s 不存在", id)
+		}
+		env = model.Environment{
+			ID:       id,
+			Name:     found.Name,
+			Kind:     string(found.Kind),
+			Endpoint: found.Endpoint,
+			AddedAt:  time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := e.store.UpsertEnvironment(env); err != nil {
+			return model.EnvironmentList{}, err
+		}
 	}
 	switch action {
 	case "test":
@@ -399,6 +424,22 @@ type proxyEnvSpec struct {
 	Start, End    int
 	Admin, Web    int
 	SocketPath    string
+	// LoopbackPublish is true when the engine publishes container ports
+	// directly on the macOS side (OrbStack / Docker Desktop / plain engine):
+	// the proxy must bind 127.0.0.1. VM-forwarded runtimes (Colima, Lima,
+	// Finch, Rancher Desktop) need an in-VM 0.0.0.0 bind so the host
+	// forwarder lands the ports on the macOS loopback.
+	LoopbackPublish bool
+}
+
+// envLoopbackPublish reports the publishing model of an engine kind.
+func envLoopbackPublish(kind string) bool {
+	switch kind {
+	case "colima", "lima", "finch", "rancher-desktop", "podman":
+		return false
+	default:
+		return true
+	}
 }
 
 func (e *Engine) proxySpecForEnv(envID string) proxyEnvSpec {
@@ -413,7 +454,8 @@ func (e *Engine) proxySpecForEnv(envID string) proxyEnvSpec {
 			ConfigDir:     e.proxyConfigDir(),
 			Start:         s.ProxyPortStart, End: s.ProxyPortEnd,
 			Admin: s.AdminPort, Web: s.WebPort,
-			SocketPath: e.currentEnvEndpoint(),
+			SocketPath:      vmSocketPath(string(envKindForEndpoint(e.currentEnvEndpoint()))),
+			LoopbackPublish: envLoopbackPublish(string(envKindForEndpoint(e.currentEnvEndpoint()))),
 		}
 	}
 	suffix := strings.TrimPrefix(envID, "env-")
@@ -433,7 +475,29 @@ func (e *Engine) proxySpecForEnv(envID string) proxyEnvSpec {
 		spec.Start, spec.End = env.ProxyPortStart, env.ProxyPortEnd
 		spec.Admin, spec.Web = env.AdminPort, env.WebPort
 	}
+	spec.SocketPath = vmSocketPath(env.Kind)
+	spec.LoopbackPublish = envLoopbackPublish(env.Kind)
 	return spec
+}
+
+// envKindForEndpoint classifies without touching the store (best effort).
+func envKindForEndpoint(endpoint string) runtime.Kind {
+	return runtime.KindFromPath(endpoint)
+}
+
+// vmSocketPath returns the socket path INSIDE the engine VM for the proxy
+// mount. The macOS-side endpoint (e.g. ~/.colima/default/docker.sock) is how
+// the host reaches the API; a container inside the VM must mount the daemon's
+// own socket, which every Docker-compatible VM runtime exposes at
+// /var/run/docker.sock. Per-kind overrides belong here when a runtime that
+// differs shows up.
+func vmSocketPath(kind string) string {
+	switch kind {
+	case "podman":
+		return "/var/run/podman/podman.sock"
+	default:
+		return "/var/run/docker.sock"
+	}
 }
 
 // adminClientForEnv returns the admin API client for an environment's proxy.

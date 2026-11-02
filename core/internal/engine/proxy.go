@@ -108,6 +108,17 @@ type PublishedPort struct {
 	Bindings      []HostBinding
 }
 
+// wildcardV4Port returns the host port published on the wildcard address
+// inside a VM (Colima-style runtimes), or 0 when absent.
+func (p PublishedPort) wildcardV4Port() int {
+	for _, b := range p.Bindings {
+		if b.HostIP == "" || b.HostIP == "0.0.0.0" {
+			return b.HostPort
+		}
+	}
+	return 0
+}
+
 // loopbackV4Port returns the host port published on exactly 127.0.0.1, the only
 // address the gateway can dial, or 0 when the port has no such binding.
 func (p PublishedPort) loopbackV4Port() int {
@@ -494,7 +505,11 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 		logger.finish(status, msg+"；备份位于 "+snapDir)
 	}
 
-	if err := compose.WriteAtomic(composePath, proxy.ComposeFile(next, key, cfgDir, spec.ContainerName, spec.SocketPath), 0o600); err != nil {
+	publishIP := "127.0.0.1"
+	if !spec.LoopbackPublish {
+		publishIP = ""
+	}
+	if err := compose.WriteAtomic(composePath, proxy.ComposeFile(next, key, cfgDir, spec.ContainerName, spec.SocketPath, publishIP), 0o600); err != nil {
 		restore(fmt.Errorf("写入代理 Compose 文件失败: %w", err))
 		return
 	}
@@ -687,8 +702,12 @@ func findFreeRangeExcluding(size int, owned, reserved map[int]bool) (int, int, b
 
 // chooseManagedPort keeps preferred when it is free or already owned by our
 // proxy, otherwise picks the next free port not reserved for other purposes.
+// preferred <= 0 means "no preference": scan from the 49000 ephemeral band.
 func chooseManagedPort(preferred int, owned, reserved map[int]bool) (int, error) {
-	if preferred > 0 && !reserved[preferred] && (owned[preferred] || proxy.PortFree("127.0.0.1", preferred)) {
+	if preferred <= 0 {
+		preferred = 49000
+	}
+	if !reserved[preferred] && (owned[preferred] || proxy.PortFree("127.0.0.1", preferred)) {
 		return preferred, nil
 	}
 	for p := preferred; p < preferred+200 && p <= 65535; p++ {
@@ -913,9 +932,26 @@ func validateProxyConfig(cfg proxy.Config) error {
 
 // putProxyConfigVerified writes a config and re-reads it. A failure to read
 // back does not mean the write did not happen; callers must treat this as an
-// uncertain state and attempt a restore.
+// uncertain state and attempt a restore. Transient connection failures
+// (EOF/reset through a VM port forwarder, or the proxy's own network-join
+// window) are retried: the write is idempotent full-state, so a retry can
+// never double-apply.
 func (e *Engine) putProxyConfigVerified(ctx context.Context, admin *proxy.AdminClient, cfg proxy.Config) error {
-	if err := admin.UpdateConfig(ctx, cfg); err != nil {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = admin.UpdateConfig(ctx, cfg); err == nil {
+			break
+		}
+		if !isTransientAdminError(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 700 * time.Millisecond):
+		}
+	}
+	if err != nil {
 		return err
 	}
 	got, err := admin.GetConfig(ctx)
@@ -928,9 +964,40 @@ func (e *Engine) putProxyConfigVerified(ctx context.Context, admin *proxy.AdminC
 	return nil
 }
 
+// isTransientAdminError reports whether an admin API failure looks like a
+// transport hiccup (VM forwarder restart, proxy restarting, proxy busy doing
+// network joins) rather than a definite refusal.
+func isTransientAdminError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"eof", "connection reset", "broken pipe", "connection refused", "timeout", "temporarily unavailable"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // verifyProxyService confirms one service entry exists with the expected ports.
 func (e *Engine) verifyProxyService(ctx context.Context, admin *proxy.AdminClient, want proxy.ServiceConfig) error {
-	got, err := admin.GetConfig(ctx)
+	var got proxy.Config
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		got, err = admin.GetConfig(ctx)
+		if err == nil {
+			break
+		}
+		if !isTransientAdminError(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 700 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		return err
 	}

@@ -207,7 +207,14 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 		return nil, ae
 	}
 
-	// 1. Register the service in the proxy (identical semantics to compose).
+	// 1. Pre-join the proxy container to the target's networks. The proxy
+	// joins target networks itself when a service registers, with its own
+	// short timeout — on slower engines (Colima) that join can cancel and
+	// tear down the admin response. Doing it here (idempotent) removes the
+	// slow path entirely.
+	e.prejoinProxyNetworks(ctx, snap.envID, ins)
+
+	// 1a. Register the service in the proxy (identical semantics to compose).
 	nextCfg := prevCfg.Clone()
 	sc := proxy.ServiceConfig{
 		Name:             snap.containerName,
@@ -284,11 +291,11 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 		return nil
 	}})
 	for _, b := range snap.bindings {
-		route, err := e.gatewayRoute(ctx, svcID, snap.containerName, b, s)
+		route, err := e.gatewayRouteForEnv(ctx, snap.envID, svcID, snap.containerName, b, s)
 		if err != nil {
 			return fail(err)
 		}
-		if err := e.gw.Ensure(route); err != nil {
+		if err := e.gwEnsureWithRetry(route, 20*time.Second); err != nil {
 			return fail(fmt.Errorf("启动端口网关失败（%s:%d）: %w", hostLabel(b.HostIP), b.HostPort, err))
 		}
 	}

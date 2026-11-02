@@ -24,7 +24,7 @@ import (
 	"orbsleep/internal/settings"
 )
 
-const version = "0.2.9"
+const version = "0.3.0"
 
 type globals struct {
 	socket  string
@@ -643,6 +643,10 @@ func environmentAction(c *client.Client, args []string) {
 	}
 	var out model.EnvironmentList
 	must(c.Call(context.Background(), "environment.action", map[string]any{"id": args[0], "action": args[1]}, &out))
+	if hasFlag(args[2:], "--json") {
+		printJSON(out)
+		return
+	}
 	fmt.Printf("环境 %s 已执行 %s（共 %d 个注册环境）\n", args[0], args[1], len(out.Environments))
 }
 
