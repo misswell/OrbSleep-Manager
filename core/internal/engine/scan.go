@@ -10,6 +10,7 @@ import (
 
 	"orbsleep/internal/dockerx"
 	"orbsleep/internal/model"
+	"orbsleep/internal/runtime"
 	"orbsleep/internal/scan"
 )
 
@@ -27,11 +28,14 @@ func (e *Engine) Scan(ctx context.Context, envID string) (model.ScanResult, erro
 	if !ok {
 		return model.ScanResult{}, fmt.Errorf("环境 %s 不存在", envID)
 	}
-	return e.scanOne(ctx, env)
+	return e.scanOne(ctx, env, nil)
 }
 
-// scanOne scans a single environment.
-func (e *Engine) scanOne(ctx context.Context, env model.Environment) (model.ScanResult, error) {
+// scanOne scans a single environment. globalSem (optional) caps total
+// concurrent inspects across a multi-environment scan: each environment has
+// its own per-scan limiter, and without a global cap N environments would
+// yield N×8 concurrent API calls against possibly resource-constrained VMs.
+func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem chan struct{}) (model.ScanResult, error) {
 	c, err := e.clientForEnv(ctx, env.ID)
 	if err != nil {
 		e.setLastError("扫描失败: " + err.Error())
@@ -52,11 +56,28 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment) (model.Scan
 		ProxyContainerName:   e.proxySpecForEnv(env.ID).ContainerName,
 	}
 	services, _ := e.store.ListServices()
+	primary := e.currentEnvID()
+	// Container IDs are engine-unique, so ID matching may span services of any
+	// environment. NAME matching must stay inside THIS environment: two
+	// engines can run same-named containers, and a cross-environment name hit
+	// would stamp a container with another environment's service record.
 	managedByID := map[string]string{}
 	managedByName := map[string]string{}
 	for _, svc := range services {
-		managedByID[svc.ContainerID] = svc.ID
-		managedByName[svc.ContainerName] = svc.ID
+		if svc.ContainerID != "" {
+			managedByID[svc.ContainerID] = svc.ID
+		}
+		svcEnv := svc.EnvironmentID
+		if svcEnv == "" {
+			if svc.DockerSocket == "" || svc.DockerSocket == strings.TrimPrefix(e.currentEnvEndpoint(), "unix://") {
+				svcEnv = primary
+			} else {
+				svcEnv = runtime.EnvID("unix://" + svc.DockerSocket)
+			}
+		}
+		if svcEnv == env.ID && svc.ContainerName != "" {
+			managedByName[svc.ContainerName] = svc.ID
+		}
 	}
 
 	results := make([]model.Container, len(summaries))
@@ -66,6 +87,10 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment) (model.Scan
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
+			if globalSem != nil {
+				globalSem <- struct{}{}
+				defer func() { <-globalSem }()
+			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			ins, err := c.InspectContainer(ctx, id)
@@ -158,7 +183,7 @@ func (e *Engine) scanAll(ctx context.Context) (model.ScanResult, error) {
 		// Fall back to the primary detection path so a fresh install still
 		// scans before the environment row exists.
 		env := model.Environment{ID: e.currentEnvID(), Name: "Docker", Kind: "docker-engine"}
-		return e.scanOne(ctx, env)
+		return e.scanOne(ctx, env, nil)
 	}
 	merged := model.ScanResult{
 		ScannedAt:  time.Now().UTC().Format(time.RFC3339),
@@ -167,12 +192,15 @@ func (e *Engine) scanAll(ctx context.Context) (model.ScanResult, error) {
 	}
 	var mu sync.Mutex
 	var firstErr error
+	// One global inspect cap across all environments: a per-env limiter alone
+	// would scale concurrency with the environment count.
+	globalSem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 	for _, env := range enabled {
 		wg.Add(1)
 		go func(env model.Environment) {
 			defer wg.Done()
-			res, err := e.scanOne(ctx, env)
+			res, err := e.scanOne(ctx, env, globalSem)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {

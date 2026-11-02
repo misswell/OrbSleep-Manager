@@ -341,9 +341,14 @@ func (e *Engine) validateContainerIPDialMode() error {
 		return errors.New("无法获取代理容器 IP，不能启用 container_ip 模式")
 	}
 	d := netDialer(3 * time.Second)
-	// Probe the exact ports the gateway would use. Without managed services,
-	// fall back to the proxy web listener as a basic routing check.
-	services, _ := e.store.ListServices()
+	// Probe the exact ports the gateway would use. A store read failure is
+	// NOT a clean board: proceeding with an empty service list would let the
+	// web-port fallback vouch for proxy ports the gateway actually needs.
+	// Fail closed instead.
+	services, err := e.store.ListServices()
+	if err != nil {
+		return fmt.Errorf("读取托管服务失败，拒绝切换代理网络模式: %w", err)
+	}
 	probed := 0
 	for _, svc := range services {
 		for _, b := range svc.Bindings {
@@ -484,7 +489,14 @@ func (e *Engine) UpdateSettings(patch map[string]any) (model.Settings, error) {
 	portsChanged := old.AdminPort != s.AdminPort || old.WebPort != s.WebPort ||
 		old.ProxyPortStart != s.ProxyPortStart || old.ProxyPortEnd != s.ProxyPortEnd
 	if portsChanged {
-		if installed, _ := e.proxyInstalled(); installed {
+		// An unknown install state must be treated as installed: modifying the
+		// published range while a proxy container exists would orphan it.
+		// Fail closed instead of reading "unknown" as "not installed".
+		installed, instErr := e.proxyInstalled()
+		if instErr != nil {
+			return s, fmt.Errorf("无法确认代理安装状态（%v），拒绝修改端口设置；请确认 Docker 可用后再试", instErr)
+		}
+		if installed {
 			return s, errors.New("代理已安装：修改管理端口/状态端口/端口范围会导致管理接口失联。请先卸载代理（docker compose -p orbsleep-proxy down）后再修改，并重新运行 proxy-setup")
 		}
 	}
