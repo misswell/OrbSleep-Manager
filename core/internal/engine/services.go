@@ -89,7 +89,7 @@ func (e *Engine) ServiceAction(ctx context.Context, id, action string, params ma
 }
 
 func (e *Engine) containerAction(ctx context.Context, svc model.Service, action string) error {
-	c, err := e.dockerClient(ctx)
+	c, err := e.clientForEnv(ctx, svc.EnvironmentID)
 	if err != nil {
 		return err
 	}
@@ -187,6 +187,13 @@ func (e *Engine) runDetach(ctx context.Context, svc model.Service, op model.Oper
 	// attach on the same file.
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+
+	// docrun services have no Compose file: their restore path is driven by
+	// the durable container snapshot instead of YAML edits.
+	if svc.Strategy == "docrun" {
+		e.runDetachDocrun(ctx, svc, op, remove, done)
+		return
+	}
 
 	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
 	lock, lerr := e.composeLocker.Acquire(lockCtx, svc.ComposeFile)
@@ -339,11 +346,11 @@ func (e *Engine) rebuildMissingCompose(svc model.Service, backupFile string) ([]
 // removed first and verified; the managed record is only deleted after the
 // container is running and the original ports are published and reachable.
 func (e *Engine) restoreService(ctx context.Context, logger *opLogger, svc model.Service) error {
-	cli, cliErr := e.cliRunner()
+	cli, cliErr := e.cliForEnv(ctx, svc.EnvironmentID)
 	if cliErr != nil {
 		return fmt.Errorf("docker CLI 不可用，无法重建服务: %w", cliErr)
 	}
-	admin, adminErr := e.adminClient()
+	admin, adminErr := e.adminClientForEnv(svc.EnvironmentID)
 	if adminErr != nil {
 		return fmt.Errorf("代理管理接口不可用，无法安全恢复: %w", adminErr)
 	}

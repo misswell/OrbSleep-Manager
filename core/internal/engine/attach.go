@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"orbsleep/internal/compose"
+	"orbsleep/internal/deployment/docrun"
 	"orbsleep/internal/dockerx"
 	"orbsleep/internal/failpoint"
 	"orbsleep/internal/gateway"
@@ -40,6 +41,10 @@ type appliedItem struct {
 	serviceID      string
 	backupPath     string
 	managedContent []byte
+	// docrun strategy fields (nil for compose items).
+	strategy      string
+	prep          *docrun.PreparedAttach
+	replacementID string
 }
 
 type undoStep struct {
@@ -148,10 +153,19 @@ func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSna
 	}
 	logger.add("info", fmt.Sprintf("接入计划 %s 开始执行（%d 个容器）", plan.ID, len(items)))
 
+	// One plan operates on ONE environment (enforced at plan time): its proxy
+	// baseline, CLI and client all belong to that environment.
+	envID := ""
+	for _, it := range items {
+		if it.envID != "" {
+			envID = it.envID
+			break
+		}
+	}
 	// A complete, validated baseline snapshot is mandatory. Never start
 	// modifying anything if it cannot be read: rollback must be able to
 	// restore exactly what existed before.
-	admin, err := e.adminClient()
+	admin, err := e.adminClientForEnv(envID)
 	if err != nil {
 		logger.finish("failed", "无法连接代理管理接口，已终止（未做任何修改）: "+err.Error())
 		e.setLastError("接入未执行: " + err.Error())
@@ -234,6 +248,11 @@ func (e *Engine) runAttach(ctx context.Context, plan model.Plan, items []planSna
 }
 
 func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, fileStates map[string][]byte, admin *proxy.AdminClient, txnID string) (*appliedItem, error) {
+	// The docrun strategy has no Compose file and therefore no file lock;
+	// it branches off before any Compose-specific machinery runs.
+	if snap.strategy == "docrun" {
+		return e.attachOneDocrun(ctx, logger, idx, snap, admin, txnID)
+	}
 	lockCtx, lockCancel := context.WithTimeout(ctx, 60*time.Second)
 	lock, lerr := e.composeLocker.Acquire(lockCtx, snap.composeFile)
 	lockCancel()
@@ -254,11 +273,11 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		return nil, &attachError{Err: rerr}
 	}
 	s := e.settings.Get()
-	cli, err := e.cliRunner()
+	cli, err := e.cliForEnv(ctx, snap.envID)
 	if err != nil {
 		return nil, &attachError{Err: err}
 	}
-	c, err := e.dockerClient(ctx)
+	c, err := e.clientForEnv(ctx, snap.envID)
 	if err != nil {
 		return nil, &attachError{Err: err}
 	}
@@ -580,7 +599,7 @@ func (e *Engine) attachOne(ctx context.Context, logger *opLogger, idx int, snap 
 		return nil
 	}})
 	for _, b := range snap.bindings {
-		route, err := e.gatewayRoute(ctx, svcID, snap.containerName, b, s)
+		route, err := e.gatewayRouteForEnv(ctx, snap.envID, svcID, snap.containerName, b, s)
 		if err != nil {
 			return fail(err)
 		}
@@ -641,11 +660,15 @@ func (e *Engine) rollbackApplied(logger *opLogger, applied []appliedItem, base p
 	// Rollback must never inherit a cancelled business context (e.g. shutdown).
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
-	cli, err := e.cliRunner()
+	envID := ""
+	if len(applied) > 0 {
+		envID = applied[0].snap.envID
+	}
+	cli, err := e.cliForEnv(ctx, envID)
 	if err != nil {
 		return &rollbackDeferredError{Cause: fmt.Errorf("docker CLI 不可用: %w", err)}
 	}
-	admin, err := e.adminClient()
+	admin, err := e.adminClientForEnv(envID)
 	if err != nil {
 		return &rollbackDeferredError{Cause: fmt.Errorf("代理管理接口不可用: %w", err)}
 	}
@@ -659,6 +682,20 @@ func (e *Engine) rollbackApplied(logger *opLogger, applied []appliedItem, base p
 		name := ai.snap.containerName
 		logger.add("warn", "回滚 "+name)
 		e.gw.RemoveService(ai.serviceID)
+
+		if ai.strategy == "docrun" {
+			if err := e.rollbackDocrunApplied(ctx, logger, ai); err != nil {
+				errs = append(errs, name+": 恢复原容器失败: "+err.Error())
+				// Keep the managed wiring reachable while the operator decides.
+				if gerr := e.ensureGatewayForService(ctx, ai.serviceID); gerr != nil {
+					errs = append(errs, name+": 重新监听失败: "+gerr.Error())
+				}
+				continue
+			}
+			rolledBack[name] = true
+			logger.add("info", name+" 已恢复到接入前状态")
+			continue
+		}
 
 		current, err := os.ReadFile(ai.snap.composeFile)
 		if err != nil || !bytes.Equal(current, ai.managedContent) {
@@ -739,7 +776,7 @@ func (e *Engine) rollbackApplied(logger *opLogger, applied []appliedItem, base p
 // and re-installs gateway listeners. Used when restoring the original port
 // mapping failed midway.
 func (e *Engine) revertToManaged(ai appliedItem) error {
-	cli, err := e.cliRunner()
+	cli, err := e.cliForEnv(context.Background(), ai.snap.envID)
 	if err != nil {
 		return err
 	}
@@ -914,9 +951,24 @@ func gatewayRouteFor(svcID, name string, b model.Binding, s model.Settings, prox
 }
 
 func (e *Engine) gatewayRoute(ctx context.Context, svcID, name string, b model.Binding, s model.Settings) (gateway.Route, error) {
+	return e.gatewayRouteForEnv(ctx, "", svcID, name, b, s)
+}
+
+// gatewayRouteForEnv builds a route using the environment's own proxy IP.
+// envID empty means the primary environment.
+func (e *Engine) gatewayRouteForEnv(ctx context.Context, envID, svcID, name string, b model.Binding, s model.Settings) (gateway.Route, error) {
 	ip := ""
 	if s.ProxyDialMode == "container_ip" {
-		ip = e.proxyContainerIP(ctx)
+		spec := e.proxySpecForEnv(envID)
+		c, err := e.clientForEnv(ctx, envID)
+		if err != nil {
+			return gateway.Route{}, err
+		}
+		ins, err := c.InspectContainer(ctx, spec.ContainerName)
+		if err != nil {
+			return gateway.Route{}, fmt.Errorf("container_ip 模式无法解析代理容器 IP: %w", err)
+		}
+		ip = containerIP(ins)
 	}
 	return gatewayRouteFor(svcID, name, b, s, ip)
 }

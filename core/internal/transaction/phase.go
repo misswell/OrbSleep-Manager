@@ -24,6 +24,13 @@ const (
 	PhaseRolledBack         Phase = "rolled_back"
 	PhaseRollbackFailed     Phase = "rollback_failed"
 	PhaseNeedsRepair        Phase = "needs_repair"
+
+	// docrun strategy phases (recreate without a Compose file). Between
+	// proxy_updated and container_recreated the original container is parked
+	// under its backup name and the replacement is built from the snapshot.
+	PhaseOriginalRenamed    Phase = "original_renamed"
+	PhaseReplacementCreated Phase = "replacement_created"
+	PhaseSnapshotPersisted  Phase = "snapshot_persisted"
 )
 
 // CanTransition reports whether phase b is a legal successor of a. Recovery
@@ -37,7 +44,8 @@ func CanTransition(a, b Phase) bool {
 		switch b {
 		case PhasePrepared, PhaseApplying, PhaseProxyUpdated, PhaseComposeWrite, PhaseComposeWritten,
 			PhaseComposeUpdated, PhaseContainerReady, PhaseContainerRecreated, PhaseGatewayReady,
-			PhaseVerifying, PhaseVerified, PhaseCommittedItem, PhaseRollbackPending, PhaseNeedsRepair:
+			PhaseVerifying, PhaseVerified, PhaseCommittedItem, PhaseRollbackPending, PhaseNeedsRepair,
+			PhaseSnapshotPersisted, PhaseOriginalRenamed, PhaseReplacementCreated:
 			return true
 		default:
 			return false
@@ -53,11 +61,17 @@ func CanTransition(a, b Phase) bool {
 	case PhasePlanned:
 		return b == PhasePrepared || b == PhaseApplying
 	case PhasePrepared:
-		return b == PhaseApplying || b == PhaseProxyUpdated || b == PhaseComposeWrite
+		return b == PhaseApplying || b == PhaseProxyUpdated || b == PhaseComposeWrite || b == PhaseSnapshotPersisted
 	case PhaseApplying:
-		return b == PhaseProxyUpdated || b == PhaseComposeWrite || b == PhaseVerifying
+		return b == PhaseProxyUpdated || b == PhaseComposeWrite || b == PhaseVerifying || b == PhaseSnapshotPersisted
 	case PhaseProxyUpdated:
-		return b == PhaseComposeWrite || b == PhaseVerifying || b == PhaseComposeUpdated
+		return b == PhaseComposeWrite || b == PhaseVerifying || b == PhaseComposeUpdated || b == PhaseSnapshotPersisted
+	case PhaseSnapshotPersisted:
+		return b == PhaseOriginalRenamed || b == PhaseContainerRecreated || b == PhaseVerifying || b == PhaseRollbackPending
+	case PhaseOriginalRenamed:
+		return b == PhaseReplacementCreated || b == PhaseContainerRecreated || b == PhaseRollbackPending
+	case PhaseReplacementCreated:
+		return b == PhaseContainerRecreated || b == PhaseRollbackPending
 	case PhaseComposeWrite:
 		return b == PhaseComposeWritten || b == PhaseComposeUpdated || b == PhaseVerifying || b == PhaseRollbackPending
 	case PhaseComposeWritten:

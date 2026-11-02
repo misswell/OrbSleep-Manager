@@ -188,9 +188,9 @@ func (f *fakeCLI) UpService(ctx context.Context, project, file, workdir, service
 	f.docker.setPublished(published)
 	return nil
 }
-func (f *fakeCLI) ProxyUp(ctx context.Context, file string) error   { return f.proxyUpErr }
-func (f *fakeCLI) ProxyDown(ctx context.Context, file string) error { return nil }
-func (f *fakeCLI) Version(ctx context.Context) (string, error)      { return "fake", nil }
+func (f *fakeCLI) ProxyUp(ctx context.Context, project, file string) error   { return f.proxyUpErr }
+func (f *fakeCLI) ProxyDown(ctx context.Context, project, file string) error { return nil }
+func (f *fakeCLI) Version(ctx context.Context) (string, error)               { return "fake", nil }
 
 func composeConfigFor(ports []model.PortBinding) func(string) (map[string]any, error) {
 	return func(file string) (map[string]any, error) {
@@ -774,7 +774,7 @@ func TestProxySetupWriteFailureRestoresAbsentCompose(t *testing.T) {
 	if err := e.store.InsertOperation(op); err != nil {
 		t.Fatal(err)
 	}
-	e.runProxySetup(context.Background(), op, func() {})
+	e.runProxySetup(context.Background(), op, func() {}, "")
 	got, ok, err := e.store.GetOperation(op.ID)
 	if err != nil || !ok {
 		t.Fatal(err)
@@ -803,7 +803,7 @@ func TestProxySetupRollbackFailureIsReported(t *testing.T) {
 	if err := e.store.InsertOperation(op); err != nil {
 		t.Fatal(err)
 	}
-	e.runProxySetup(context.Background(), op, func() {})
+	e.runProxySetup(context.Background(), op, func() {}, "")
 	got, ok, err := e.store.GetOperation(op.ID)
 	if err != nil || !ok {
 		t.Fatal(err)
@@ -934,7 +934,7 @@ func TestProxySetupAbortsWhenBackupCannotBeWritten(t *testing.T) {
 	if err := e.store.InsertOperation(op); err != nil {
 		t.Fatal(err)
 	}
-	e.runProxySetup(context.Background(), op, func() {})
+	e.runProxySetup(context.Background(), op, func() {}, "")
 	got, ok, err := e.store.GetOperation(op.ID)
 	if err != nil || !ok {
 		t.Fatal(err)

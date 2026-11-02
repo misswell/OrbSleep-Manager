@@ -450,8 +450,8 @@ func TestReconcileSkipsForeignSocketServices(t *testing.T) {
 	if !ok {
 		t.Fatal("record missing")
 	}
-	if got.Status != "missing" || !strings.Contains(got.LastError, "Docker 实例") {
-		t.Fatalf("foreign service must warn about its instance: %+v", got)
+	if got.Status != "missing" || !strings.Contains(got.LastError, "环境") {
+		t.Fatalf("foreign service must warn about its environment: %+v", got)
 	}
 }
 
@@ -627,7 +627,7 @@ func TestBusinessWritesBlockedByFailedRecovery(t *testing.T) {
 	}
 
 	// ProxySetup.
-	if _, err := e.ProxySetup(); err == nil {
+	if _, err := e.ProxySetup(""); err == nil {
 		t.Fatal("ProxySetup must be refused while recovery is unresolved")
 	}
 }

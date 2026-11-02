@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -222,6 +223,74 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, force bool) err
 	return c.do(ctx, http.MethodDelete, path, nil, nil)
 }
 
+// StartContainer starts a stopped container.
+func (c *Client) StartContainer(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodPost, "/containers/"+id+"/start", nil, nil)
+}
+
+// StopContainer stops a running container, waiting up to timeout seconds.
+func (c *Client) StopContainer(ctx context.Context, id string, timeout int) error {
+	path := "/containers/" + id + "/stop"
+	if timeout > 0 {
+		path += fmt.Sprintf("?t=%d", timeout)
+	}
+	return c.do(ctx, http.MethodPost, path, nil, nil)
+}
+
+// RenameContainer renames a container. Used by the docker-run recreate path to
+// keep the original container as an instant rollback anchor while the
+// replacement is built under the original name.
+func (c *Client) RenameContainer(ctx context.Context, id, name string) error {
+	return c.do(ctx, http.MethodPost, "/containers/"+id+"/rename?name="+url.QueryEscape(name), nil, nil)
+}
+
+// CreateContainer creates a container and returns its ID. The body is the
+// Engine API create request (Config/HostConfig/NetworkingConfig at top level).
+func (c *Client) CreateContainer(ctx context.Context, name string, body any) (string, error) {
+	path := "/containers/create"
+	if name != "" {
+		path += "?name=" + url.QueryEscape(name)
+	}
+	var out struct {
+		ID       string   `json:"Id"`
+		Warnings []string `json:"Warnings"`
+	}
+	if err := c.do(ctx, http.MethodPost, path, body, &out); err != nil {
+		return "", err
+	}
+	if out.ID == "" {
+		return "", fmt.Errorf("容器创建响应缺少 Id")
+	}
+	return out.ID, nil
+}
+
+// ConnectNetwork attaches a container to a network. endpoint may be nil.
+func (c *Client) ConnectNetwork(ctx context.Context, network, containerID string, endpoint any) error {
+	body := struct {
+		Container      string `json:"Container"`
+		EndpointConfig any    `json:"EndpointConfig,omitempty"`
+	}{Container: containerID, EndpointConfig: endpoint}
+	return c.do(ctx, http.MethodPost, "/networks/"+url.QueryEscape(network)+"/connect", body, nil)
+}
+
+// DisconnectNetwork detaches a container from a network.
+func (c *Client) DisconnectNetwork(ctx context.Context, network, containerID string) error {
+	body := struct {
+		Container string `json:"Container"`
+		Force     bool   `json:"Force"`
+	}{Container: containerID}
+	return c.do(ctx, http.MethodPost, "/networks/"+url.QueryEscape(network)+"/disconnect", body, nil)
+}
+
+// FullVersion returns the engine identity payload (used to label environments).
+func (c *Client) FullVersion(ctx context.Context) (*EngineVersion, error) {
+	var v EngineVersion
+	if err := c.get(ctx, "/version", &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
 // Events subscribes to Docker events. The caller must close the body.
 func (c *Client) Events(ctx context.Context) (io.ReadCloser, error) {
 	return c.Stream(ctx, "/events?filters="+urlQueryEscape(`{"type":["container"]}`))
@@ -248,11 +317,47 @@ func detectContextName(socket string) string {
 	return "default"
 }
 
+// contextKind labels a socket path with its runtime family. OrbStack keeps its
+// historical kind value; other runtimes are recognised by their well-known
+// socket locations. The runtime package refines the kind with the engine
+// identity returned by /version.
 func contextKind(socket string) string {
-	if strings.Contains(socket, ".orbstack") {
-		return "orbstack"
+	switch KindFromPath(socket) {
+	case "orbstack", "colima", "rancher-desktop", "finch", "lima", "podman", "docker-desktop":
+		return KindFromPath(socket)
 	}
 	return "docker"
+}
+
+// KindFromPath classifies a socket path without contacting the engine.
+func KindFromPath(socket string) string {
+	home, _ := os.UserHomeDir()
+	homePrefix := filepath.ToSlash(home)
+	path := filepath.ToSlash(socket)
+	switch {
+	case strings.Contains(path, ".orbstack"):
+		return "orbstack"
+	case strings.Contains(path, ".colima"), strings.Contains(path, ".lima"):
+		if strings.Contains(path, ".colima") {
+			return "colima"
+		}
+		return "lima"
+	case strings.Contains(path, "/.rd/"):
+		return "rancher-desktop"
+	case strings.Contains(path, ".finch"):
+		return "finch"
+	case strings.Contains(path, "podman"):
+		return "podman"
+	case strings.Contains(path, ".docker/run") || strings.Contains(path, ".docker/desktop"):
+		return "docker-desktop"
+	case path == "/var/run/docker.sock":
+		return "docker"
+	case homePrefix != "" && strings.HasPrefix(path, homePrefix):
+		// Unknown socket under the user's home: treat as generic docker.
+		return "docker"
+	default:
+		return "docker"
+	}
 }
 
 func currentContext() string {

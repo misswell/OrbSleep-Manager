@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"orbsleep/internal/deployment/docrun"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/state"
@@ -26,6 +27,11 @@ type detachPayload struct {
 	ManagedContent   []byte        `json:"managedContent"`
 	ExpectedRestored []byte        `json:"expectedRestored"`
 	Phase            string        `json:"phase"`
+	// Strategy: "compose" (default for legacy records) or "docrun". Docrun
+	// detaches restore the original container from DocrunSnapshot instead of
+	// editing a Compose file.
+	Strategy string                  `json:"strategy,omitempty"`
+	Docrun   *docrun.ManagedSnapshot `json:"docrunSnapshot,omitempty"`
 }
 
 type txnItem struct {
@@ -44,6 +50,18 @@ type txnItem struct {
 	ManagedContent []byte               `json:"managedContent"`
 	ServiceID      string               `json:"serviceId"`
 	Phase          string               `json:"phase"`
+	// Strategy: "compose" (default) or "docrun".
+	Strategy string `json:"strategy,omitempty"`
+	// EnvID pins the item to the environment it was planned on.
+	EnvID string `json:"envId,omitempty"`
+	// TakeoverKeys are the container port keys ("8080/tcp") whose TCP host
+	// bindings the gateway takes over (docrun only).
+	TakeoverKeys []string `json:"takeoverKeys,omitempty"`
+	// Docrun carries the full recreation snapshot for docrun items. It is
+	// persisted before the first container mutation.
+	Docrun *docrun.PreparedAttach `json:"docrun,omitempty"`
+	// ReplacementID is the replacement container created for docrun items.
+	ReplacementID string `json:"replacementId,omitempty"`
 }
 
 func txnFromPlan(opID string, baseline proxy.Config, snaps []planSnapshot) txnPayload {
@@ -55,6 +73,8 @@ func txnFromPlan(opID string, baseline proxy.Config, snaps []planSnapshot) txnPa
 			ComposeFile: s.composeFile, WorkingDir: s.workingDir,
 			Content: append([]byte(nil), s.content...), Removals: s.removals,
 			ProxyMappings: s.proxyMappings, Bindings: s.bindings, Phase: "planned",
+			Strategy: s.strategy, EnvID: s.envID, TakeoverKeys: s.takeoverKeys,
+			Docrun: s.docrun,
 		}
 	}
 	return p

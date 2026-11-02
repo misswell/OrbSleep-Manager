@@ -382,8 +382,41 @@ func (s *Server) handlers() map[string]handler {
 			_ = decode(params, &p)
 			return s.eng.ExportLogs(p.Limit)
 		},
-		"scan": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			return s.eng.Scan(ctx)
+		"scan": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				EnvironmentID string `json:"environmentId"`
+			}
+			_ = decode(params, &p)
+			return s.eng.Scan(ctx, p.EnvironmentID)
+		},
+		"environments.list": func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return s.eng.ListEnvironments(ctx), nil
+		},
+		"environment.add": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				Endpoint string `json:"endpoint"`
+				Name     string `json:"name"`
+			}
+			if err := decode(params, &p); err != nil {
+				return nil, err
+			}
+			if p.Endpoint == "" {
+				return nil, badRequest("缺少 endpoint")
+			}
+			return s.eng.AddEnvironment(ctx, p.Endpoint, p.Name)
+		},
+		"environment.action": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				ID     string `json:"id"`
+				Action string `json:"action"`
+			}
+			if err := decode(params, &p); err != nil {
+				return nil, err
+			}
+			if p.ID == "" || p.Action == "" {
+				return nil, badRequest("缺少环境 id 或 action")
+			}
+			return s.eng.EnvironmentAction(ctx, p.ID, p.Action)
 		},
 		"container.inspect": func(ctx context.Context, params json.RawMessage) (any, error) {
 			var p struct {
@@ -482,15 +515,23 @@ func (s *Server) handlers() map[string]handler {
 			}
 			return s.eng.UpdateSettings(patch)
 		},
-		"proxy.stop": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			id, err := s.eng.ProxyStop()
+		"proxy.stop": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				EnvironmentID string `json:"environmentId"`
+			}
+			_ = decode(params, &p)
+			id, err := s.eng.ProxyStop(p.EnvironmentID)
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"operationId": id}, nil
 		},
-		"proxy.setup": func(ctx context.Context, _ json.RawMessage) (any, error) {
-			id, err := s.eng.ProxySetup()
+		"proxy.setup": func(ctx context.Context, params json.RawMessage) (any, error) {
+			var p struct {
+				EnvironmentID string `json:"environmentId"`
+			}
+			_ = decode(params, &p)
+			id, err := s.eng.ProxySetup(p.EnvironmentID)
 			if err != nil {
 				return nil, err
 			}

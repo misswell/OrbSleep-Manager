@@ -95,6 +95,24 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE IF NOT EXISTS environments (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL DEFAULT 'docker-engine',
+			endpoint TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'unknown',
+			engine_version TEXT NOT NULL DEFAULT '',
+			api_version TEXT NOT NULL DEFAULT '',
+			remote INTEGER NOT NULL DEFAULT 0,
+			proxy_port_start INTEGER NOT NULL DEFAULT 0,
+			proxy_port_end INTEGER NOT NULL DEFAULT 0,
+			admin_port INTEGER NOT NULL DEFAULT 0,
+			web_port INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			added_at TEXT NOT NULL DEFAULT '',
+			last_seen_at TEXT NOT NULL DEFAULT ''
+		)`,
 	}
 	for _, stmt := range schema {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -115,7 +133,172 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate services.docker_socket: %w", err)
 		}
 	}
+	// Multi-environment: which registered environment the service lives on and
+	// how it was attached (compose file rewrite vs docker-run recreation).
+	if _, err := s.db.Exec(`ALTER TABLE services ADD COLUMN environment_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumn(err) {
+			return fmt.Errorf("migrate services.environment_id: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE services ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !isDuplicateColumn(err) {
+			return fmt.Errorf("migrate services.strategy: %w", err)
+		}
+	}
+	// Track the schema revision for future migrations. 1 = environments table
+	// + services.environment_id/strategy columns introduced (0.3.0).
+	if _, err := s.db.Exec(`PRAGMA user_version = 1`); err != nil {
+		return fmt.Errorf("migrate user_version: %w", err)
+	}
 	return nil
+}
+
+// SchemaVersion returns the stored PRAGMA user_version.
+func (s *Store) SchemaVersion() (int, error) {
+	var v int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+// UpsertEnvironment inserts or updates a registered environment. Proxy ports
+// and enabled flags are preserved when the caller leaves them zero/absent —
+// pass the full record to change them deliberately.
+func (s *Store) UpsertEnvironment(env model.Environment) error {
+	_, err := s.db.Exec(`INSERT INTO environments
+		(id, name, kind, endpoint, enabled, status, engine_version, api_version, remote,
+		 proxy_port_start, proxy_port_end, admin_port, web_port, last_error, added_at, last_seen_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+		 name=excluded.name, kind=excluded.kind, endpoint=excluded.endpoint,
+		 enabled=excluded.enabled, status=excluded.status,
+		 engine_version=CASE WHEN excluded.engine_version='' THEN environments.engine_version ELSE excluded.engine_version END,
+		 api_version=CASE WHEN excluded.api_version='' THEN environments.api_version ELSE excluded.api_version END,
+		 remote=excluded.remote,
+		 proxy_port_start=CASE WHEN excluded.proxy_port_start=0 THEN environments.proxy_port_start ELSE excluded.proxy_port_start END,
+		 proxy_port_end=CASE WHEN excluded.proxy_port_end=0 THEN environments.proxy_port_end ELSE excluded.proxy_port_end END,
+		 admin_port=CASE WHEN excluded.admin_port=0 THEN environments.admin_port ELSE excluded.admin_port END,
+		 web_port=CASE WHEN excluded.web_port=0 THEN environments.web_port ELSE excluded.web_port END,
+		 last_error=excluded.last_error, last_seen_at=excluded.last_seen_at`,
+		env.ID, env.Name, env.Kind, env.Endpoint, boolInt(env.Enabled), env.Status,
+		env.EngineVersion, env.APIVersion, boolInt(env.Remote),
+		env.ProxyPortStart, env.ProxyPortEnd, env.AdminPort, env.WebPort,
+		env.LastError, env.AddedAt, env.LastSeenAt)
+	return err
+}
+
+// ListEnvironments returns every registered environment.
+func (s *Store) ListEnvironments() ([]model.Environment, error) {
+	rows, err := s.db.Query(`SELECT id, name, kind, endpoint, enabled, status, engine_version, api_version,
+		remote, proxy_port_start, proxy_port_end, admin_port, web_port, last_error, added_at, last_seen_at
+		FROM environments ORDER BY added_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Environment
+	for rows.Next() {
+		env, err := scanEnvironment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, env)
+	}
+	return out, rows.Err()
+}
+
+func scanEnvironment(row rowScanner) (model.Environment, error) {
+	var env model.Environment
+	var enabled, remote int
+	if err := row.Scan(&env.ID, &env.Name, &env.Kind, &env.Endpoint, &enabled, &env.Status,
+		&env.EngineVersion, &env.APIVersion, &remote,
+		&env.ProxyPortStart, &env.ProxyPortEnd, &env.AdminPort, &env.WebPort,
+		&env.LastError, &env.AddedAt, &env.LastSeenAt); err != nil {
+		return env, err
+	}
+	env.Enabled = enabled != 0
+	env.Remote = remote != 0
+	env.Capabilities = capsFor(env.Kind, env.Remote)
+	return env, nil
+}
+
+// capsFor derives the capability set from the kind. Only engines proven by a
+// real adapter get capabilities; the flag can only be MORE restrictive than
+// the dockerapi default, never less.
+func capsFor(kind string, remote bool) model.Caps {
+	caps := model.Caps{
+		ListContainers: true, InspectContainer: true, StartStop: true,
+		Recreate: true, Events: true, PortTakeover: true, ComposeSupport: true,
+	}
+	if remote || kind == "remote" {
+		caps.PortTakeover = false
+		caps.ComposeSupport = false
+	}
+	if kind == "podman" {
+		// Podman's Docker-compatible API is recognised but NOT yet verified by
+		// the test matrix. Attach through it is deliberately disabled until a
+		// real verification pass exists — see docs/COMPATIBILITY.md.
+		caps.ComposeSupport = false
+		caps.Recreate = false
+	}
+	return caps
+}
+
+// GetEnvironment returns one registered environment.
+func (s *Store) GetEnvironment(id string) (model.Environment, bool, error) {
+	row := s.db.QueryRow(`SELECT id, name, kind, endpoint, enabled, status, engine_version, api_version,
+		remote, proxy_port_start, proxy_port_end, admin_port, web_port, last_error, added_at, last_seen_at
+		FROM environments WHERE id = ?`, id)
+	env, err := scanEnvironment(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return model.Environment{}, false, nil
+		}
+		return model.Environment{}, false, err
+	}
+	return env, true, nil
+}
+
+// GetEnvironmentByEndpoint looks an environment up by its endpoint.
+func (s *Store) GetEnvironmentByEndpoint(endpoint string) (model.Environment, bool, error) {
+	row := s.db.QueryRow(`SELECT id, name, kind, endpoint, enabled, status, engine_version, api_version,
+		remote, proxy_port_start, proxy_port_end, admin_port, web_port, last_error, added_at, last_seen_at
+		FROM environments WHERE endpoint = ?`, endpoint)
+	env, err := scanEnvironment(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return model.Environment{}, false, nil
+		}
+		return model.Environment{}, false, err
+	}
+	return env, true, nil
+}
+
+// DeleteEnvironment removes a registration (only allowed when no service
+// references it; the caller enforces that).
+func (s *Store) DeleteEnvironment(id string) error {
+	_, err := s.db.Exec(`DELETE FROM environments WHERE id=?`, id)
+	return err
+}
+
+// CountServicesInEnvironment returns how many managed services live on an
+// environment.
+func (s *Store) CountServicesInEnvironment(id string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM services WHERE environment_id=?`, id).Scan(&n)
+	return n, err
+}
+
+// SetEnvironmentStatus updates the reachability fields after a probe.
+func (s *Store) SetEnvironmentStatus(id, status, engineVersion, apiVersion, lastError string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.Exec(`UPDATE environments SET status=?, last_error=?,
+		engine_version=CASE WHEN ?='' THEN engine_version ELSE ? END,
+		api_version=CASE WHEN ?='' THEN api_version ELSE ? END,
+		last_seen_at=CASE WHEN ?='online' THEN ? ELSE last_seen_at END
+		WHERE id=?`, status, lastError, engineVersion, engineVersion, apiVersion, apiVersion, status, now, id)
+	return err
 }
 
 func isDuplicateColumn(err error) bool {
@@ -130,8 +313,9 @@ func (s *Store) UpsertService(svc model.Service) error {
 	}
 	_, err = s.db.Exec(`INSERT INTO services
 		(id, container_id, container_name, compose_project, compose_service, compose_file, status, bindings,
-		 idle_timeout, start_timeout, active_conns, last_active_at, created_at, last_error, excluded_from_sleep, docker_socket)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 idle_timeout, start_timeout, active_conns, last_active_at, created_at, last_error, excluded_from_sleep, docker_socket,
+		 environment_id, strategy)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		 container_id=excluded.container_id, container_name=excluded.container_name,
 		 compose_project=excluded.compose_project, compose_service=excluded.compose_service,
@@ -139,11 +323,13 @@ func (s *Store) UpsertService(svc model.Service) error {
 		 idle_timeout=excluded.idle_timeout, start_timeout=excluded.start_timeout,
 		 active_conns=excluded.active_conns, last_active_at=excluded.last_active_at,
 		 last_error=excluded.last_error, excluded_from_sleep=excluded.excluded_from_sleep,
-		 docker_socket=CASE WHEN excluded.docker_socket='' THEN services.docker_socket ELSE excluded.docker_socket END`,
+		 docker_socket=CASE WHEN excluded.docker_socket='' THEN services.docker_socket ELSE excluded.docker_socket END,
+		 environment_id=CASE WHEN excluded.environment_id='' THEN services.environment_id ELSE excluded.environment_id END,
+		 strategy=CASE WHEN excluded.strategy='' THEN services.strategy ELSE excluded.strategy END`,
 		svc.ID, svc.ContainerID, svc.ContainerName, svc.ComposeProject, svc.ComposeService,
 		svc.ComposeFile, svc.Status, string(bindings), svc.IdleTimeoutSecs, svc.StartTimeoutSecs,
 		svc.ActiveConnections, svc.LastActiveAt, svc.CreatedAt, svc.LastError, boolInt(svc.ExcludedFromSleep),
-		svc.DockerSocket)
+		svc.DockerSocket, svc.EnvironmentID, svc.Strategy)
 	return err
 }
 
@@ -151,29 +337,38 @@ func (s *Store) UpsertService(svc model.Service) error {
 func (s *Store) ListServices() ([]model.Service, error) {
 	rows, err := s.db.Query(`SELECT id, container_id, container_name, compose_project, compose_service,
 		compose_file, status, bindings, idle_timeout, start_timeout, active_conns, last_active_at,
-		created_at, last_error, excluded_from_sleep, docker_socket FROM services ORDER BY created_at, id`)
+		created_at, last_error, excluded_from_sleep, docker_socket, environment_id, strategy
+		FROM services ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []model.Service
 	for rows.Next() {
-		var svc model.Service
-		var bindings string
-		var excl int
-		if err := rows.Scan(&svc.ID, &svc.ContainerID, &svc.ContainerName, &svc.ComposeProject,
-			&svc.ComposeService, &svc.ComposeFile, &svc.Status, &bindings, &svc.IdleTimeoutSecs,
-			&svc.StartTimeoutSecs, &svc.ActiveConnections, &svc.LastActiveAt, &svc.CreatedAt,
-			&svc.LastError, &excl, &svc.DockerSocket); err != nil {
+		svc, err := scanService(rows)
+		if err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(bindings), &svc.Bindings); err != nil {
-			return nil, fmt.Errorf("服务 %s 的端口绑定数据损坏: %w", svc.ID, err)
-		}
-		svc.ExcludedFromSleep = excl != 0
 		out = append(out, svc)
 	}
 	return out, rows.Err()
+}
+
+func scanService(row rowScanner) (model.Service, error) {
+	var svc model.Service
+	var bindings string
+	var excl int
+	if err := row.Scan(&svc.ID, &svc.ContainerID, &svc.ContainerName, &svc.ComposeProject,
+		&svc.ComposeService, &svc.ComposeFile, &svc.Status, &bindings, &svc.IdleTimeoutSecs,
+		&svc.StartTimeoutSecs, &svc.ActiveConnections, &svc.LastActiveAt, &svc.CreatedAt,
+		&svc.LastError, &excl, &svc.DockerSocket, &svc.EnvironmentID, &svc.Strategy); err != nil {
+		return svc, err
+	}
+	if err := json.Unmarshal([]byte(bindings), &svc.Bindings); err != nil {
+		return svc, fmt.Errorf("服务 %s 的端口绑定数据损坏: %w", svc.ID, err)
+	}
+	svc.ExcludedFromSleep = excl != 0
+	return svc, nil
 }
 
 // GetService returns one service. It queries by primary key directly: the
@@ -181,23 +376,15 @@ func (s *Store) ListServices() ([]model.Service, error) {
 func (s *Store) GetService(id string) (model.Service, bool, error) {
 	row := s.db.QueryRow(`SELECT id, container_id, container_name, compose_project, compose_service,
 		compose_file, status, bindings, idle_timeout, start_timeout, active_conns, last_active_at,
-		created_at, last_error, excluded_from_sleep, docker_socket FROM services WHERE id = ?`, id)
-	var svc model.Service
-	var bindings string
-	var excl int
-	if err := row.Scan(&svc.ID, &svc.ContainerID, &svc.ContainerName, &svc.ComposeProject,
-		&svc.ComposeService, &svc.ComposeFile, &svc.Status, &bindings, &svc.IdleTimeoutSecs,
-		&svc.StartTimeoutSecs, &svc.ActiveConnections, &svc.LastActiveAt, &svc.CreatedAt,
-		&svc.LastError, &excl, &svc.DockerSocket); err != nil {
+		created_at, last_error, excluded_from_sleep, docker_socket, environment_id, strategy
+		FROM services WHERE id = ?`, id)
+	svc, err := scanService(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return model.Service{}, false, nil
 		}
 		return model.Service{}, false, err
 	}
-	if err := json.Unmarshal([]byte(bindings), &svc.Bindings); err != nil {
-		return model.Service{}, false, fmt.Errorf("服务 %s 的端口绑定数据损坏: %w", id, err)
-	}
-	svc.ExcludedFromSleep = excl != 0
 	return svc, true, nil
 }
 

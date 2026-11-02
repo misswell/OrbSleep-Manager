@@ -107,9 +107,15 @@ func main() {
 	case "logs":
 		withClient(sock, func(c *client.Client) { printLogs(c, rest) })
 	case "proxy-setup":
-		withClient(sock, func(c *client.Client) { proxySetup(c) })
+		withClient(sock, func(c *client.Client) { proxySetup(c, rest) })
 	case "proxy-stop":
-		withClient(sock, func(c *client.Client) { proxyStop(c) })
+		withClient(sock, func(c *client.Client) { proxyStop(c, rest) })
+	case "environments", "envs":
+		withClient(sock, func(c *client.Client) { printEnvironments(c, rest) })
+	case "environment-add":
+		withClient(sock, func(c *client.Client) { environmentAdd(c, rest) })
+	case "environment-action":
+		withClient(sock, func(c *client.Client) { environmentAction(c, rest) })
 	case "ping":
 		withClient(sock, func(c *client.Client) {
 			var out map[string]any
@@ -224,7 +230,11 @@ func printDoctor(c *client.Client, args []string) {
 func printScan(c *client.Client, args []string) {
 	asJSON := hasFlag(args, "--json")
 	var res model.ScanResult
-	must(c.Call(context.Background(), "scan", nil, &res))
+	params := map[string]any{}
+	if v := flagValue(args, "--env"); v != "" {
+		params["environmentId"] = v
+	}
+	must(c.Call(context.Background(), "scan", params, &res))
 	if asJSON {
 		printJSON(res)
 		return
@@ -520,22 +530,110 @@ func printLogs(c *client.Client, args []string) {
 	}
 }
 
-func proxyStop(c *client.Client) {
+func proxyStop(c *client.Client, args []string) {
+	params := map[string]any{}
+	if v := flagValue(args, "--env"); v != "" {
+		params["environmentId"] = v
+	}
 	var out struct {
 		OperationID string `json:"operationId"`
 	}
-	must(c.Call(context.Background(), "proxy.stop", nil, &out))
+	must(c.Call(context.Background(), "proxy.stop", params, &out))
 	fmt.Printf("停止代理操作: %s\n", out.OperationID)
 	followOperation(c, out.OperationID)
 }
 
-func proxySetup(c *client.Client) {
+func proxySetup(c *client.Client, args []string) {
+	params := map[string]any{}
+	if v := flagValue(args, "--env"); v != "" {
+		params["environmentId"] = v
+	}
 	var out struct {
 		OperationID string `json:"operationId"`
 	}
-	must(c.Call(context.Background(), "proxy.setup", nil, &out))
+	must(c.Call(context.Background(), "proxy.setup", params, &out))
 	fmt.Printf("代理安装/启动操作: %s\n", out.OperationID)
 	followOperation(c, out.OperationID)
+}
+
+// printEnvironments lists registered + discovered container environments.
+func printEnvironments(c *client.Client, args []string) {
+	var out model.EnvironmentList
+	must(c.Call(context.Background(), "environments.list", nil, &out))
+	if hasFlag(args, "--json") {
+		printJSON(out)
+		return
+	}
+	for _, env := range out.Environments {
+		state := env.Status
+		if env.Enabled {
+			state = "已启用/" + env.Status
+		}
+		marker := ""
+		if env.ID == out.PrimaryID {
+			marker = "*"
+		}
+		extra := ""
+		if env.DiscoveredOnly {
+			extra = "（未注册）"
+		}
+		if env.Remote {
+			extra += "（远程：端口接管不支持）"
+		}
+		fmt.Printf("%s%-14s %-18s %-28s %s%s\n", marker, env.ID, env.Kind, env.Endpoint, state, extra)
+	}
+}
+
+// environmentAdd registers a custom unix socket environment.
+func environmentAdd(c *client.Client, args []string) {
+	var endpoint, name string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--endpoint" && i+1 < len(args):
+			endpoint = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--endpoint="):
+			endpoint = strings.TrimPrefix(args[i], "--endpoint=")
+		case args[i] == "--name" && i+1 < len(args):
+			name = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--name="):
+			name = strings.TrimPrefix(args[i], "--name=")
+		}
+	}
+	if endpoint == "" && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		endpoint = args[0]
+	}
+	if endpoint == "" {
+		fail(fmt.Errorf("用法: orbsleepctl environment-add <unix:///path/to/docker.sock> [--name 名称]"))
+	}
+	var out model.EnvironmentList
+	must(c.Call(context.Background(), "environment.add", map[string]any{"endpoint": endpoint, "name": name}, &out))
+	fmt.Printf("已添加环境（共 %d 个注册环境）\n", len(out.Environments))
+	printEnvironments(c, []string{"--json"})
+}
+
+// environmentAction performs enable/disable/test/remove on one environment.
+func environmentAction(c *client.Client, args []string) {
+	if len(args) < 2 {
+		fail(fmt.Errorf("用法: orbsleepctl environment-action <envId> <enable|disable|test|remove>"))
+	}
+	var out model.EnvironmentList
+	must(c.Call(context.Background(), "environment.action", map[string]any{"id": args[0], "action": args[1]}, &out))
+	fmt.Printf("环境 %s 已执行 %s（共 %d 个注册环境）\n", args[0], args[1], len(out.Environments))
+}
+
+// flagValue extracts "--name value" or "--name=value" from args.
+func flagValue(args []string, flag string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(args[i], flag+"=") {
+			return strings.TrimPrefix(args[i], flag+"=")
+		}
+	}
+	return ""
 }
 
 func installAgent(dataDir string, args []string) {
@@ -851,8 +949,14 @@ func usage() {
                                   修改休眠策略
   settings [set key=value...]     查看/修改设置
   logs [-n 100]                   守护进程日志
-  proxy-setup                     安装/启动 Lazy TCP Proxy
-  proxy-stop                      停止/移除代理容器（保留配置）
+  proxy-setup [--env <envId>]     安装/启动 Lazy TCP Proxy（默认环境可不带 --env）
+  proxy-stop [--env <envId>]      停止/移除代理容器（保留配置）
+  environments [--json]           列出容器环境（注册 + 发现）
+  environment-add <endpoint> [--name 名称]
+                                  注册自定义 socket 环境
+  environment-action <envId> <enable|disable|test|remove>
+                                  环境启停/测试/删除
+  scan [--env <envId>] [--json]   扫描容器（默认扫描全部已启用环境）
   restore-all                     恢复所有托管服务
   uninstall --yes [--keep-proxy]  卸载（恢复服务、移除开机启动）
   install-agent [--binary PATH]   安装开机启动

@@ -9,6 +9,48 @@ type ContextInfo struct {
 	Kind     string `json:"kind"`
 }
 
+// Environment is one registered container runtime environment (a specific
+// Docker-compatible engine endpoint). Several environments can be enabled at
+// the same time; each has its own proxy container and proxy port range.
+type Environment struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Kind           string `json:"kind"` // orbstack | docker-desktop | docker-engine | colima | rancher-desktop | finch | lima | podman | custom | remote
+	Endpoint       string `json:"endpoint"`
+	Enabled        bool   `json:"enabled"`
+	Status         string `json:"status"` // online | offline | unknown | error
+	EngineVersion  string `json:"engineVersion,omitempty"`
+	APIVersion     string `json:"apiVersion,omitempty"`
+	Remote         bool   `json:"remote"`
+	Capabilities   Caps   `json:"capabilities"`
+	ProxyPortStart int    `json:"proxyPortStart,omitempty"`
+	ProxyPortEnd   int    `json:"proxyPortEnd,omitempty"`
+	AdminPort      int    `json:"adminPort,omitempty"`
+	WebPort        int    `json:"webPort,omitempty"`
+	ProxyStatus    string `json:"proxyStatus,omitempty"` // installed | missing | error (filled by the engine, not persisted)
+	LastError      string `json:"lastError,omitempty"`
+	AddedAt        string `json:"addedAt,omitempty"`
+	LastSeenAt     string `json:"lastSeenAt,omitempty"`
+	DiscoveredOnly bool   `json:"discoveredOnly,omitempty"` // true for discovery results not yet registered
+}
+
+// Caps is the capability set of an environment (mirrors runtime.Capabilities).
+type Caps struct {
+	ListContainers   bool `json:"listContainers"`
+	InspectContainer bool `json:"inspectContainer"`
+	StartStop        bool `json:"startStop"`
+	Recreate         bool `json:"recreate"`
+	Events           bool `json:"events"`
+	PortTakeover     bool `json:"portTakeover"`
+	ComposeSupport   bool `json:"composeSupport"`
+}
+
+// EnvironmentList is returned by environments.list.
+type EnvironmentList struct {
+	Environments []Environment `json:"environments"`
+	PrimaryID    string        `json:"primaryId"`
+}
+
 // Reason explains a classification or risk decision.
 type Reason struct {
 	Code     string `json:"code"`
@@ -96,6 +138,15 @@ type Container struct {
 	Ports                  []PortBinding  `json:"ports"`
 	ManagedServiceID       string         `json:"managedServiceId"`
 	Classification         Classification `json:"classification"`
+	// EnvironmentID identifies which registered environment the container was
+	// scanned from. Empty means the legacy single (primary) environment.
+	EnvironmentID string `json:"environmentId,omitempty"`
+	// Strategy is how OrbSleep would take the container over:
+	// compose (rewrite the Compose file) | docrun (recreate from a full
+	// inspect snapshot) | "" (undetermined / not attachable).
+	Strategy string `json:"strategy,omitempty"`
+	// Source is how the container was created: compose | docker-run | api | unknown.
+	Source string `json:"source,omitempty"`
 }
 
 // ScanResult is returned by the scan method.
@@ -104,6 +155,9 @@ type ScanResult struct {
 	Context    ContextInfo    `json:"context"`
 	Containers []Container    `json:"containers"`
 	Counts     map[string]int `json:"counts"`
+	// EnvironmentID is the environment this scan came from. Empty for the
+	// legacy single-environment scan.
+	EnvironmentID string `json:"environmentId,omitempty"`
 }
 
 // PlanItem describes the change for one container.
@@ -120,6 +174,11 @@ type PlanItem struct {
 	Risks                   []Reason       `json:"risks"`
 	Diff                    string         `json:"diff"`
 	Steps                   []string       `json:"steps"`
+	// Strategy: compose | docrun. docrun items have no ComposeFile and are
+	// recreated from a full inspect snapshot via the Engine API.
+	Strategy string `json:"strategy,omitempty"`
+	// EnvironmentID pins the plan item to the environment it was planned on.
+	EnvironmentID string `json:"environmentId,omitempty"`
 }
 
 // Plan is a reviewed attach plan.
@@ -174,6 +233,10 @@ type Service struct {
 	// before this field existed; reconcile never rebinds a record to a
 	// different socket by name.
 	DockerSocket string `json:"dockerSocket,omitempty"`
+	// EnvironmentID is the registered environment the service lives on.
+	EnvironmentID string `json:"environmentId,omitempty"`
+	// Strategy: compose | docrun (see PlanItem).
+	Strategy string `json:"strategy,omitempty"`
 }
 
 // Range is an inclusive port range.
@@ -212,17 +275,31 @@ type LastError struct {
 	Message string `json:"message"`
 }
 
+// EnvSummary is the per-environment dashboard line.
+type EnvSummary struct {
+	ID       string      `json:"id"`
+	Name     string      `json:"name"`
+	Kind     string      `json:"kind"`
+	Endpoint string      `json:"endpoint"`
+	Enabled  bool        `json:"enabled"`
+	Status   string      `json:"status"`
+	Primary  bool        `json:"primary"`
+	Proxy    ProxyStatus `json:"proxy"`
+	Remote   bool        `json:"remote"`
+}
+
 // Status is the top-level dashboard state.
 type Status struct {
-	DaemonVersion        string      `json:"daemonVersion"`
-	DataDir              string      `json:"dataDir"`
-	Context              ContextInfo `json:"context"`
-	DockerReachable      bool        `json:"dockerReachable"`
-	Proxy                ProxyStatus `json:"proxy"`
-	Counts               Counts      `json:"counts"`
-	LastScanAt           string      `json:"lastScanAt"`
-	LastError            LastError   `json:"lastError"`
-	LaunchAgentInstalled bool        `json:"launchAgentInstalled"`
+	DaemonVersion        string       `json:"daemonVersion"`
+	DataDir              string       `json:"dataDir"`
+	Context              ContextInfo  `json:"context"`
+	DockerReachable      bool         `json:"dockerReachable"`
+	Proxy                ProxyStatus  `json:"proxy"`
+	Counts               Counts       `json:"counts"`
+	LastScanAt           string       `json:"lastScanAt"`
+	LastError            LastError    `json:"lastError"`
+	LaunchAgentInstalled bool         `json:"launchAgentInstalled"`
+	Environments         []EnvSummary `json:"environments,omitempty"`
 }
 
 // Settings is the user configuration exposed by the protocol.

@@ -692,7 +692,7 @@ func TestMaintenanceGateFreezesConcurrentBusinessWrites(t *testing.T) {
 	if _, err := e.ServiceAction(context.Background(), svc.ID, "updatePolicy", map[string]any{"idleTimeoutSecs": 600}); err == nil || !strings.Contains(err.Error(), "冻结") {
 		t.Fatalf("updatePolicy must be frozen by the pending request: %v", err)
 	}
-	if _, err := e.ProxySetup(); err == nil || !strings.Contains(err.Error(), "冻结") {
+	if _, err := e.ProxySetup(""); err == nil || !strings.Contains(err.Error(), "冻结") {
 		t.Fatalf("ProxySetup must be frozen by the pending request: %v", err)
 	}
 
@@ -728,7 +728,7 @@ func TestMaintenanceGateFreezesConcurrentBusinessWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := e.ProxySetup()
+			_, err := e.ProxySetup("")
 			note(err)
 		}()
 	}

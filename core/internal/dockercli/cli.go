@@ -122,16 +122,17 @@ func (r *Runner) UpService(ctx context.Context, project, file, workdir, service 
 	return err
 }
 
-// ProxyUp starts (or recreates) the OrbSleep proxy compose project.
-func (r *Runner) ProxyUp(ctx context.Context, file string) error {
+// ProxyUp starts (or recreates) an OrbSleep proxy compose project. The
+// project name is explicit so each environment runs its own proxy.
+func (r *Runner) ProxyUp(ctx context.Context, project, file string) error {
 	_, err := r.run(ctx, filepath.Dir(file), 5*time.Minute,
-		"compose", "-p", "orbsleep-proxy", "-f", file, "up", "-d")
+		"compose", "-p", project, "-f", file, "up", "-d")
 	return err
 }
 
-// ProxyDown stops the OrbSleep proxy project.
-func (r *Runner) ProxyDown(ctx context.Context, file string) error {
-	_, err := r.run(ctx, filepath.Dir(file), 2*time.Minute, "compose", "-p", "orbsleep-proxy", "-f", file, "down")
+// ProxyDown stops an OrbSleep proxy compose project.
+func (r *Runner) ProxyDown(ctx context.Context, project, file string) error {
+	_, err := r.run(ctx, filepath.Dir(file), 2*time.Minute, "compose", "-p", project, "-f", file, "down")
 	return err
 }
 

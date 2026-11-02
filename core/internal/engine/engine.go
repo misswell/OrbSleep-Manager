@@ -49,12 +49,18 @@ type Engine struct {
 	plansMu sync.Mutex
 	plans   map[string]*planEntry
 
+	// envClients caches one Docker client per secondary environment; the
+	// primary client is cached separately (e.docker) with its own singleflight.
+	envClients map[string]*dockerx.Client
+
 	activityMu sync.Mutex
 	activity   map[string]time.Time
 
 	reconcileMu sync.Mutex
 	eventMu     sync.Mutex
-	lastProxyID string
+	// lastProxyIDs tracks the proxy container id per environment so a proxy
+	// restart forces a config re-sync only for that environment.
+	lastProxyIDs map[string]string
 
 	txnMu      sync.Mutex
 	txnWG      sync.WaitGroup
@@ -111,6 +117,8 @@ func New(version, dataDir string) (*Engine, error) {
 		gw:            gateway.New(func(level, format string, args ...any) { logger.Printf(level, format, args...) }),
 		plans:         map[string]*planEntry{},
 		activity:      map[string]time.Time{},
+		lastProxyIDs:  map[string]string{},
+		envClients:    map[string]*dockerx.Client{},
 		txnCancels:    map[string]context.CancelFunc{},
 		eventsCh:      make(chan struct{}, 1),
 		stopCh:        make(chan struct{}),
@@ -160,6 +168,9 @@ func New(version, dataDir string) (*Engine, error) {
 // Start launches the background loops.
 func (e *Engine) Start() {
 	e.logger.Printf("info", "OrbSleep daemon %s 启动，数据目录 %s", e.version, e.dataDir)
+	// Register the primary environment row so the GUI always has a concrete
+	// environment and legacy service pins map onto it deterministically.
+	e.ensurePrimaryEnvironment()
 	if frozen, reason := e.writesFrozen(); frozen {
 		// Transaction recovery writes Compose files from its own stale snapshots.
 		// Running it while an unresolved restore transaction describes those same
@@ -269,12 +280,33 @@ func (e *Engine) Status() model.Status {
 		st.LastScanAt = lastScan.UTC().Format(time.RFC3339)
 	}
 	st.Proxy = e.proxyStatus(ctx)
+	// Per-environment overview for the environments page. Failures are
+	// non-fatal: the GUI shows what it can.
+	st.Environments = e.environmentSummaries(ctx)
 	// Read lastErr last: docker/proxy checks above may have raised a fresh
 	// error during this very status computation.
 	e.mu.Lock()
 	st.LastError = e.lastErr
 	e.mu.Unlock()
 	return st
+}
+
+// environmentSummaries builds the dashboard lines for registered environments.
+func (e *Engine) environmentSummaries(ctx context.Context) []model.EnvSummary {
+	envs, err := e.store.ListEnvironments()
+	if err != nil {
+		return nil
+	}
+	primary := e.currentEnvID()
+	out := make([]model.EnvSummary, 0, len(envs))
+	for _, env := range envs {
+		out = append(out, model.EnvSummary{
+			ID: env.ID, Name: env.Name, Kind: env.Kind, Endpoint: env.Endpoint,
+			Enabled: env.Enabled, Status: env.Status, Primary: env.ID == primary,
+			Remote: env.Remote, Proxy: e.proxyStatusForEnv(ctx, env.ID),
+		})
+	}
+	return out
 }
 
 // proxyInstalled reports whether the OrbSleep proxy container exists.

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"orbsleep/internal/compose"
+	"orbsleep/internal/deployment/docrun"
+	"orbsleep/internal/dockerx"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/scan"
@@ -36,6 +38,19 @@ type planSnapshot struct {
 	proxyMappings  []model.ProxyMapping
 	bindings       []model.Binding
 	requiresLan    bool
+	// strategy: "compose" | "docrun". envID pins the item to the environment
+	// the plan was generated against.
+	strategy string
+	envID    string
+	// takeoverKeys lists the container port keys whose TCP bindings the
+	// gateway takes over (docrun only).
+	takeoverKeys []string
+	// docrunFingerprint is the plan-time fingerprint of the recreation spec;
+	// attach re-verifies it before mutating anything.
+	docrunFingerprint string
+	// docrun carries the full attach snapshot once rebuilt at attach time
+	// (plan-time items carry only the fingerprint).
+	docrun *docrun.PreparedAttach
 }
 
 // CreatePlan validates the selected containers and produces a dry-run plan.
@@ -183,7 +198,7 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 			}
 			continue
 		}
-		item, snap, blockers := e.buildPlanItem(ctx, cont, &plan, &used, s.ProxyPortStart, s.ProxyPortEnd, cli, published)
+		item, snap, blockers := e.buildPlanItem(ctx, ins, cont, &plan, &used, s.ProxyPortStart, s.ProxyPortEnd, cli, published)
 		if len(blockers) > 0 {
 			continue
 		}
@@ -283,11 +298,14 @@ func bindingList(p PublishedPort) []string {
 	return out
 }
 
-func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *model.Plan, used *map[int]bool, rangeStart, rangeEnd int, cli composeCLI, published map[int]PublishedPort) (*model.PlanItem, *planSnapshot, []model.Reason) {
+func (e *Engine) buildPlanItem(ctx context.Context, ins *dockerx.ContainerInspect, cont model.Container, plan *model.Plan, used *map[int]bool, rangeStart, rangeEnd int, cli composeCLI, published map[int]PublishedPort) (*model.PlanItem, *planSnapshot, []model.Reason) {
 	var blockers []model.Reason
 	block := func(code, msg string) {
 		blockers = append(blockers, model.Reason{Code: code, Message: msg, Severity: "blocker"})
 		plan.Blockers = append(plan.Blockers, model.Reason{Code: code, Message: cont.Name + "：" + msg, Severity: "blocker"})
+	}
+	if cont.Strategy == "docrun" {
+		return e.buildDocrunPlanItem(ctx, ins, cont, plan, used, rangeStart, rangeEnd, published)
 	}
 	if len(cont.ComposeConfigFiles) != 1 {
 		block("compose_file_unresolved", "需要唯一的 Compose 配置文件，当前无法定位")
@@ -416,6 +434,108 @@ func (e *Engine) buildPlanItem(ctx context.Context, cont model.Container, plan *
 		proxyMappings:  mappings,
 		bindings:       bindings,
 		requiresLan:    requiresLan,
+		strategy:       "compose",
+		envID:          e.currentEnvID(),
+	}
+	return &item, snap, nil
+}
+
+// buildDocrunPlanItem plans the attach of a container that has no Compose
+// identity. There is no file to validate — the safety comes from the full
+// inspect snapshot that attach persists before the first mutation.
+func (e *Engine) buildDocrunPlanItem(ctx context.Context, ins *dockerx.ContainerInspect, cont model.Container, plan *model.Plan, used *map[int]bool, rangeStart, rangeEnd int, published map[int]PublishedPort) (*model.PlanItem, *planSnapshot, []model.Reason) {
+	var blockers []model.Reason
+	block := func(code, msg string) {
+		blockers = append(blockers, model.Reason{Code: code, Message: msg, Severity: "blocker"})
+		plan.Blockers = append(plan.Blockers, model.Reason{Code: code, Message: cont.Name + "：" + msg, Severity: "blocker"})
+	}
+	candidates := cont.Classification.ProxyCandidates
+	if len(candidates) == 0 {
+		block("no_candidates", "没有可接管的 TCP 端口")
+		return nil, nil, blockers
+	}
+	var removals []model.PortBinding
+	var mappings []model.ProxyMapping
+	var bindings []model.Binding
+	var keys []string
+	requiresLan := false
+	for _, cand := range candidates {
+		proxyPort, ok := allocateProxyPort(*used, rangeStart, rangeEnd)
+		if !ok {
+			block("proxy_ports_exhausted", fmt.Sprintf("代理端口范围 %d-%d 已用尽，请在设置中扩大范围", rangeStart, rangeEnd))
+			return nil, nil, blockers
+		}
+		before := len(blockers)
+		checkProxyPublishedPort(published, proxyPort, block)
+		if len(blockers) > before {
+			return nil, nil, blockers
+		}
+		*used = withPort(*used, proxyPort)
+		removals = append(removals, cand)
+		mappings = append(mappings, model.ProxyMapping{ListenPort: proxyPort, TargetPort: cand.ContainerPort})
+		bindings = append(bindings, model.Binding{
+			HostIP: cand.HostIP, HostPort: cand.HostPort, ContainerPort: cand.ContainerPort,
+			ProxyPort: proxyPort, Protocol: "tcp",
+		})
+		keys = append(keys, fmt.Sprintf("%d/%s", cand.ContainerPort, cand.Protocol))
+		if cand.HostIP == "" {
+			requiresLan = true
+		}
+	}
+
+	// Plan-time fingerprint: attach refuses to run when the container config
+	// drifted after this plan was generated.
+	prep, err := docrun.PrepareAttach(ins, "", keys)
+	if err != nil {
+		block("docrun_snapshot_failed", "无法生成容器重建快照: "+err.Error())
+		return nil, nil, blockers
+	}
+
+	risks := []model.Reason{
+		{Code: "recreate", Message: "将通过 Docker Engine API 按完整配置快照重建容器（保留镜像/环境变量/挂载/网络/资源限制）", Severity: "info"},
+		{Code: "data_preserved", Message: "具名卷、Bind Mount、匿名卷按原卷名重新挂载；重建期间服务短暂不可用", Severity: "info"},
+	}
+	for _, w := range cont.Classification.Warnings {
+		risks = append(risks, w)
+	}
+	if requiresLan {
+		risks = append(risks, model.Reason{
+			Code: "lan_exposure", Message: "原始端口绑定所有网卡，接入后仍保持原绑定范围（不会自动扩大或收窄）", Severity: "warning",
+		})
+	}
+	item := model.PlanItem{
+		ContainerID:             cont.ID,
+		ContainerName:           cont.Name,
+		Removals:                removals,
+		ProxyMappings:           mappings,
+		Bindings:                bindings,
+		RequiresLanConfirmation: requiresLan,
+		Risks:                   risks,
+		Strategy:                "docrun",
+		EnvironmentID:           e.currentEnvID(),
+		Diff:                    "",
+		Steps: []string{
+			"保存完整容器配置快照（含挂载、网络、环境变量、资源限制）",
+			"写入 Lazy TCP Proxy 服务配置并验证",
+			"停止原容器并重命名为回滚锚点",
+			"按快照重建容器（移除被接管的 TCP 端口）",
+			"启动新容器并恢复附属网络",
+			"启动 macOS 端口网关监听",
+			"通过原端口完成连通性测试",
+			"验证通过后移除原容器备份",
+		},
+	}
+	snap := &planSnapshot{
+		containerID:       cont.ID,
+		containerName:     cont.Name,
+		removals:          removals,
+		proxyMappings:     mappings,
+		bindings:          bindings,
+		requiresLan:       requiresLan,
+		strategy:          "docrun",
+		envID:             item.EnvironmentID,
+		takeoverKeys:      keys,
+		docrunFingerprint: prep.Fingerprint,
 	}
 	return &item, snap, nil
 }

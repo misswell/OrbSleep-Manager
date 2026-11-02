@@ -5,12 +5,46 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"orbsleep/internal/dockerx"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
+	"orbsleep/internal/runtime"
 )
+
+// envGroup is one environment's slice of managed services during reconcile.
+type envGroup struct {
+	envID    string
+	services []*model.Service
+}
+
+// activitySnapshot copies the gateway activity timestamps.
+func (e *Engine) activitySnapshot() map[string]time.Time {
+	e.activityMu.Lock()
+	activity := make(map[string]time.Time, len(e.activity))
+	for k, v := range e.activity {
+		activity[k] = v
+	}
+	e.activityMu.Unlock()
+	return activity
+}
+
+// persistServiceIfChanged writes a service row only when a reconciled field
+// actually moved, keeping write amplification low.
+func (e *Engine) persistServiceIfChanged(svc model.Service) {
+	if svc.LastActiveAt != "" {
+		// Volatile fields ride along with the runtime update path.
+		if err := e.store.UpsertService(svc); err != nil {
+			e.logger.Printf("warn", "更新服务状态失败: %v", err)
+		}
+		return
+	}
+	if err := e.store.UpsertService(svc); err != nil {
+		e.logger.Printf("warn", "更新服务状态失败: %v", err)
+	}
+}
 
 func (e *Engine) reconcileLoop() {
 	defer e.wg.Done()
@@ -54,17 +88,97 @@ func (e *Engine) reconcile() {
 		e.gw.Prune(map[string]bool{})
 		return
 	}
-	e.logger.Printf("info", "reconcile：检查 %d 个托管服务", len(services))
-	c, err := e.dockerClient(ctx)
-	if err != nil {
-		e.logger.Printf("warn", "reconcile 跳过：Docker 不可用: %v", err)
-		return
-	}
-	s := e.settings.Get()
 
+	// Group services by their pinned environment. Legacy records (no
+	// environment_id) map onto the environment of the socket they were
+	// attached on; that is the current primary for records without a pin.
+	primary := e.currentEnvID()
+	groups := map[string]*envGroup{}
+	order := []string{}
+	for i := range services {
+		svc := &services[i]
+		envID := svc.EnvironmentID
+		if envID == "" {
+			if svc.DockerSocket == "" || svc.DockerSocket == strings.TrimPrefix(e.currentEnvEndpoint(), "unix://") {
+				envID = primary
+			} else {
+				envID = runtime.EnvID("unix://" + svc.DockerSocket)
+			}
+		}
+		g, ok := groups[envID]
+		if !ok {
+			g = &envGroup{envID: envID}
+			groups[envID] = g
+			order = append(order, envID)
+		}
+		g.services = append(g.services, svc)
+	}
+
+	// Which environments are enabled right now?
+	enabledEnvs := map[string]bool{primary: true}
+	envs, _ := e.store.ListEnvironments()
+	for _, env := range envs {
+		if env.Enabled {
+			enabledEnvs[env.ID] = true
+		}
+	}
+	e.logger.Printf("info", "reconcile：检查 %d 个托管服务（%d 个环境）", len(services), len(order))
+
+	s := e.settings.Get()
+	keep := map[string]bool{}
+	activity := e.activitySnapshot()
+
+	for _, envID := range order {
+		group := groups[envID]
+		if !enabledEnvs[envID] {
+			// The environment was disabled: its proxy mappings live on that
+			// env's proxy, so routing through anything local would only
+			// create dead listeners. Prune the routes and say so.
+			for _, svc := range group.services {
+				for _, b := range svc.Bindings {
+					e.gw.Remove(fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort))
+				}
+				svc.Status = "missing"
+				svc.LastError = "所属容器环境已停用"
+				e.persistServiceIfChanged(*svc)
+			}
+			continue
+		}
+		c, err := e.clientForEnv(ctx, envID)
+		if err != nil {
+			e.logger.Printf("warn", "reconcile 跳过环境 %s：%v", envID, err)
+			// Keep the listeners: an offline engine (e.g. a stopped Colima
+			// VM) must not tear down wiring that serves again when it returns.
+			for _, svc := range group.services {
+				for _, b := range svc.Bindings {
+					keep[fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)] = true
+				}
+				svc.Status = "missing"
+				svc.LastError = "容器环境不可达: " + err.Error()
+				e.persistServiceIfChanged(*svc)
+			}
+			continue
+		}
+		spec := e.proxySpecForEnv(envID)
+		e.reconcileEnvGroup(ctx, c, spec, group, s, activity, keep)
+	}
+	e.gw.Prune(keep)
+}
+
+// reconcileEnvGroup reconciles one environment's services against that env's
+// own Docker client and proxy container.
+func (e *Engine) reconcileEnvGroup(ctx context.Context, c *dockerx.Client, spec proxyEnvSpec, group *envGroup, s model.Settings, activity map[string]time.Time, keep map[string]bool) {
 	summaries, lerr := c.ListContainers(ctx)
 	if lerr != nil {
-		e.logger.Printf("warn", "reconcile 列出容器失败: %v", lerr)
+		e.logger.Printf("warn", "reconcile 列出容器失败（环境 %s）: %v", spec.EnvID, lerr)
+		for _, svc := range group.services {
+			for _, b := range svc.Bindings {
+				keep[fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)] = true
+			}
+			svc.Status = "missing"
+			svc.LastError = "读取容器列表失败: " + lerr.Error()
+			e.persistServiceIfChanged(*svc)
+		}
 		return
 	}
 	byID := make(map[string]dockerx.ContainerSummary, len(summaries))
@@ -76,29 +190,14 @@ func (e *Engine) reconcile() {
 		}
 	}
 
-	proxyIns, proxyErr := c.InspectContainer(ctx, proxy.ContainerName)
+	proxyIns, proxyErr := c.InspectContainer(ctx, spec.ContainerName)
 	proxyRunning := proxyErr == nil && proxyIns.State.Running
 	proxyIP := ""
 	if proxyErr == nil {
 		proxyIP = containerIP(proxyIns)
 	}
 
-	e.activityMu.Lock()
-	activity := make(map[string]time.Time, len(e.activity))
-	for k, v := range e.activity {
-		activity[k] = v
-	}
-	e.activityMu.Unlock()
-
-	keep := map[string]bool{}
-	clientSocket := c.Socket()
-	for i := range services {
-		orig := services[i]
-		svc := &services[i]
-		// Services pinned to another Docker instance are invisible here:
-		// their proxy mappings live on that instance's proxy, so routing
-		// them through this instance would only create dead listeners.
-		foreignSocket := svc.DockerSocket != "" && svc.DockerSocket != clientSocket
+	for _, svc := range group.services {
 		var summary *dockerx.ContainerSummary
 		var lastErr string
 		if svc.ContainerID != "" {
@@ -106,11 +205,10 @@ func (e *Engine) reconcile() {
 				summary = &s
 			}
 		}
-		if summary == nil && !foreignSocket {
-			// Rebind by name only on the Docker instance the service was
-			// attached on (or a legacy record without a pin). Two Docker
-			// instances can run same-named containers; adopting one from
-			// the wrong instance would sleep/restore the wrong workload.
+		if summary == nil {
+			// Rebind by name only within the service's own environment: two
+			// environments can run same-named containers; adopting one from
+			// the wrong environment would sleep/restore the wrong workload.
 			if s, ok := byName[svc.ContainerName]; ok {
 				summary = &s
 				svc.ContainerID = s.ID
@@ -118,11 +216,7 @@ func (e *Engine) reconcile() {
 		}
 		status := "missing"
 		if summary == nil {
-			if svc.DockerSocket != "" && svc.DockerSocket != clientSocket {
-				lastErr = "容器不在当前 Docker 实例（服务绑定于 " + svc.DockerSocket + "）"
-			} else {
-				lastErr = "容器不存在（可能已被删除）"
-			}
+			lastErr = "容器不存在（可能已被删除）"
 		} else {
 			svc.ContainerID = summary.ID
 			switch {
@@ -145,41 +239,33 @@ func (e *Engine) reconcile() {
 
 		// Keep the host gateway listeners alive for every binding, even while
 		// the container sleeps: the first connection wakes it through the proxy.
-		if foreignSocket {
-			// Prune dead routes the service may still have from before the
-			// switch; its own instance re-creates them when selected again.
-			for _, b := range svc.Bindings {
-				e.gw.Remove(fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort))
+		for _, b := range svc.Bindings {
+			key := fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)
+			// Build routes through the shared helper: in container_ip mode an
+			// unresolvable proxy IP must surface as an error and skip the
+			// listener, never fall back to 127.0.0.1.
+			route, rerr := gatewayRouteFor(svc.ID, svc.ContainerName, b, s, proxyIP)
+			if rerr == nil {
+				rerr = e.gw.Ensure(route)
 			}
-		} else {
-			for _, b := range svc.Bindings {
-				key := fmt.Sprintf("%s|%s|%d", svc.ID, b.HostIP, b.HostPort)
-				// Build routes through the shared helper: in container_ip mode an
-				// unresolvable proxy IP must surface as an error and skip the
-				// listener, never fall back to 127.0.0.1.
-				route, rerr := gatewayRouteFor(svc.ID, svc.ContainerName, b, s, proxyIP)
-				if rerr == nil {
-					rerr = e.gw.Ensure(route)
-				}
-				if rerr != nil {
-					status = "warning"
-					lastErr = rerr.Error()
-					// If a healthy route is already correct, keep it. Otherwise
-					// remove the stale route so it cannot forward to the wrong IP.
-					if e.gw.Matches(route) {
-						keep[key] = true
-					} else {
-						e.gw.Remove(key)
-					}
-				} else {
+			if rerr != nil {
+				status = "warning"
+				lastErr = rerr.Error()
+				// If a healthy route is already correct, keep it. Otherwise
+				// remove the stale route so it cannot forward to the wrong IP.
+				if e.gw.Matches(route) {
 					keep[key] = true
+				} else {
+					e.gw.Remove(key)
 				}
-				if summary != nil && containerSummaryPublishes(*summary, model.PortBinding{
-					HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
-				}) {
-					status = "warning"
-					lastErr = fmt.Sprintf("容器又重新发布了端口 %d，与端口网关冲突（可能有人手动恢复了 Compose 文件）", b.HostPort)
-				}
+			} else {
+				keep[key] = true
+			}
+			if summary != nil && containerSummaryPublishes(*summary, model.PortBinding{
+				HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol,
+			}) {
+				status = "warning"
+				lastErr = fmt.Sprintf("容器又重新发布了端口 %d，与端口网关冲突（可能有人手动恢复了配置）", b.HostPort)
 			}
 		}
 		svc.ActiveConnections = e.gw.ActiveConns(svc.ID)
@@ -188,27 +274,22 @@ func (e *Engine) reconcile() {
 		}
 		svc.Status = status
 		svc.LastError = lastErr
-		if serviceRuntimeChanged(orig, *svc) {
-			if err := e.store.UpsertService(*svc); err != nil {
-				e.logger.Printf("warn", "更新服务状态失败: %v", err)
-			}
-		}
+		e.persistServiceIfChanged(*svc)
 	}
-	e.gw.Prune(keep)
 
 	if proxyRunning {
 		force := false
 		e.mu.Lock()
-		if e.lastProxyID != proxyIns.ID {
-			e.lastProxyID = proxyIns.ID
+		if e.lastProxyIDs[spec.EnvID] != proxyIns.ID {
+			e.lastProxyIDs[spec.EnvID] = proxyIns.ID
 			force = true
 		}
 		e.mu.Unlock()
-		if err := e.syncProxyConfig(ctx, force); err != nil {
-			e.logger.Printf("warn", "同步代理配置失败: %v", err)
+		if err := e.syncProxyConfigForEnv(ctx, spec.EnvID, force); err != nil {
+			e.logger.Printf("warn", "同步代理配置失败（环境 %s）: %v", spec.EnvID, err)
 		}
-	} else if proxyErr != nil || proxyIns != nil {
-		e.logger.Printf("warn", "代理容器未运行，已托管服务的新连接将无法唤醒")
+	} else if proxyErr != nil {
+		e.logger.Printf("warn", "环境 %s 的代理容器未运行，其托管服务的新连接将无法唤醒", spec.EnvID)
 	}
 }
 
@@ -244,50 +325,67 @@ func (e *Engine) eventsLoop() {
 			return
 		default:
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			select {
-			case <-e.stopCh:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-		c, err := e.dockerClient(ctx)
-		if err != nil {
-			cancel()
-			<-done
-			if !sleepOrStop(e.stopCh, 5*time.Second) {
-				return
-			}
-			continue
+		// Watch every enabled environment, one connection each. A flapping
+		// engine only affects its own watcher.
+		envs, _ := e.store.ListEnvironments()
+		primary := e.currentEnvID()
+		var wg sync.WaitGroup
+		watch := func(envID string) {
+			defer wg.Done()
+			e.watchEnvEvents(envID)
 		}
-		body, err := c.Events(ctx)
-		if err != nil {
-			cancel()
-			<-done
-			if !sleepOrStop(e.stopCh, 3*time.Second) {
-				return
+		wg.Add(1)
+		go watch(primary)
+		for _, env := range envs {
+			if !env.Enabled || env.ID == primary {
+				continue
 			}
-			continue
+			wg.Add(1)
+			go watch(env.ID)
 		}
-		e.logger.Printf("info", "已订阅 Docker 事件")
-		dec := json.NewDecoder(body)
-		for {
-			var ev dockerEvent
-			if err := dec.Decode(&ev); err != nil {
-				break
-			}
-			if e.relevantEvent(&ev) {
-				e.triggerReconcile()
-			}
-		}
-		body.Close()
-		cancel()
-		<-done
+		wg.Wait()
 		if !sleepOrStop(e.stopCh, 2*time.Second) {
 			return
+		}
+	}
+}
+
+// watchEnvEvents streams one environment's container events until an error
+// or shutdown. Every relevant event just nudges the reconcile loop.
+func (e *Engine) watchEnvEvents(envID string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-e.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	defer cancel()
+	c, err := e.clientForEnv(ctx, envID)
+	if err != nil {
+		<-done
+		sleepOrStop(e.stopCh, 5*time.Second)
+		return
+	}
+	body, err := c.Events(ctx)
+	if err != nil {
+		<-done
+		sleepOrStop(e.stopCh, 3*time.Second)
+		return
+	}
+	defer body.Close()
+	e.logger.Printf("info", "已订阅 Docker 事件（环境 %s）", envID)
+	dec := json.NewDecoder(body)
+	for {
+		var ev dockerEvent
+		if err := dec.Decode(&ev); err != nil {
+			return
+		}
+		if e.relevantEvent(&ev) {
+			e.triggerReconcile()
 		}
 	}
 }
@@ -306,7 +404,7 @@ func (e *Engine) relevantEvent(ev *dockerEvent) bool {
 		return false
 	}
 	name := ev.Actor.Attributes["name"]
-	if name == proxy.ContainerName {
+	if name == proxy.ContainerName || strings.HasPrefix(name, proxy.ContainerName+"-") {
 		return true
 	}
 	services, err := e.store.ListServices()

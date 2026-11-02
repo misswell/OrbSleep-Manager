@@ -65,15 +65,49 @@ func Convert(ins *dockerx.ContainerInspect, opts Options) model.Container {
 	}
 	sort.Slice(c.Networks, func(i, j int) bool { return c.Networks[i].Name < c.Networks[j].Name })
 
+	anonymousVolumes := 0
 	for _, m := range ins.Mounts {
 		c.Mounts = append(c.Mounts, model.Mount{
 			Type: m.Type, Name: m.Name, Source: m.Source, Destination: m.Destination, ReadOnly: !m.RW,
 		})
+		if m.Type == "volume" && dockerx.IsAnonymousVolume(m.Name) {
+			anonymousVolumes++
+		}
 	}
 
 	c.Ports = extractPorts(ins)
+	c.Strategy = DetectStrategy(&c)
+	if c.Strategy == "compose" {
+		c.Source = "compose"
+	} else if c.Strategy == "docrun" {
+		c.Source = "docker-run"
+	}
 	c.Classification = Classify(&c, opts)
+	if c.Classification.Warnings == nil {
+		c.Classification.Warnings = []model.Reason{}
+	}
+	if anonymousVolumes > 0 && c.Strategy == "docrun" {
+		c.Classification.Warnings = append(c.Classification.Warnings, model.Reason{
+			Code: "anonymous_volumes", Severity: "warning",
+			Message: fmt.Sprintf("容器有 %d 个匿名卷；接入时 OrbSleep 会按原卷名重新挂载以保留数据", anonymousVolumes),
+		})
+	}
 	return c
+}
+
+// DetectStrategy decides how a container would be taken over:
+//   - compose: it carries Compose project/service labels and is recreated by
+//     rewriting the Compose file (the original, proven path);
+//   - docrun: no Compose identity — recreated losslessly from a full inspect
+//     snapshot via the Engine API (docker run, GUI, Portainer, plain API).
+//
+// Compose labels win when present: they describe the whole service, not just
+// one container, and the Compose path has years of hardening behind it.
+func DetectStrategy(c *model.Container) string {
+	if c.ComposeProject != "" && c.ComposeService != "" && !c.Oneoff {
+		return "compose"
+	}
+	return "docrun"
 }
 
 // extractPorts reads HostConfig.PortBindings (and falls back to the runtime map).
@@ -161,28 +195,14 @@ func Classify(c *model.Container, opts Options) model.Classification {
 	if c.Oneoff {
 		block("compose_oneoff", "这是一次性（run）容器，没有可持续的 Compose 服务定义")
 	}
-	if c.ComposeProject == "" || c.ComposeService == "" {
-		block("no_compose", "不是由 Docker Compose 创建（或缺少 Compose 标签），第一版不支持自动迁移")
-	}
+	// 接入策略：compose 走 Compose 定点改写；其余容器一律按 docrun 策略
+	// 通过 Engine API 无损重建。不再因缺少 Compose 标签排除任何容器。
 	if c.Privileged {
 		review("privileged", "容器以特权模式运行，重建前请确认其安全影响")
 	}
 
-	if len(c.ComposeConfigFiles) == 0 {
-		review("compose_file_unknown", "无法从标签定位 Compose 配置文件")
-	} else if len(c.ComposeConfigFiles) > 1 {
-		review("multiple_compose_files", "项目由多个 Compose 文件合并，无法可靠定位端口声明来源")
-	} else {
-		f := c.ComposeConfigFiles[0]
-		if _, err := os.Stat(f); err != nil {
-			review("compose_file_missing", "Compose 配置文件不存在: "+f)
-		}
-		if ext := strings.ToLower(filepath.Ext(f)); ext != ".yml" && ext != ".yaml" {
-			review("compose_file_format", "Compose 配置文件不是 YAML: "+f)
-		}
-	}
-	if c.ComposeContainerNumber > 1 {
-		review("multiple_instances", fmt.Sprintf("Compose 服务当前有多个实例（本容器是第 %d 个），无法建立稳定的端口对应关系", c.ComposeContainerNumber))
+	if c.Strategy == "compose" {
+		applyComposeChecks(c, review)
 	}
 
 	var tcpCount, udpCount, staticCount int
@@ -253,9 +273,36 @@ func Classify(c *model.Container, opts Options) model.Classification {
 		cl.Verdict = verdictNeedsReview
 	}
 	if cl.Verdict != verdictExcluded && len(cl.Reasons) == 0 {
-		cl.Reasons = append(cl.Reasons, model.Reason{Code: "static_tcp", Message: "静态 TCP 端口映射，可由 Compose 安全重建", Severity: "info"})
+		msg := "静态 TCP 端口映射，可通过 Compose 定点改写安全重建"
+		if c.Strategy != "compose" {
+			msg = "静态 TCP 端口映射，可通过 Engine API 按完整快照无损重建"
+		}
+		cl.Reasons = append(cl.Reasons, model.Reason{Code: "static_tcp", Message: msg, Severity: "info"})
 	}
 	return cl
+}
+
+// applyComposeChecks runs the Compose-only viability warnings. They do not
+// apply to docrun containers, which need no Compose file at all.
+func applyComposeChecks(c *model.Container, review func(code, msg string)) {
+	if len(c.ComposeConfigFiles) == 0 {
+		review("compose_file_unknown", "无法从标签定位 Compose 配置文件")
+		return
+	}
+	if len(c.ComposeConfigFiles) > 1 {
+		review("multiple_compose_files", "项目由多个 Compose 文件合并，无法可靠定位端口声明来源")
+		return
+	}
+	f := c.ComposeConfigFiles[0]
+	if _, err := os.Stat(f); err != nil {
+		review("compose_file_missing", "Compose 配置文件不存在: "+f)
+	}
+	if ext := strings.ToLower(filepath.Ext(f)); ext != ".yml" && ext != ".yaml" {
+		review("compose_file_format", "Compose 配置文件不是 YAML: "+f)
+	}
+	if c.ComposeContainerNumber > 1 {
+		review("multiple_instances", fmt.Sprintf("Compose 服务当前有多个实例（本容器是第 %d 个），无法建立稳定的端口对应关系", c.ComposeContainerNumber))
+	}
 }
 
 func isStatefulImage(image string, patterns []string) bool {

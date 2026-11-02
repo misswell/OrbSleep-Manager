@@ -7,7 +7,7 @@ import "context"
 type composeCLI interface {
 	ComposeConfig(ctx context.Context, project, file, workdir string) (map[string]any, error)
 	UpService(ctx context.Context, project, file, workdir, service string) error
-	ProxyUp(ctx context.Context, file string) error
-	ProxyDown(ctx context.Context, file string) error
+	ProxyUp(ctx context.Context, project, file string) error
+	ProxyDown(ctx context.Context, project, file string) error
 	Version(ctx context.Context) (string, error)
 }

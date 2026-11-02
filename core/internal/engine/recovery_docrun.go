@@ -1,0 +1,181 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"orbsleep/internal/deployment/docrun"
+)
+
+// recoverDocrunAttachItem rolls back one docrun attach item after a crash.
+// The durable state lives in the transaction payload (full recreation specs),
+// and the actual container state is re-derived by inspection: the strategy
+// sequence is rename/create based, so every intermediate state is recognisable.
+// Returns true when the item is back at its pre-attach state.
+func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it txnItem, logger *opLogger, errs *[]string) bool {
+	if it.Docrun == nil {
+		// Very old interrupted txn (or payload corruption): nothing safe to do
+		// beyond removing a possibly orphaned record.
+		if it.ServiceID != "" {
+			_ = e.store.DeleteService(it.ServiceID)
+		}
+		*errs = append(*errs, it.ContainerName+": 事务缺少重建快照，已移除托管记录（容器未被修改过则无影响）")
+		return false
+	}
+	prep := it.Docrun
+	eng, err := e.docrunEngineForServiceByID(it.EnvID)
+	if err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: 容器运行时不可用: %v", it.ContainerName, err))
+		return false
+	}
+	hasRecord := false
+	if it.ServiceID != "" {
+		if _, ok, _ := e.store.GetService(it.ServiceID); ok {
+			hasRecord = true
+		}
+	}
+	// Gateway listeners from a partially committed attach must not survive a
+	// rollback: remove them up front (recovery re-ensures them if the managed
+	// state turns out to be the right outcome below).
+	if it.ServiceID != "" {
+		e.gw.RemoveService(it.ServiceID)
+	}
+	bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
+	_, backupErr := eng.InspectContainer(bctx, prep.BackupName)
+	bcancel()
+	backupExists := backupErr == nil
+
+	switch {
+	case backupExists:
+		// Crash between rename and verified replacement: roll back to the
+		// original. If a replacement exists it is removed first.
+		if rerr := docrun.RollbackManaged(ctx, eng, prep, it.ReplacementID); rerr != nil {
+			*errs = append(*errs, fmt.Sprintf("%s: 回滚容器重建失败: %v", it.ContainerName, rerr))
+			return false
+		}
+		if hasRecord {
+			if derr := deleteServiceRecord(e, it.ServiceID); derr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
+				return false
+			}
+			_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+		}
+		logger.add("info", it.ContainerName+" 已恢复到接入前状态（原容器已还原）")
+		return true
+
+	default:
+		// No parked backup: either nothing happened yet, or the replacement is
+		// already in place.
+		ins, err := eng.InspectContainer(ctx, prep.OriginalName)
+		if err != nil {
+			// Container gone entirely. If a record survived, the managed state
+			// can be rebuilt from the snapshot; otherwise nothing to do.
+			if hasRecord && it.Phase == "committed_item" {
+				if merr := e.recoverDocrunRebuildManaged(ctx, eng, it, errs); merr == nil {
+					logger.add("warn", it.ContainerName+" 容器缺失，已按快照重建托管容器")
+					return false
+				}
+			}
+			if it.ServiceID != "" {
+				_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+				_ = e.store.DeleteService(it.ServiceID)
+			}
+			logger.add("info", it.ContainerName+" 容器不存在，未做容器级修改")
+			return true
+		}
+		if ins.Config.Labels[docrun.LabelServiceID] == it.ServiceID || ins.Config.Labels[docrun.LabelManaged] == "true" {
+			// The replacement is running under the original name.
+			if it.Phase == "committed_item" && hasRecord {
+				// Effectively committed; finish the bookkeeping: ensure the
+				// gateway listens and mark the txn committed contribution.
+				if gerr := e.ensureGatewayForService(ctx, it.ServiceID); gerr != nil {
+					*errs = append(*errs, fmt.Sprintf("%s: 恢复端口监听失败: %v", it.ContainerName, gerr))
+					return false
+				}
+				logger.add("info", it.ContainerName+" 接入已完成，补记提交")
+				return true
+			}
+			// Uncommitted replacement: restore the original from the snapshot
+			// (park the replacement, create the original, verify).
+			snap := &docrun.ManagedSnapshot{
+				ServiceID:    it.ServiceID,
+				OriginalName: prep.OriginalName,
+				OriginalID:   it.ReplacementID,
+				OriginalSpec: prep.OriginalSpec,
+				ManagedSpec:  prep.ManagedSpec,
+				Secondary:    prep.Secondary,
+			}
+			if _, rollback, rerr := docrun.RestoreOriginal(ctx, eng, snap); rerr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 恢复原容器失败: %v", it.ContainerName, rerr))
+				return false
+			} else {
+				_ = rollback
+			}
+			if ins2, werr := docrun.InspectRunning(ctx, eng, prep.OriginalName, 2*time.Minute); werr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 原容器未就绪: %v", it.ContainerName, werr))
+				return false
+			} else {
+				for _, r := range it.Removals {
+					if !containerPublishes(ins2, r) {
+						*errs = append(*errs, fmt.Sprintf("%s: 原端口 %d 未重新发布", it.ContainerName, r.HostPort))
+						return false
+					}
+				}
+			}
+			_ = eng.RemoveContainer(ctx, docrun.StaleName(prep.OriginalName), true)
+			if hasRecord {
+				if derr := deleteServiceRecord(e, it.ServiceID); derr != nil {
+					*errs = append(*errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
+					return false
+				}
+				_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+			}
+			logger.add("info", it.ContainerName+" 已恢复到接入前状态（替换容器已撤销）")
+			return true
+		}
+		// The container under the original name is the ORIGINAL (untouched or
+		// already rolled back). Only the proxy registration may need undoing
+		// (handled by the caller via the baseline) and a stale record removed.
+		if hasRecord {
+			// The original serves its own ports again: the record is stale.
+			if derr := deleteServiceRecord(e, it.ServiceID); derr != nil {
+				*errs = append(*errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))
+				return false
+			}
+			_ = e.store.DeleteMeta("serviceBackup:" + it.ServiceID)
+		}
+		logger.add("info", it.ContainerName+" 未被替换（或已还原），仅撤销其代理注册")
+		return true
+	}
+}
+
+// recoverDocrunRebuildManaged recreates the managed replacement for a committed
+// docrun item whose container disappeared.
+func (e *Engine) recoverDocrunRebuildManaged(ctx context.Context, eng docrun.Engine, it txnItem, errs *[]string) error {
+	if it.Docrun == nil {
+		return fmt.Errorf("缺少快照")
+	}
+	id, err := docrun.CreateAndStart(ctx, eng, it.Docrun.ManagedSpec)
+	if err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: 重建托管容器失败: %v", it.ContainerName, err))
+		return err
+	}
+	_ = e.store.SetServiceStatus(it.ServiceID, "managed_running", "", id)
+	if gerr := e.ensureGatewayForService(ctx, it.ServiceID); gerr != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: 恢复端口监听失败: %v", it.ContainerName, gerr))
+		return gerr
+	}
+	return nil
+}
+
+// docrunEngineForServiceByID resolves a strategy engine for an env id.
+func (e *Engine) docrunEngineForServiceByID(envID string) (docrun.Engine, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := e.clientForEnv(ctx, envID)
+	if err != nil {
+		return nil, err
+	}
+	return docrunEngine{c: c}, nil
+}

@@ -16,6 +16,7 @@ import (
 	"orbsleep/internal/dockerx"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
+	"orbsleep/internal/runtime"
 )
 
 func (e *Engine) proxyComposePath() string {
@@ -27,17 +28,23 @@ func (e *Engine) proxyConfigDir() string {
 }
 
 func (e *Engine) proxyStatus(ctx context.Context) model.ProxyStatus {
-	s := e.settings.Get()
+	return e.proxyStatusForEnv(ctx, e.currentEnvID())
+}
+
+// proxyStatusForEnv inspects one environment's proxy container via its env
+// admin/web ports.
+func (e *Engine) proxyStatusForEnv(ctx context.Context, envID string) model.ProxyStatus {
+	spec := e.proxySpecForEnv(envID)
 	ps := model.ProxyStatus{
-		ContainerName:  proxy.ContainerName,
-		PublishedRange: model.Range{Start: s.ProxyPortStart, End: s.ProxyPortEnd},
+		ContainerName:  spec.ContainerName,
+		PublishedRange: model.Range{Start: spec.Start, End: spec.End},
 	}
-	c, err := e.dockerClient(ctx)
+	c, err := e.clientForEnv(ctx, envID)
 	if err != nil {
 		ps.Error = err.Error()
 		return ps
 	}
-	ins, err := c.InspectContainer(ctx, proxy.ContainerName)
+	ins, err := c.InspectContainer(ctx, spec.ContainerName)
 	if err != nil {
 		if !dockerx.IsErrNotFound(err) {
 			ps.Error = err.Error()
@@ -47,7 +54,7 @@ func (e *Engine) proxyStatus(ctx context.Context) model.ProxyStatus {
 	ps.Installed = true
 	ps.Running = ins.State.Running
 	ps.ContainerIP = containerIP(ins)
-	if admin, err := e.adminClient(); err == nil {
+	if admin, err := e.adminClientForEnv(envID); err == nil {
 		pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		if err := admin.Ping(pingCtx); err == nil {
 			ps.AdminReachable = true
@@ -56,7 +63,7 @@ func (e *Engine) proxyStatus(ctx context.Context) model.ProxyStatus {
 	}
 	if ps.Running {
 		mctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		if _, err := proxy.FetchMetrics(mctx, fmt.Sprintf("127.0.0.1:%d", s.WebPort)); err == nil {
+		if _, err := proxy.FetchMetrics(mctx, fmt.Sprintf("127.0.0.1:%d", spec.Web)); err == nil {
 			ps.MetricsReachable = true
 		}
 		cancel()
@@ -65,7 +72,7 @@ func (e *Engine) proxyStatus(ctx context.Context) model.ProxyStatus {
 	case !ps.Running:
 		ps.Error = "代理容器未运行"
 	case !ps.AdminReachable:
-		ps.Error = "代理管理接口不可达（请检查端口 " + fmt.Sprintf("%d", s.AdminPort) + "）"
+		ps.Error = "代理管理接口不可达（请检查端口 " + fmt.Sprintf("%d", spec.Admin) + "）"
 	}
 	return ps
 }
@@ -141,11 +148,15 @@ func (p PublishedPort) routableBindings() []string {
 // hand to the gateway — an empty result means nothing is published and must
 // block the plan, never be treated as "no need to check".
 func (e *Engine) proxyPublishedPorts(ctx context.Context) (map[int]PublishedPort, error) {
-	c, err := e.dockerClient(ctx)
+	return e.proxyPublishedPortsForEnv(ctx, e.currentEnvID())
+}
+
+func (e *Engine) proxyPublishedPortsForEnv(ctx context.Context, envID string) (map[int]PublishedPort, error) {
+	c, err := e.clientForEnv(ctx, envID)
 	if err != nil {
 		return nil, err
 	}
-	ins, err := c.InspectContainer(ctx, proxy.ContainerName)
+	ins, err := c.InspectContainer(ctx, e.proxySpecForEnv(envID).ContainerName)
 	if err != nil {
 		return nil, err
 	}
@@ -185,8 +196,9 @@ func (e *Engine) proxyContainerIP(ctx context.Context) string {
 	return containerIP(ins)
 }
 
-// ProxySetup installs or restarts the proxy and returns an operation id.
-func (e *Engine) ProxySetup() (string, error) {
+// ProxySetup installs or restarts the proxy of one environment and returns an
+// operation id. envID empty means the primary environment.
+func (e *Engine) ProxySetup(envID string) (string, error) {
 	if err := e.ensureNoUnresolvedWork(); err != nil {
 		return "", err
 	}
@@ -206,13 +218,14 @@ func (e *Engine) ProxySetup() (string, error) {
 		done()
 		return "", err
 	}
-	go e.runProxySetup(ctx, op, done)
+	go e.runProxySetup(ctx, op, done, envID)
 	return op.ID, nil
 }
 
-// ProxyStop stops and removes the proxy container but keeps its configuration,
-// settings and backups so it can be started again.
-func (e *Engine) ProxyStop() (string, error) {
+// ProxyStop stops and removes an environment's proxy container but keeps its
+// configuration, settings and backups so it can be started again. envID empty
+// means the primary environment.
+func (e *Engine) ProxyStop(envID string) (string, error) {
 	if err := e.ensureNoUnresolvedWork(); err != nil {
 		return "", err
 	}
@@ -232,11 +245,11 @@ func (e *Engine) ProxyStop() (string, error) {
 		done()
 		return "", err
 	}
-	go e.runProxyStop(ctx, op, done)
+	go e.runProxyStop(ctx, op, done, envID)
 	return op.ID, nil
 }
 
-func (e *Engine) runProxyStop(ctx context.Context, op model.Operation, done func()) {
+func (e *Engine) runProxyStop(ctx context.Context, op model.Operation, done func(), envID string) {
 	defer done()
 	logger := e.newOpLogger(op)
 	unlock, err := e.beginSafeWrite()
@@ -246,18 +259,19 @@ func (e *Engine) runProxyStop(ctx context.Context, op model.Operation, done func
 		return
 	}
 	defer unlock()
-	cli, err := e.cliRunner()
+	spec := e.proxySpecForEnv(envID)
+	cli, err := e.cliForEnv(ctx, envID)
 	if err != nil {
 		logger.finish("failed", err.Error())
 		return
 	}
-	composePath := e.proxyComposePath()
+	composePath := spec.ComposePath
 	if _, err := os.Stat(composePath); err != nil {
 		logger.finish("failed", "代理未安装: "+err.Error())
 		return
 	}
 	logger.add("info", "停止并移除代理容器（配置与设置保留）")
-	if err := cli.ProxyDown(ctx, composePath); err != nil {
+	if err := cli.ProxyDown(ctx, spec.Project, composePath); err != nil {
 		logger.finish("failed", "停止代理失败: "+err.Error())
 		return
 	}
@@ -268,7 +282,7 @@ func (e *Engine) runProxyStop(ctx context.Context, op model.Operation, done func
 	e.triggerReconcile()
 }
 
-func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done func()) {
+func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done func(), envID string) {
 	defer done()
 	logger := e.newOpLogger(op)
 	unlock, err := e.beginSafeWrite()
@@ -278,29 +292,40 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 		return
 	}
 	defer unlock()
-	logger.add("info", "开始安装/启动 Lazy TCP Proxy")
+	spec := e.proxySpecForEnv(envID)
+	primary := spec.Primary
+	logger.add("info", fmt.Sprintf("开始安装/启动 Lazy TCP Proxy（环境 %s）", envDisplayName(envID, spec)))
 
-	c, err := e.dockerClient(ctx)
+	c, err := e.clientForEnv(ctx, envID)
 	if err != nil {
 		logger.finish("failed", "Docker 不可用: "+err.Error())
 		return
 	}
-	cli, err := e.cliRunner()
+	cli, err := e.cliForEnv(ctx, envID)
 	if err != nil {
 		logger.finish("failed", err.Error())
 		return
 	}
 	old := e.settings.Get()
 	var ins *dockerx.ContainerInspect
-	if i, err := c.InspectContainer(ctx, proxy.ContainerName); err == nil {
-		if proj := i.Config.Labels["com.docker.compose.project"]; proj != "orbsleep-proxy" {
-			logger.finish("failed", fmt.Sprintf("已存在同名容器 %s（Compose 项目 %q），为避免覆盖用户配置已停止；请先改名或移除该容器", proxy.ContainerName, proj))
+	if i, err := c.InspectContainer(ctx, spec.ContainerName); err == nil {
+		if proj := i.Config.Labels["com.docker.compose.project"]; proj != spec.Project {
+			logger.finish("failed", fmt.Sprintf("已存在同名容器 %s（Compose 项目 %q），为避免覆盖用户配置已停止；请先改名或移除该容器", spec.ContainerName, proj))
 			return
 		}
 		ins = i
 	}
 	owned := proxyOwnedHostPorts(ins)
 	next := old
+	if !primary {
+		// Additional environments use their own persisted port plan.
+		next.ProxyPortStart, next.ProxyPortEnd = spec.Start, spec.End
+		next.AdminPort, next.WebPort = spec.Admin, spec.Web
+		if next.ProxyPortStart <= 0 || next.ProxyPortEnd <= 0 {
+			logger.finish("failed", "环境未分配代理端口段，请先停用后重新启用该环境")
+			return
+		}
+	}
 
 	// Select the published range, treating ports already published by our own
 	// proxy as reusable (a running proxy legitimately owns them).
@@ -351,6 +376,7 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 
 	samePorts := old.ProxyPortStart == next.ProxyPortStart && old.ProxyPortEnd == next.ProxyPortEnd &&
 		old.AdminPort == next.AdminPort && old.WebPort == next.WebPort
+	_ = primary
 	if ins != nil && ins.State.Running && samePorts && e.proxyAdminReachable(ctx, next.AdminPort) {
 		if err := e.syncProxyConfig(ctx, true); err != nil {
 			logger.finish("failed", "代理正在运行，但同步服务配置失败: "+err.Error())
@@ -441,7 +467,7 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 		}
 		if hadCompose {
 			rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			if uerr := cli.ProxyUp(rctx, composePath); uerr != nil {
+			if uerr := cli.ProxyUp(rctx, spec.Project, composePath); uerr != nil {
 				errs = append(errs, "恢复旧代理容器失败: "+uerr.Error())
 			} else if werr := e.waitProxyAdminAt(rctx, old.AdminPort, 90*time.Second); werr != nil {
 				errs = append(errs, "旧代理管理接口未恢复: "+werr.Error())
@@ -468,7 +494,7 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 		logger.finish(status, msg+"；备份位于 "+snapDir)
 	}
 
-	if err := compose.WriteAtomic(composePath, proxy.ComposeFile(next, key, cfgDir), 0o600); err != nil {
+	if err := compose.WriteAtomic(composePath, proxy.ComposeFile(next, key, cfgDir, spec.ContainerName, spec.SocketPath), 0o600); err != nil {
 		restore(fmt.Errorf("写入代理 Compose 文件失败: %w", err))
 		return
 	}
@@ -476,7 +502,7 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 	logger.add("info", fmt.Sprintf("代理端口范围 %d-%d，管理 API 127.0.0.1:%d，状态页 127.0.0.1:%d",
 		next.ProxyPortStart, next.ProxyPortEnd, next.AdminPort, next.WebPort))
 	logger.add("info", "拉取并启动代理容器…")
-	if err := cli.ProxyUp(ctx, composePath); err != nil {
+	if err := cli.ProxyUp(ctx, spec.Project, composePath); err != nil {
 		restore(fmt.Errorf("启动代理失败: %w", err))
 		return
 	}
@@ -485,17 +511,34 @@ func (e *Engine) runProxySetup(ctx context.Context, op model.Operation, done fun
 		restore(err)
 		return
 	}
-	if err := e.settings.Save(next); err != nil {
-		restore(fmt.Errorf("保存设置失败: %w", err))
-		return
+	if primary {
+		if err := e.settings.Save(next); err != nil {
+			restore(fmt.Errorf("保存设置失败: %w", err))
+			return
+		}
+	} else if env, ok, gerr := e.store.GetEnvironment(envID); gerr == nil && ok {
+		env.ProxyPortStart, env.ProxyPortEnd = next.ProxyPortStart, next.ProxyPortEnd
+		env.AdminPort, env.WebPort = next.AdminPort, next.WebPort
+		if err := e.store.UpsertEnvironment(env); err != nil {
+			restore(fmt.Errorf("保存环境端口配置失败: %w", err))
+			return
+		}
 	}
-	if err := e.syncProxyConfig(ctx, true); err != nil {
+	if err := e.syncProxyConfigForEnv(ctx, envID, true); err != nil {
 		restore(fmt.Errorf("写入代理服务配置失败: %w", err))
 		return
 	}
 	logger.add("info", "Lazy TCP Proxy 已就绪")
 	logger.finish("succeeded", "")
 	e.triggerReconcile()
+}
+
+// envDisplayName resolves a friendly name for logs.
+func envDisplayName(envID string, spec proxyEnvSpec) string {
+	if spec.Primary {
+		return "默认"
+	}
+	return spec.ContainerName
 }
 
 // proxyAPIKey returns the cached admin key, generating one on first use.
@@ -680,26 +723,68 @@ func mergeSets(base map[int]bool, ports ...int) map[int]bool {
 	return out
 }
 
+// syncProxyConfig pushes the desired service config to EVERY environment
+// that has managed services. Each environment has its own proxy container and
+// admin endpoint; services are grouped by their pinned environment.
 func (e *Engine) syncProxyConfig(ctx context.Context, force bool) error {
 	services, err := e.store.ListServices()
 	if err != nil {
 		return err
 	}
-	// The proxy only runs on the currently selected Docker instance; services
-	// pinned to another instance are managed by that instance's proxy and must
-	// not be pushed into this one's config.
-	clientSocket := strings.TrimPrefix(strings.TrimSpace(e.settings.Get().DockerSocket), "unix://")
-	if c, derr := e.dockerClient(ctx); derr == nil {
-		clientSocket = strings.TrimPrefix(c.Socket(), "unix://")
+	primary := e.currentEnvID()
+	groups := map[string][]model.Service{}
+	order := []string{}
+	for _, svc := range services {
+		envID := svc.EnvironmentID
+		if envID == "" {
+			// Legacy record: bound to the socket it was attached on; map that
+			// socket to its environment id when it is the current one.
+			if svc.DockerSocket == "" || svc.DockerSocket == strings.TrimPrefix(e.currentEnvEndpoint(), "unix://") {
+				envID = primary
+			} else {
+				envID = runtime.EnvID("unix://" + svc.DockerSocket)
+			}
+		}
+		if _, seen := groups[envID]; !seen {
+			order = append(order, envID)
+		}
+		groups[envID] = append(groups[envID], svc)
 	}
+	var errs []string
+	for _, envID := range order {
+		if err := e.syncProxyConfigForEnv(ctx, envID, force); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// syncProxyConfigForEnv pushes the desired config to one environment's proxy.
+func (e *Engine) syncProxyConfigForEnv(ctx context.Context, envID string, force bool) error {
+	services, err := e.store.ListServices()
+	if err != nil {
+		return err
+	}
+	primary := e.currentEnvID()
 	scoped := make([]model.Service, 0, len(services))
 	for _, svc := range services {
-		if svc.DockerSocket == "" || svc.DockerSocket == clientSocket {
+		svcEnv := svc.EnvironmentID
+		if svcEnv == "" {
+			if svc.DockerSocket == "" || svc.DockerSocket == strings.TrimPrefix(e.currentEnvEndpoint(), "unix://") {
+				svcEnv = primary
+			} else {
+				svcEnv = runtime.EnvID("unix://" + svc.DockerSocket)
+			}
+		}
+		if svcEnv == envID {
 			scoped = append(scoped, svc)
 		}
 	}
 	desired := e.desiredProxyConfig(scoped)
-	admin, err := e.adminClient()
+	admin, err := e.adminClientForEnv(envID)
 	if err != nil {
 		return err
 	}

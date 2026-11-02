@@ -174,7 +174,14 @@ func (e *Engine) recoverAttachTxn(txn state.Transaction) {
 		e.setLastError("存在未完成事务；代理不可读，暂未自动恢复")
 		return
 	}
-	cli, err := e.cliRunner()
+	txnEnvID := ""
+	for _, it := range payload.Items {
+		if it.EnvID != "" {
+			txnEnvID = it.EnvID
+			break
+		}
+	}
+	cli, err := e.cliForEnv(ctx, txnEnvID)
 	if err != nil {
 		logger.finish("failed", "docker CLI 不可用，暂不自动恢复（事务保留）: "+err.Error())
 		return
@@ -185,6 +192,14 @@ func (e *Engine) recoverAttachTxn(txn state.Transaction) {
 	for i := len(payload.Items) - 1; i >= 0; i-- {
 		it := payload.Items[i]
 		if it.BackupPath == "" {
+			continue
+		}
+		// docrun items roll back from the container snapshot; they take no
+		// Compose file lock and do not need the compose CLI.
+		if it.Strategy == "docrun" {
+			if e.recoverDocrunAttachItem(ctx, txn.ID, it, logger, &errs) {
+				restored = append(restored, it.ContainerName)
+			}
 			continue
 		}
 		if e.recoverAttachItem(ctx, cli, txn.ID, it, logger, &errs) {
@@ -412,6 +427,11 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 		_ = e.store.FinishTransaction(txn.ID, "rollback_failed", "事务数据损坏: "+err.Error(), "rollback_failed")
 		return
 	}
+	// docrun detaches are snapshot-driven: no Compose file, no file lock.
+	if p.Strategy == "docrun" {
+		e.recoverDocrunDetachTxn(txn.ID, p)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	// The per-file lock serializes against anything else touching this
@@ -433,12 +453,12 @@ func (e *Engine) recoverDetachTxn(txn state.Transaction) {
 		e.finishTxnAtomic(txn.ID, p.OperationID, "committed", nil, "committed")
 		return
 	}
-	c, err := e.dockerClient(ctx)
+	c, err := e.clientForEnv(ctx, p.Service.EnvironmentID)
 	if err != nil {
 		e.logger.Printf("error", "未完成恢复操作：Docker 不可用: %v（事务保留）", err)
 		return
 	}
-	cli, err := e.cliRunner()
+	cli, err := e.cliForEnv(ctx, p.Service.EnvironmentID)
 	if err != nil {
 		e.logger.Printf("error", "未完成恢复操作：docker CLI 不可用: %v（事务保留）", err)
 		return
@@ -719,6 +739,12 @@ func (e *Engine) txnAllCommitted(ctx context.Context, payload txnPayload) bool {
 		}
 		if _, ok, err := e.store.GetService(it.ServiceID); err != nil || !ok {
 			return false
+		}
+		if it.Strategy == "docrun" {
+			// No Compose file backs a docrun item; the record existing is the
+			// commit evidence (the container replacement was verified before
+			// committed_item was written).
+			continue
 		}
 		expected := it.ManagedContent
 		if len(expected) == 0 {

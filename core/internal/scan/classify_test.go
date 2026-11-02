@@ -62,12 +62,18 @@ func TestHostNetworkExcluded(t *testing.T) {
 	}
 }
 
-func TestNoComposeExcluded(t *testing.T) {
+func TestNoComposeNowEligibleViaDocrun(t *testing.T) {
+	// Since 0.3.0 a container without Compose labels is NOT excluded anymore:
+	// it goes through the docrun strategy (full inspect snapshot + Engine API
+	// recreation).
 	ins := baseInspect(t)
 	ins.Config.Labels = map[string]string{}
 	c := Convert(ins, Options{})
-	if c.Classification.Verdict != "excluded" || !hasReason(c.Classification, "no_compose") {
-		t.Fatalf("verdict = %s reasons=%+v", c.Classification.Verdict, c.Classification.Reasons)
+	if c.Strategy != "docrun" || c.Source != "docker-run" {
+		t.Fatalf("strategy/source = %s/%s", c.Strategy, c.Source)
+	}
+	if c.Classification.Verdict != "eligible" {
+		t.Fatalf("verdict = %s reasons=%+v warnings=%+v", c.Classification.Verdict, c.Classification.Reasons, c.Classification.Warnings)
 	}
 }
 
