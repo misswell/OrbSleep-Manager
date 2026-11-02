@@ -130,13 +130,20 @@ struct ServicesView: View {
                     Text(service.displayName)
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
-                    Text(service.projectServiceText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        Text(service.projectServiceText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text(service.strategyText)
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.blue.opacity(0.10), in: Capsule())
+                    }
                 }
             }
-            .width(min: 150, ideal: 200)
+            .width(min: 150, ideal: 210)
 
             TableColumn("状态") { service in
                 HStack(spacing: 4) {

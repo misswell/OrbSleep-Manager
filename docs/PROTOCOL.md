@@ -42,7 +42,10 @@ GUI 与后台助手（`orbsleepd`）通过 **Unix Domain Socket** + **换行分�
 | `system.recovery.resolve` | `{}` 或 `{"id":"txn-..."}`（按 ID 重试失败事务） | `{"transactions":[...],"message":"..."}` |
 | `docker.contexts` | `{}` | `{"contexts":[DockerContext],"selected":"unix://..."}` |
 | `docker.context.select` | `{"name":"OrbStack"}` 或 `{"endpoint":"unix://..."}` | `DockerContexts` |
-| `scan` | `{}` | `ScanResult` |
+| `environments.list` | `{}` | `{"environments":[Environment],"primaryId":"env-..."}` |
+| `environment.add` | `{"endpoint":"unix:///path/docker.sock","name":"可选"}` | `EnvironmentList`（端点会被探测；远程 tcp/ssh 端点拒绝注册） |
+| `environment.action` | `{"id":"env-...","action":"enable|disable|test|remove"}` | `EnvironmentList`；enable 会为该环境分配不相交的代理端口段 |
+| `scan` | `{"environmentId":"env-..."}`（缺省扫描全部已启用环境并合并） | `ScanResult` |
 | `container.inspect` | `{"id":"..."}` | `{"container":Container,"inspect":object}` |
 | `plan.create` | `{"containerIds":["..."],"allowLanExposure":false}` | `Plan` |
 | `plan.apply` | `{"planId":"..."}` | `{"operationId":"..."}` |
@@ -52,8 +55,8 @@ GUI 与后台助手（`orbsleepd`）通过 **Unix Domain Socket** + **换行分�
 | `service.action` | `{"id":"...","action":"start|stop|restore|remove|updatePolicy","params":{...}}` | `{"operationId":"..."}` 或 `{"ok":true}` |
 | `settings.get` | `{}` | `Settings` |
 | `settings.update` | `SettingsPatch` | `Settings` |
-| `proxy.setup` | `{}` | `{"operationId":"..."}` |
-| `proxy.stop` | `{}` | `{"operationId":"..."}` |
+| `proxy.setup` | `{"environmentId":"env-..."}`（缺省=默认环境） | `{"operationId":"..."}` |
+| `proxy.stop` | `{"environmentId":"env-..."}`（缺省=默认环境） | `{"operationId":"..."}` |
 | `backup.create` | `{}` | `{"backup":BackupEntry}` |
 | `backup.list` | `{}` | `{"backups":[BackupEntry]}` |
 | `backup.restore` | `{"id":"backup-..."}` 或 `{"path":"..."}` | `{"ok":true,"restartRequired":true,"message":"...","backupPath":"..."}` |
@@ -110,6 +113,9 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
   "mounts": [{"type":"volume","name":"blog_data","source":"blog_data","destination":"/data","readOnly":false}],
   "ports": [{"hostIP":"127.0.0.1","hostPort":8080,"containerPort":80,"protocol":"tcp"}],
   "managedServiceId": "svc-...",
+  "environmentId": "env-3f9a...",
+  "strategy": "compose",
+  "source": "compose",
   "classification": {
     "verdict": "eligible",
     "reasons": [{"code":"static_tcp","message":"可安全迁移的静态 TCP 端口映射","severity":"info"}],
@@ -122,6 +128,7 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 `state` 为 Docker 原始状态：`running`、`exited`、`created`、`paused`、`restarting`、`dead`、`removing`。
 `verdict`: `eligible`（可自动接入）、`needs_review`（需人工确认）、`excluded`（排除）。
 `managedServiceId` 为空表示未托管。
+`environmentId` 标识容器所属环境；`strategy` 是接入方式：`compose`（Compose 定点改写重建）或 `docrun`（按完整 inspect 快照经 Engine API 无损重建，用于 docker run / GUI / API 创建的容器）；`source` 是创建来源：`compose` | `docker-run` | `api` | `unknown`。
 
 ### ScanResult
 
@@ -130,8 +137,12 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
   "scannedAt": "2026-10-29T12:00:00Z",
   "context": {"name":"orbstack","endpoint":"unix:///Users/me/.orbstack/run/docker.sock","kind":"orbstack"},
   "containers": [Container],
-  "counts": {"eligible":2,"needsReview":1,"excluded":10,"managed":3}
+  "counts": {"eligible":2,"needsReview":1,"excluded":10,"managed":3},
+  "environmentId": ""
 }
+```
+
+`environmentId` 为空表示多环境合并扫描（每个 Container 自带 `environmentId`）；非空表示单环境扫描。
 ```
 
 ### Plan
@@ -153,6 +164,8 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
     "proxyMappings": [{"listenPort":20000,"targetPort":80}],
     "bindings": [{"hostIP":"127.0.0.1","hostPort":8080,"containerPort":80,"proxyPort":20000,"protocol":"tcp"}],
     "requiresLanConfirmation": false,
+    "strategy": "compose",
+    "environmentId": "env-3f9a...",
     "risks": [{"code":"recreate","message":"将执行 docker compose up -d --no-deps nginx","severity":"info"}],
     "diff": "--- a/docker-compose.yml\n+++ b/docker-compose.yml\n@@ ...\n",
     "steps": ["备份 Compose 文件", "写入代理配置", "移除端口映射", "校验 Compose", "仅重建 nginx", "启动端口网关", "连通性测试"]
@@ -162,6 +175,7 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
 ```
 
 `status`: `ready` | `blocked`。`blockers` 非空时 GUI 必须禁用执行按钮。
+`strategy` 同 Container；一个计划的所有条目必须属于同一个环境（`mixed_environments` 阻塞）。docrun 条目没有 `composeFile`/`diff`，其 `steps` 描述快照重建序列。
 
 ### Operation
 

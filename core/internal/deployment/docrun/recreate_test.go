@@ -1,0 +1,272 @@
+package docrun
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"orbsleep/internal/dockerx"
+	"orbsleep/internal/runtime"
+)
+
+// fakeEngine is an in-memory Engine recording every mutation, used to prove
+// the recreate/rollback sequences never lose the original container.
+type fakeEngine struct {
+	inspections map[string]*dockerx.ContainerInspect
+	created     []*specRecord
+	removed     []string
+	renames     [][2]string
+	started     []string
+	stopped     [][2]string
+	connected   [][3]string
+	failNext    map[string]error
+}
+
+type specRecord struct {
+	name string
+	spec *runtime.ContainerSpec
+}
+
+func (f *fakeEngine) err(op string) error {
+	if f.failNext == nil {
+		return nil
+	}
+	if e, ok := f.failNext[op]; ok {
+		delete(f.failNext, op)
+		return e
+	}
+	return nil
+}
+
+func (f *fakeEngine) InspectContainer(ctx context.Context, id string) (*dockerx.ContainerInspect, error) {
+	if err := f.err("inspect"); err != nil {
+		return nil, err
+	}
+	if ins, ok := f.inspections[id]; ok {
+		return ins, nil
+	}
+	return nil, &dockerx.APIError{Status: 404, Body: "no such container"}
+}
+
+func (f *fakeEngine) StartContainer(ctx context.Context, id string) error {
+	if err := f.err("start"); err != nil {
+		return err
+	}
+	f.started = append(f.started, id)
+	return nil
+}
+
+func (f *fakeEngine) StopContainer(ctx context.Context, id string, timeoutSecs int) error {
+	if err := f.err("stop"); err != nil {
+		return err
+	}
+	f.stopped = append(f.stopped, [2]string{id, "t"})
+	return nil
+}
+
+func (f *fakeEngine) RemoveContainer(ctx context.Context, id string, force bool) error {
+	if err := f.err("remove"); err != nil {
+		return err
+	}
+	f.removed = append(f.removed, id)
+	delete(f.inspections, id)
+	return nil
+}
+
+func (f *fakeEngine) RenameContainer(ctx context.Context, id, name string) error {
+	if err := f.err("rename"); err != nil {
+		return err
+	}
+	f.renames = append(f.renames, [2]string{id, name})
+	if ins, ok := f.inspections[id]; ok {
+		ins.Name = "/" + name
+	}
+	return nil
+}
+
+func (f *fakeEngine) CreateContainer(ctx context.Context, spec *runtime.ContainerSpec) (string, error) {
+	if err := f.err("create"); err != nil {
+		return "", err
+	}
+	id := "new-" + spec.Name
+	f.created = append(f.created, &specRecord{name: spec.Name, spec: spec})
+	return id, nil
+}
+
+func (f *fakeEngine) ConnectNetwork(ctx context.Context, network, containerID string, endpoint *runtime.EndpointConfig) error {
+	aliases := ""
+	if endpoint != nil {
+		aliases = strings.Join(endpoint.Aliases, ",")
+	}
+	f.connected = append(f.connected, [3]string{network, containerID, aliases})
+	return nil
+}
+
+func TestRecreateManagedHappyPath(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &fakeEngine{inspections: map[string]*dockerx.ContainerInspect{prep.OriginalID: ins}}
+	var phases []string
+	created, cleanup, err := RecreateManaged(context.Background(), eng, prep, func(phase string) error {
+		phases = append(phases, phase)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created != "new-webapp" {
+		t.Fatalf("created = %s", created)
+	}
+	if len(phases) != 2 || phases[0] != "original_renamed" || phases[1] != "replacement_created" {
+		t.Fatalf("phases = %v", phases)
+	}
+	if len(eng.stopped) != 1 || eng.stopped[0][0] != prep.OriginalID {
+		t.Fatalf("stop sequence wrong: %v", eng.stopped)
+	}
+	if len(eng.renames) != 1 || eng.renames[0][1] != prep.BackupName {
+		t.Fatalf("rename sequence wrong: %v", eng.renames)
+	}
+	if len(eng.connected) != 1 || eng.connected[0][0] != "backnet" {
+		t.Fatalf("network reconnect wrong: %v", eng.connected)
+	}
+	if err := cleanup(true); err != nil {
+		t.Fatal(err)
+	}
+	if len(eng.removed) != 1 || eng.removed[0] != prep.OriginalID {
+		t.Fatalf("cleanup removal wrong: %v", eng.removed)
+	}
+}
+
+func TestRecreateManagedRollsBackOnCreateFailure(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &fakeEngine{
+		inspections: map[string]*dockerx.ContainerInspect{prep.OriginalID: ins},
+		failNext:    map[string]error{"create": &dockerx.APIError{Status: 409, Body: "conflict"}},
+	}
+	_, _, err = RecreateManaged(context.Background(), eng, prep, nil)
+	if err == nil {
+		t.Fatal("create failure must surface")
+	}
+	if len(eng.renames) != 2 || eng.renames[1][1] != prep.OriginalName {
+		t.Fatalf("rollback rename wrong: %v", eng.renames)
+	}
+	if len(eng.started) == 0 || eng.started[len(eng.started)-1] != prep.OriginalID {
+		t.Fatalf("rollback start wrong: %v", eng.started)
+	}
+	for _, c := range eng.created {
+		if c.name == prep.OriginalName {
+			t.Fatal("replacement must be removed after failed create")
+		}
+	}
+}
+
+func TestRollbackManagedRestoresOriginal(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &fakeEngine{inspections: map[string]*dockerx.ContainerInspect{prep.OriginalID: ins}}
+	created, _, err := RecreateManaged(context.Background(), eng, prep, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RollbackManaged(context.Background(), eng, prep, created); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, id := range eng.removed {
+		if id == created {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("replacement not removed: %v", eng.removed)
+	}
+	if len(eng.renames) != 2 || eng.renames[1][1] != prep.OriginalName {
+		t.Fatalf("rename-back wrong: %v", eng.renames)
+	}
+}
+
+func TestRestoreOriginalSequence(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The managed container reflects the MANAGED spec: takeover port removed,
+	// anonymous volume re-attached by name, management labels present.
+	managed := loadGolden(t)
+	managed.ID = "managed-1"
+	delete(managed.HostConfig.PortBindings, "80/tcp")
+	managed.HostConfig.Binds = append(managed.HostConfig.Binds,
+		"9f8e7d6c5b4a3210fedcba9876543210fedcba9876543210fedcba9876543210:/var/cache/nginx")
+	managed.Config.Labels[LabelServiceID] = "svc-1"
+	managed.Config.Labels[LabelManaged] = "true"
+	// Mirror a modern engine: user aliases land in DNSNames alongside the
+	// container's own identities. A container created from the spec carries
+	// only the user alias — the original's short-ID alias does not survive.
+	wn := managed.NetworkSettings.Networks["webnet"]
+	wn.Aliases = []string{"web"}
+	wn.DNSNames = []string{"webapp", "web"}
+	managed.NetworkSettings.Networks["webnet"] = wn
+	eng := &fakeEngine{inspections: map[string]*dockerx.ContainerInspect{
+		"managed-1":     managed,
+		managed.ID:      managed,
+		"webapp":        managed, // VerifyManaged looks the container up by name
+		prep.OriginalID: ins,
+	}}
+	snap := &ManagedSnapshot{
+		ServiceID:    "svc-1",
+		OriginalName: prep.OriginalName,
+		OriginalID:   "managed-1",
+		OriginalSpec: prep.OriginalSpec,
+		ManagedSpec:  prep.ManagedSpec,
+		Secondary:    prep.Secondary,
+	}
+	if _, err := VerifyManaged(context.Background(), eng, snap); err != nil {
+		t.Fatalf("managed verification failed: %v", err)
+	}
+	tampered := loadGolden(t)
+	tampered.ID = "managed-1"
+	tampered.Config.Env = append(tampered.Config.Env, "INTRUDER=1")
+	eng2 := &fakeEngine{inspections: map[string]*dockerx.ContainerInspect{"managed-1": tampered, "webapp": tampered}}
+	if _, err := VerifyManaged(context.Background(), eng2, snap); err == nil {
+		t.Fatal("tampered container must be refused")
+	}
+	created, rollback, err := RestoreOriginal(context.Background(), eng, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created == "" || rollback == nil {
+		t.Fatal("restore must return id and rollback")
+	}
+	found := false
+	for _, r := range eng.renames {
+		if r[0] == "managed-1" && strings.HasSuffix(r[1], StaleSuffix) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("managed container not parked: %v", eng.renames)
+	}
+	var origCreated bool
+	for _, c := range eng.created {
+		if c.name == prep.OriginalName {
+			origCreated = true
+		}
+	}
+	if !origCreated {
+		t.Fatal("original container not recreated")
+	}
+	if len(eng.connected) != 1 || eng.connected[0][0] != "backnet" {
+		t.Fatalf("restore network reconnect wrong: %v", eng.connected)
+	}
+}

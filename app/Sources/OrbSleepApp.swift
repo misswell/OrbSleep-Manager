@@ -104,6 +104,8 @@ struct RootView: View {
             switch app.section {
             case .overview:
                 OverviewView()
+            case .environments:
+                EnvironmentsView()
             case .scan:
                 ScanView()
             case .services:

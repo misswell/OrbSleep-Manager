@@ -49,8 +49,18 @@ func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it t
 	switch {
 	case backupExists:
 		// Crash between rename and verified replacement: roll back to the
-		// original. If a replacement exists it is removed first.
-		if rerr := docrun.RollbackManaged(ctx, eng, prep, it.ReplacementID); rerr != nil {
+		// original. The replacement (if create already happened) sits under
+		// the ORIGINAL name; its id may never have been persisted, so locate
+		// it by our management label before removing it — otherwise the
+		// rename-back would collide with the living replacement.
+		replacementID := it.ReplacementID
+		if ins, ierr := eng.InspectContainer(ctx, prep.OriginalName); ierr == nil {
+			if ins.Config.Labels[docrun.LabelServiceID] == it.ServiceID ||
+				ins.Config.Labels[docrun.LabelManaged] == "true" {
+				replacementID = ins.ID
+			}
+		}
+		if rerr := docrun.RollbackManaged(ctx, eng, prep, replacementID); rerr != nil {
 			*errs = append(*errs, fmt.Sprintf("%s: 回滚容器重建失败: %v", it.ContainerName, rerr))
 			return false
 		}

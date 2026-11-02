@@ -110,6 +110,8 @@ func main() {
 		withClient(sock, func(c *client.Client) { proxySetup(c, rest) })
 	case "proxy-stop":
 		withClient(sock, func(c *client.Client) { proxyStop(c, rest) })
+	case "recoveries", "transactions":
+		withClient(sock, func(c *client.Client) { printRecoveries(c, rest) })
 	case "environments", "envs":
 		withClient(sock, func(c *client.Client) { printEnvironments(c, rest) })
 	case "environment-add":
@@ -554,6 +556,27 @@ func proxySetup(c *client.Client, args []string) {
 	must(c.Call(context.Background(), "proxy.setup", params, &out))
 	fmt.Printf("代理安装/启动操作: %s\n", out.OperationID)
 	followOperation(c, out.OperationID)
+}
+
+// printRecoveries lists unresolved transactions (system.recovery.list).
+func printRecoveries(c *client.Client, args []string) {
+	var out struct {
+		Transactions []model.RecoveryTransaction `json:"transactions"`
+		Resolved     int                         `json:"resolved"`
+		Message      string                      `json:"message"`
+	}
+	must(c.Call(context.Background(), "system.recovery.list", nil, &out))
+	if hasFlag(args, "--json") {
+		printJSON(out)
+		return
+	}
+	if len(out.Transactions) == 0 {
+		fmt.Println("没有未完成事务")
+		return
+	}
+	for _, t := range out.Transactions {
+		fmt.Printf("%-24s %-10s %-16s %s\n", t.ID, t.Status, t.Phase, t.Error)
+	}
 }
 
 // printEnvironments lists registered + discovered container environments.

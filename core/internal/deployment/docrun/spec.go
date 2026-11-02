@@ -198,8 +198,11 @@ func SpecFromInspect(ins *dockerx.ContainerInspect) (*runtime.ContainerSpec, err
 			continue
 		}
 		ec := runtime.EndpointConfig{}
-		if len(ep.Aliases) > 0 {
-			ec.Aliases = copyStrings(ep.Aliases)
+		if aliases := userAliases(ep, ins); len(aliases) > 0 {
+			// Set both spellings: Docker 29.x only honors DNSNames on raw
+			// API creates, older engines only know Aliases.
+			ec.Aliases = aliases
+			ec.DNSNames = copyStrings(aliases)
 		}
 		if ep.IPAMConfig != nil {
 			ec.IPAMConfig = &dockerx.IPAMConfig{
@@ -310,6 +313,34 @@ func splitPortKey(key string) (int, string) {
 		n = n*10 + int(r-'0')
 	}
 	return n, proto
+}
+
+// userAliases merges the legacy Aliases field with the modern DNSNames field
+// and strips the container's own identities (name, short id) — those are
+// implicit on every container and pinning them would chain the replacement
+// to the original's identity.
+func userAliases(ep dockerx.EndpointSettings, ins *dockerx.ContainerInspect) []string {
+	name := strings.TrimPrefix(ins.Name, "/")
+	own := map[string]bool{name: true, ins.ID: true}
+	if len(ins.ID) >= 12 {
+		own[ins.ID[:12]] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(list []string) {
+		for _, a := range list {
+			a = strings.TrimPrefix(a, "/")
+			if a == "" || own[a] || seen[a] {
+				continue
+			}
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	add(ep.Aliases)
+	add(ep.DNSNames)
+	sort.Strings(out)
+	return out
 }
 
 func destCoveredBy(dest string, binds []string, mounts []dockerx.MountSpec) bool {

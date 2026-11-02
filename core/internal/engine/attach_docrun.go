@@ -246,6 +246,9 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 		if perr != nil {
 			return fmt.Errorf("写入事务日志失败: %w", perr)
 		}
+		// Crash-injection hooks mirror the compose path: recovery must be
+		// able to roll the sequence back from any of these states.
+		failpoint.Hit("docrun_" + phase)
 		return nil
 	})
 	if err != nil {

@@ -215,12 +215,26 @@ struct ScanView: View {
             .width(min: 110, ideal: 210)
 
             TableColumn("项目 / 服务") { container in
-                Text(container.projectServiceText)
-                    .font(.callout)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(container.projectServiceText)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    HStack(spacing: 4) {
+                        Text(container.sourceText)
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.10), in: Capsule())
+                        Text(container.strategyText)
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.blue.opacity(0.10), in: Capsule())
+                    }
+                }
             }
-            .width(min: 80, ideal: 140)
+            .width(min: 90, ideal: 160)
 
             TableColumn("端口") { container in
                 PortsText(ports: container.ports ?? [], maxLines: 3)
@@ -351,6 +365,8 @@ struct ScanView: View {
                 LabeledValue(label: "启动于", value: RelativeTime.text(container.startedAt, placeholder: "—"))
                 LabeledValue(label: "重启策略", value: container.restartPolicy ?? "—")
                 LabeledValue(label: "网络模式", value: container.networkMode ?? "—")
+                LabeledValue(label: "创建来源", value: container.sourceText)
+                LabeledValue(label: "接入方式", value: container.strategyText)
                 LabeledValue(label: "Compose", value: container.projectServiceText)
                 if let workingDir = container.composeWorkingDir, !workingDir.isEmpty {
                     LabeledValue(label: "工作目录", value: workingDir, monospaced: true)

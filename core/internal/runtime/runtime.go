@@ -90,9 +90,12 @@ type Runtime interface {
 	Events(ctx context.Context) (io.ReadCloser, error)
 }
 
-// EndpointConfig is the per-network endpoint payload for ConnectNetwork.
+// EndpointConfig is the per-network endpoint payload. Aliases is the widely
+// compatible field; DNSNames is the modern Engine API field and is set as
+// well because Docker 29.x ignores Aliases on raw API creates.
 type EndpointConfig struct {
 	Aliases    []string            `json:"Aliases,omitempty"`
+	DNSNames   []string            `json:"DNSNames,omitempty"`
 	IPAMConfig *dockerx.IPAMConfig `json:"IPAMConfig,omitempty"`
 }
 

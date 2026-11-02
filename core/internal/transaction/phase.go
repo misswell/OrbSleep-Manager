@@ -65,7 +65,8 @@ func CanTransition(a, b Phase) bool {
 	case PhaseApplying:
 		return b == PhaseProxyUpdated || b == PhaseComposeWrite || b == PhaseVerifying || b == PhaseSnapshotPersisted
 	case PhaseProxyUpdated:
-		return b == PhaseComposeWrite || b == PhaseVerifying || b == PhaseComposeUpdated || b == PhaseSnapshotPersisted
+		return b == PhaseComposeWrite || b == PhaseVerifying || b == PhaseComposeUpdated ||
+			b == PhaseSnapshotPersisted || b == PhaseOriginalRenamed
 	case PhaseSnapshotPersisted:
 		return b == PhaseOriginalRenamed || b == PhaseContainerRecreated || b == PhaseVerifying || b == PhaseRollbackPending
 	case PhaseOriginalRenamed:

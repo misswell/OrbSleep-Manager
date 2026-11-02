@@ -40,10 +40,16 @@ type MountPoint struct {
 
 // EndpointSettings is a container network endpoint.
 type EndpointSettings struct {
-	IPAddress  string      `json:"IPAddress"`
-	Gateway    string      `json:"Gateway"`
-	NetworkID  string      `json:"NetworkID"`
-	Aliases    []string    `json:"Aliases"`
+	IPAddress string   `json:"IPAddress"`
+	Gateway   string   `json:"Gateway"`
+	NetworkID string   `json:"NetworkID"`
+	Aliases   []string `json:"Aliases"`
+	// DNSNames is the modern (Engine API ≥1.45) alias representation; it
+	// includes the container's own name and short id, which callers must
+	// filter out. Some engines (Docker 29.x) stop populating Aliases for
+	// containers created through the raw API, so recreate mapping must read
+	// this field too.
+	DNSNames   []string    `json:"DNSNames"`
 	IPAMConfig *IPAMConfig `json:"IPAMConfig,omitempty"`
 	DriverOpts []string    `json:"DriverOpts,omitempty"`
 	MacAddress string      `json:"MacAddress,omitempty"`

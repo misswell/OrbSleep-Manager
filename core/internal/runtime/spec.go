@@ -123,14 +123,21 @@ func (s *ContainerSpec) Label(key string) string {
 
 // CreateRequestBody renders the Engine API POST /containers/create body.
 // The spec's Config fields flatten to the top level, matching the API shape.
+// NetworkingConfig requires its EndpointsConfig wrapper — passing the bare
+// map makes the engine silently drop aliases and static IPs.
 func CreateRequestBody(spec *ContainerSpec) any {
-	return struct {
+	body := struct {
 		ConfigSpec
-		HostConfig       *HostConfigSpec           `json:"HostConfig"`
-		NetworkingConfig map[string]EndpointConfig `json:"NetworkingConfig,omitempty"`
+		HostConfig       *HostConfigSpec `json:"HostConfig"`
+		NetworkingConfig struct {
+			EndpointsConfig map[string]EndpointConfig `json:"EndpointsConfig,omitempty"`
+		} `json:"NetworkingConfig,omitempty"`
 	}{
-		ConfigSpec:       spec.Config,
-		HostConfig:       &spec.HostConfig,
-		NetworkingConfig: spec.Networks,
+		ConfigSpec: spec.Config,
+		HostConfig: &spec.HostConfig,
 	}
+	if len(spec.Networks) > 0 {
+		body.NetworkingConfig.EndpointsConfig = spec.Networks
+	}
+	return body
 }

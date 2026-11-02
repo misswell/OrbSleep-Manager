@@ -6,6 +6,7 @@ import Observation
 
 enum AppSection: String, CaseIterable, Identifiable, Hashable {
     case overview
+    case environments
     case scan
     case services
     case operations
@@ -19,6 +20,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
     var title: String {
         switch self {
         case .overview: return "概览"
+        case .environments: return "容器环境"
         case .scan: return "扫描容器"
         case .services: return "托管服务"
         case .operations: return "操作记录"
@@ -32,6 +34,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
     var systemImage: String {
         switch self {
         case .overview: return "rectangle.grid.2x2"
+        case .environments: return "square.stack.3d.up"
         case .scan: return "magnifyingglass"
         case .services: return "shippingbox"
         case .operations: return "list.bullet.rectangle"
@@ -230,6 +233,9 @@ final class AppState {
     var legacyInstallation: LegacyInstallation = .none
     var dockerContexts: [DockerContextEntry] = []
     var selectedDockerSocket = ""
+    // 多容器环境：注册 + 发现合并视图
+    var environments: [OrbEnvironment] = []
+    var primaryEnvironmentId = ""
     var backups: [BackupEntry] = []
     var recoveryTransactions: [RecoveryTransaction] = []
     var isMigrating = false
@@ -1657,6 +1663,59 @@ final class AppState {
             }
         } catch {
             if !daemonReachable { health = nil } else { handle(error) }
+        }
+    }
+
+    // MARK: 容器环境
+
+    func loadEnvironments() async {
+        guard daemonReachable else { return }
+        do {
+            let value = try await client.call("environments.list", as: EnvironmentListResult.self)
+            environments = value.list
+            primaryEnvironmentId = value.primaryId ?? ""
+            markReachable()
+        } catch {
+            handle(error)
+        }
+    }
+
+    func addEnvironment(endpoint: String, name: String) async {
+        guard daemonReachable else { return }
+        do {
+            let value = try await client.call(
+                "environment.add",
+                params: ["endpoint": .string(endpoint), "name": .string(name)],
+                as: EnvironmentListResult.self
+            )
+            environments = value.list
+            primaryEnvironmentId = value.primaryId ?? ""
+            await refreshStatus(silent: true)
+            showNotice("已添加容器环境")
+        } catch {
+            handle(error)
+        }
+    }
+
+    func environmentAction(_ id: String, _ action: String) async {
+        guard daemonReachable else { return }
+        do {
+            let value = try await client.call(
+                "environment.action",
+                params: ["id": .string(id), "action": .string(action)],
+                as: EnvironmentListResult.self
+            )
+            environments = value.list
+            primaryEnvironmentId = value.primaryId ?? ""
+            await refreshStatus(silent: true)
+            switch action {
+            case "enable": showNotice("环境已启用（已分配独立代理端口段）")
+            case "disable": showNotice("环境已停用")
+            case "remove": showNotice("环境已删除")
+            default: break
+            }
+        } catch {
+            handle(error)
         }
     }
 

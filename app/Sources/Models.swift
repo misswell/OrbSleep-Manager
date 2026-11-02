@@ -423,9 +423,31 @@ struct Container: Codable, Sendable, Hashable, Identifiable {
     var ports: [PortBinding]?
     var managedServiceId: String?
     var classification: Classification?
+    var environmentId: String?
+    var strategy: String?
+    var source: String?
 
     var displayName: String {
         name.isEmpty ? String(id.prefix(12)) : name
+    }
+
+    /// 接入方式展示：compose（Compose 定点改写）或 docrun（快照重建）。
+    var strategyText: String {
+        switch strategy ?? "" {
+        case "compose": return "Compose"
+        case "docrun": return "快照重建"
+        default: return "—"
+        }
+    }
+
+    /// 创建来源展示。
+    var sourceText: String {
+        switch source ?? "" {
+        case "compose": return "Compose"
+        case "docker-run": return "docker run"
+        case "api": return "API"
+        default: return "未知"
+        }
     }
 
     var verdict: Verdict {
@@ -489,6 +511,10 @@ struct PlanItem: Codable, Sendable, Hashable, Identifiable {
     var risks: [Reason]?
     var diff: String?
     var steps: [String]?
+    var strategy: String?
+    var environmentId: String?
+
+    var isDocrun: Bool { (strategy ?? "") == "docrun" }
 
     var id: String {
         if let containerId, !containerId.isEmpty { return containerId }
@@ -573,8 +599,19 @@ struct Service: Codable, Sendable, Hashable, Identifiable {
     var createdAt: String?
     var lastError: String?
     var excludedFromSleep: Bool?
+    var dockerSocket: String?
+    var environmentId: String?
+    var strategy: String?
 
     var statusValue: ServiceStatus { status ?? .unknown }
+
+    var strategyText: String {
+        switch strategy ?? "" {
+        case "compose": return "Compose"
+        case "docrun": return "快照重建"
+        default: return "Compose"
+        }
+    }
 
     var displayName: String {
         if let containerName, !containerName.isEmpty { return containerName }
@@ -643,6 +680,115 @@ struct DaemonStatus: Codable, Sendable, Hashable {
     var lastScanAt: String?
     var lastError: LastErrorInfo?
     var launchAgentInstalled: Bool?
+    var environments: [EnvSummary]?
+}
+
+// MARK: - 容器环境
+
+struct EnvCaps: Codable, Sendable, Hashable {
+    var listContainers: Bool?
+    var inspectContainer: Bool?
+    var startStop: Bool?
+    var recreate: Bool?
+    var events: Bool?
+    var portTakeover: Bool?
+    var composeSupport: Bool?
+}
+
+struct OrbEnvironment: Codable, Sendable, Hashable, Identifiable {
+    var id: String
+    var name: String?
+    var kind: String?
+    var endpoint: String?
+    var enabled: Bool?
+    var status: String?
+    var engineVersion: String?
+    var apiVersion: String?
+    var remote: Bool?
+    var capabilities: EnvCaps?
+    var proxyPortStart: Int?
+    var proxyPortEnd: Int?
+    var adminPort: Int?
+    var webPort: Int?
+    var proxyStatus: String?
+    var lastError: String?
+    var addedAt: String?
+    var lastSeenAt: String?
+    var discoveredOnly: Bool?
+
+    var displayName: String {
+        let n = (name ?? "").trimmingCharacters(in: .whitespaces)
+        return n.isEmpty ? id : n
+    }
+
+    var kindText: String {
+        switch kind ?? "" {
+        case "orbstack": return "OrbStack"
+        case "docker-desktop": return "Docker Desktop"
+        case "docker-engine": return "Docker Engine"
+        case "colima": return "Colima"
+        case "rancher-desktop": return "Rancher Desktop"
+        case "finch": return "Finch"
+        case "lima": return "Lima"
+        case "podman": return "Podman"
+        case "remote": return "远程 Docker"
+        case "custom": return "自定义"
+        default: return kind ?? "未知"
+        }
+    }
+
+    var statusText: String {
+        switch status ?? "" {
+        case "online": return "在线"
+        case "offline": return "离线"
+        case "error": return "错误"
+        default: return "未知"
+        }
+    }
+
+    var isEnabled: Bool { enabled == true }
+    var isDiscoveredOnly: Bool { discoveredOnly == true }
+    var isRemote: Bool { remote == true }
+
+    /// 接入能力综述（给环境页一行展示）。
+    var capabilityText: String {
+        guard let caps = capabilities else {
+            return isRemote ? "仅展示（端口接管不支持）" : "待检测"
+        }
+        var parts: [String] = []
+        if caps.listContainers == true { parts.append("扫描") }
+        if caps.startStop == true { parts.append("启停") }
+        if caps.recreate == true { parts.append("重建") }
+        if caps.portTakeover == true { parts.append("端口接管") } else { parts.append("端口接管不支持") }
+        if caps.composeSupport == true { parts.append("Compose") }
+        return parts.joined(separator: " / ")
+    }
+}
+
+struct EnvSummary: Codable, Sendable, Hashable, Identifiable {
+    var id: String
+    var name: String?
+    var kind: String?
+    var endpoint: String?
+    var enabled: Bool?
+    var status: String?
+    var primary: Bool?
+    var proxy: ProxyStatus?
+    var remote: Bool?
+
+    var displayName: String {
+        let n = (name ?? "").trimmingCharacters(in: .whitespaces)
+        return n.isEmpty ? id : n
+    }
+    var isEnabled: Bool { enabled == true }
+    var isPrimary: Bool { primary == true }
+}
+
+struct EnvironmentListResult: Codable, Sendable, Hashable {
+    var environments: [OrbEnvironment]?
+    var primaryId: String?
+
+    var list: [OrbEnvironment] { environments ?? [] }
 }
 
 // MARK: - 设置
