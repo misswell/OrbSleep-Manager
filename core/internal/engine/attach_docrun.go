@@ -53,13 +53,12 @@ func (a docrunEngine) ConnectNetwork(ctx context.Context, network, containerID s
 // only after end-to-end verification.
 func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int, snap *planSnapshot, admin *proxy.AdminClient, txnID string) (*appliedItem, error) {
 	s := e.settings.Get()
-	c, err := e.clientForEnv(ctx, snap.envID)
+	eng, err := e.runtimeForEnv(ctx, snap.envID)
 	if err != nil {
 		return nil, &attachError{Err: err}
 	}
-	eng := docrunEngine{c: c}
 
-	ins, err := c.InspectContainer(ctx, snap.containerID)
+	ins, err := eng.InspectContainer(ctx, snap.containerID)
 	if err != nil {
 		return nil, &attachError{Err: fmt.Errorf("目标容器在接入前已消失: %w", err)}
 	}
@@ -185,7 +184,7 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 			StartTimeoutSecs: s.StartTimeoutSecs,
 			LastActiveAt:     now,
 			CreatedAt:        now,
-			DockerSocket:     c.Socket(),
+			DockerSocket:     strings.TrimPrefix(eng.Info().Endpoint, "unix://"),
 			EnvironmentID:    snap.envID,
 			Strategy:         "docrun",
 		})
@@ -275,7 +274,7 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 	logger.add("info", "容器已按快照重建，原端口已释放")
 
 	// 3. Verify the replacement really stopped publishing the takeover ports.
-	freshIns, ferr := c.InspectContainer(ctx, createdID)
+	freshIns, ferr := eng.InspectContainer(ctx, createdID)
 	if ferr != nil {
 		return fail(fmt.Errorf("重建容器不可读: %w", ferr))
 	}
@@ -378,6 +377,8 @@ func (e *Engine) rollbackDocrunApplied(ctx context.Context, logger *opLogger, ai
 }
 
 // docrunEngineForService resolves the strategy engine for a service's env.
+// The unified runtime.Runtime satisfies docrun.Engine, so the strategy layer
+// never sees a Docker-specific type.
 func (e *Engine) docrunEngineForService(serviceID string) (docrun.Engine, error) {
 	svc, ok, err := e.store.GetService(serviceID)
 	if err != nil {
@@ -388,9 +389,5 @@ func (e *Engine) docrunEngineForService(serviceID string) (docrun.Engine, error)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c, err := e.clientForEnv(ctx, svc.EnvironmentID)
-	if err != nil {
-		return nil, err
-	}
-	return docrunEngine{c: c}, nil
+	return e.runtimeForEnv(ctx, svc.EnvironmentID)
 }

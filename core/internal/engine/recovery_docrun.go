@@ -216,13 +216,10 @@ func (e *Engine) recoverDocrunRebuildManaged(ctx context.Context, eng docrun.Eng
 	return nil
 }
 
-// docrunEngineForServiceByID resolves a strategy engine for an env id.
+// docrunEngineForServiceByID resolves a strategy engine for an env id. The
+// unified runtime.Runtime satisfies docrun.Engine.
 func (e *Engine) docrunEngineForServiceByID(envID string) (docrun.Engine, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c, err := e.clientForEnv(ctx, envID)
-	if err != nil {
-		return nil, err
-	}
-	return docrunEngine{c: c}, nil
+	return e.runtimeForEnv(ctx, envID)
 }

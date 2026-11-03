@@ -144,12 +144,12 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 			block("proxy_unavailable", fmt.Sprintf("环境 %s 的 Lazy TCP Proxy 未运行或管理接口不可达；请先安装并启动代理", envName))
 			return false
 		}
-		envClient, cerr := e.clientForEnv(ctx, envID)
+		envRT, cerr := e.runtimeForEnv(ctx, envID)
 		if cerr != nil {
 			block("environment_unreachable", fmt.Sprintf("环境 %s 不可达: %v", envName, cerr))
 			return false
 		}
-		proxyIns, ierr := envClient.InspectContainer(ctx, e.proxySpecForEnv(envID).ContainerName)
+		proxyIns, ierr := envRT.InspectContainer(ctx, e.proxySpecForEnv(envID).ContainerName)
 		switch {
 		case ierr != nil:
 			// The admin endpoint answers on 127.0.0.1 regardless of which
@@ -217,7 +217,7 @@ func (e *Engine) CreatePlan(ctx context.Context, ids []string, allowLan bool) (m
 			if candID == "" {
 				continue
 			}
-			cand, cerr := e.clientForEnv(ctx, candID)
+			cand, cerr := e.runtimeForEnv(ctx, candID)
 			if cerr != nil {
 				continue
 			}

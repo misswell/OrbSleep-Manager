@@ -92,7 +92,7 @@ func (e *Engine) ServiceAction(ctx context.Context, id, action string, params ma
 }
 
 func (e *Engine) containerAction(ctx context.Context, svc model.Service, action string) error {
-	c, err := e.clientForEnv(ctx, svc.EnvironmentID)
+	rt, err := e.runtimeForEnv(ctx, svc.EnvironmentID)
 	if err != nil {
 		return err
 	}
@@ -100,7 +100,7 @@ func (e *Engine) containerAction(ctx context.Context, svc model.Service, action 
 	if target == "" {
 		target = svc.ContainerName
 	}
-	ins, err := c.InspectContainer(ctx, target)
+	ins, err := rt.InspectContainer(ctx, target)
 	if err != nil {
 		return fmt.Errorf("容器不可用: %w", err)
 	}
@@ -108,12 +108,12 @@ func (e *Engine) containerAction(ctx context.Context, svc model.Service, action 
 		if ins.State.Running {
 			return nil
 		}
-		return c.Post(ctx, "/containers/"+ins.ID+"/start", nil, nil)
+		return rt.StartContainer(ctx, ins.ID)
 	}
 	if !ins.State.Running {
 		return nil
 	}
-	return c.Post(ctx, "/containers/"+ins.ID+"/stop?t=10", nil, nil)
+	return rt.StopContainer(ctx, ins.ID, 10)
 }
 
 func (e *Engine) updatePolicy(id string, params map[string]any) (map[string]any, error) {

@@ -218,3 +218,104 @@ func TestLoadSnapshotRequiresServiceID(t *testing.T) {
 		t.Fatalf("LoadSnapshot must refuse snapshots without serviceId, got %v", err)
 	}
 }
+
+// TestRestoreOriginalSocketDownKeepsState pins the triage rule for a dead
+// socket: a non-404 Inspect failure aborts with the managed wiring intact and
+// performs NO mutation (no stop, no rename, no create, no remove).
+func TestRestoreOriginalSocketDownKeepsState(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := loadGolden(t)
+	managed.ID = "managed-1"
+	managed.Config.Labels[LabelServiceID] = "svc-1"
+	delete(managed.HostConfig.PortBindings, "80/tcp")
+	eng := &fakeEngine{
+		inspections: map[string]*dockerx.ContainerInspect{"webapp": managed},
+		failNext:    map[string]error{"inspect": &dockerx.APIError{Status: 503, Body: "dial unix /var/run/docker.sock: connect: connection refused"}},
+	}
+	snap := &ManagedSnapshot{
+		ServiceID:    "svc-1",
+		OriginalName: prep.OriginalName,
+		OriginalSpec: prep.OriginalSpec,
+		ManagedSpec:  prep.ManagedSpec,
+		Secondary:    prep.Secondary,
+	}
+	_, _, err = RestoreOriginal(context.Background(), eng, snap, "managed-1")
+	if err == nil || !strings.Contains(err.Error(), "无法读取托管容器状态") {
+		t.Fatalf("socket-down must abort as unreadable state, got %v", err)
+	}
+	if len(eng.created) != 0 || len(eng.removed) != 0 || len(eng.renames) != 0 || len(eng.stopped) != 0 {
+		t.Fatalf("socket-down must not mutate anything: created=%v removed=%v renames=%v stopped=%v",
+			eng.created, eng.removed, eng.renames, eng.stopped)
+	}
+}
+
+// TestCreateAndStartSurfacesCleanupFailure pins the P2-04 rule: when the
+// started container cannot be cleaned up, the error carries the orphan id.
+func TestCreateAndStartSurfacesCleanupFailure(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &fakeEngine{
+		inspections: map[string]*dockerx.ContainerInspect{},
+		failNext: map[string]error{
+			"start":  &dockerx.APIError{Status: 500, Body: "start refused"},
+			"remove": &dockerx.APIError{Status: 500, Body: "remove refused"},
+		},
+	}
+	_, err = CreateAndStart(context.Background(), eng, prep.ManagedSpec)
+	if err == nil || !strings.Contains(err.Error(), "清理失败") || !strings.Contains(err.Error(), "孤儿容器") {
+		t.Fatalf("cleanup failure must surface with the orphan id, got %v", err)
+	}
+}
+
+// TestRestoreTwiceIsSafe pins recovery idempotency at the strategy layer:
+// after a successful restore the original container is the user's own
+// (label-less) container again — a second restore attempt must refuse it
+// instead of stopping/renaming/removing it.
+func TestRestoreTwiceIsSafe(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := loadGolden(t)
+	managed.ID = "managed-1"
+	managed.Config.Labels[LabelServiceID] = "svc-1"
+	managed.Config.Labels[LabelManaged] = "true"
+	delete(managed.HostConfig.PortBindings, "80/tcp")
+	eng := &fakeEngine{inspections: map[string]*dockerx.ContainerInspect{
+		"webapp":        managed,
+		"managed-1":     managed,
+		prep.OriginalID: ins,
+	}}
+	snap := &ManagedSnapshot{
+		ServiceID:    "svc-1",
+		OriginalName: prep.OriginalName,
+		OriginalSpec: prep.OriginalSpec,
+		ManagedSpec:  prep.ManagedSpec,
+		Secondary:    prep.Secondary,
+	}
+	if _, _, err := RestoreOriginal(context.Background(), eng, snap, "managed-1"); err != nil {
+		t.Fatalf("first restore failed: %v", err)
+	}
+	// After the restore, "webapp" is the ORIGINAL spec container (no
+	// OrbSleep labels). Simulate that state for the second call.
+	restored := loadGolden(t)
+	restored.ID = "restored-1"
+	eng.inspections["webapp"] = restored
+	eng.inspections["restored-1"] = restored
+	before := len(eng.removed) + len(eng.renames) + len(eng.stopped)
+	if _, _, err := RestoreOriginal(context.Background(), eng, snap, ""); err == nil {
+		t.Fatal("second restore must refuse a label-less container")
+	}
+	after := len(eng.removed) + len(eng.renames) + len(eng.stopped)
+	if after != before {
+		t.Fatalf("refused restore must not mutate anything (before=%d after=%d)", before, after)
+	}
+}

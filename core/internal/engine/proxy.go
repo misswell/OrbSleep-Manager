@@ -39,12 +39,12 @@ func (e *Engine) proxyStatusForEnv(ctx context.Context, envID string) model.Prox
 		ContainerName:  spec.ContainerName,
 		PublishedRange: model.Range{Start: spec.Start, End: spec.End},
 	}
-	c, err := e.clientForEnv(ctx, envID)
+	rt, err := e.runtimeForEnv(ctx, envID)
 	if err != nil {
 		ps.Error = err.Error()
 		return ps
 	}
-	ins, err := c.InspectContainer(ctx, spec.ContainerName)
+	ins, err := rt.InspectContainer(ctx, spec.ContainerName)
 	if err != nil {
 		if !dockerx.IsErrNotFound(err) {
 			ps.Error = err.Error()
@@ -163,11 +163,11 @@ func (e *Engine) proxyPublishedPorts(ctx context.Context) (map[int]PublishedPort
 }
 
 func (e *Engine) proxyPublishedPortsForEnv(ctx context.Context, envID string) (map[int]PublishedPort, error) {
-	c, err := e.clientForEnv(ctx, envID)
+	rt, err := e.runtimeForEnv(ctx, envID)
 	if err != nil {
 		return nil, err
 	}
-	ins, err := c.InspectContainer(ctx, e.proxySpecForEnv(envID).ContainerName)
+	ins, err := rt.InspectContainer(ctx, e.proxySpecForEnv(envID).ContainerName)
 	if err != nil {
 		return nil, err
 	}

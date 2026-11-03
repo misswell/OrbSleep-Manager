@@ -14,6 +14,7 @@ import (
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
 	"orbsleep/internal/runtime"
+	"orbsleep/internal/runtime/dockerapi"
 )
 
 // currentEnvID returns the environment id the engine's primary Docker client
@@ -127,6 +128,39 @@ func (e *Engine) clientForEnv(ctx context.Context, envID string) (*dockerx.Clien
 	e.envClients[envID] = c
 	e.mu.Unlock()
 	return c, nil
+}
+
+// runtimeForEnv returns the env-scoped engine through the unified Runtime
+// interface. This is the accessor new code must use: the docrun strategy,
+// scanning and reconcile go through it, so a future non-Docker adapter
+// (podman-native, containerd) plugs in behind the same interface without
+// touching the business engine. The primary environment wraps its
+// singleflight-managed client; additional environments wrap their cached
+// clients.
+func (e *Engine) runtimeForEnv(ctx context.Context, envID string) (runtime.Runtime, error) {
+	c, err := e.clientForEnv(ctx, envID)
+	if err != nil {
+		return nil, err
+	}
+	name, kind := e.envNameKind(envID, c)
+	return dockerapi.NewWithClient(c, name, kind), nil
+}
+
+// envNameKind resolves the display name and engine kind for the adapter info.
+func (e *Engine) envNameKind(envID string, c *dockerx.Client) (string, runtime.Kind) {
+	if envID == "" || envID == e.currentEnvID() {
+		socket := c.Socket()
+		if s := strings.TrimPrefix(strings.TrimSpace(e.settings.Get().DockerSocket), "unix://"); s != "" {
+			socket = s
+		}
+		kind := runtime.KindFromPath(socket)
+		return runtime.DisplayNameForKind(kind), kind
+	}
+	if env, ok, _ := e.store.GetEnvironment(envID); ok {
+		return env.Name, runtime.Kind(env.Kind)
+	}
+	kind := runtime.KindFromPath(c.Socket())
+	return runtime.DisplayNameForKind(kind), kind
 }
 
 // dropEnvClient forgets a cached secondary client (disable/remove/offline).

@@ -144,7 +144,7 @@ func (e *Engine) reconcile() {
 			}
 			continue
 		}
-		c, err := e.clientForEnv(ctx, envID)
+		rt, err := e.runtimeForEnv(ctx, envID)
 		if err != nil {
 			e.logger.Printf("warn", "reconcile 跳过环境 %s：%v", envID, err)
 			// Keep the listeners: an offline engine (e.g. a stopped Colima
@@ -160,15 +160,15 @@ func (e *Engine) reconcile() {
 			continue
 		}
 		spec := e.proxySpecForEnv(envID)
-		e.reconcileEnvGroup(ctx, c, spec, group, s, activity, keep)
+		e.reconcileEnvGroup(ctx, rt, spec, group, s, activity, keep)
 	}
 	e.gw.Prune(keep)
 }
 
 // reconcileEnvGroup reconciles one environment's services against that env's
 // own Docker client and proxy container.
-func (e *Engine) reconcileEnvGroup(ctx context.Context, c *dockerx.Client, spec proxyEnvSpec, group *envGroup, s model.Settings, activity map[string]time.Time, keep map[string]bool) {
-	summaries, lerr := c.ListContainers(ctx)
+func (e *Engine) reconcileEnvGroup(ctx context.Context, rt runtime.Runtime, spec proxyEnvSpec, group *envGroup, s model.Settings, activity map[string]time.Time, keep map[string]bool) {
+	summaries, lerr := rt.ListContainers(ctx)
 	if lerr != nil {
 		e.logger.Printf("warn", "reconcile 列出容器失败（环境 %s）: %v", spec.EnvID, lerr)
 		for _, svc := range group.services {
@@ -190,7 +190,7 @@ func (e *Engine) reconcileEnvGroup(ctx context.Context, c *dockerx.Client, spec 
 		}
 	}
 
-	proxyIns, proxyErr := c.InspectContainer(ctx, spec.ContainerName)
+	proxyIns, proxyErr := rt.InspectContainer(ctx, spec.ContainerName)
 	proxyRunning := proxyErr == nil && proxyIns.State.Running
 	proxyIP := ""
 	if proxyErr == nil {
@@ -364,13 +364,13 @@ func (e *Engine) watchEnvEvents(envID string) {
 		}
 	}()
 	defer cancel()
-	c, err := e.clientForEnv(ctx, envID)
+	rt, err := e.runtimeForEnv(ctx, envID)
 	if err != nil {
 		<-done
 		sleepOrStop(e.stopCh, 5*time.Second)
 		return
 	}
-	body, err := c.Events(ctx)
+	body, err := rt.Events(ctx)
 	if err != nil {
 		<-done
 		sleepOrStop(e.stopCh, 3*time.Second)

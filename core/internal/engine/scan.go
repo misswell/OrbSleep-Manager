@@ -36,12 +36,12 @@ func (e *Engine) Scan(ctx context.Context, envID string) (model.ScanResult, erro
 // its own per-scan limiter, and without a global cap N environments would
 // yield N×8 concurrent API calls against possibly resource-constrained VMs.
 func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem chan struct{}) (model.ScanResult, error) {
-	c, err := e.clientForEnv(ctx, env.ID)
+	rt, err := e.runtimeForEnv(ctx, env.ID)
 	if err != nil {
 		e.setLastError("扫描失败: " + err.Error())
 		return model.ScanResult{}, err
 	}
-	summaries, err := c.ListContainers(ctx)
+	summaries, err := rt.ListContainers(ctx)
 	if err != nil {
 		if env.ID == e.currentEnvID() {
 			e.invalidateDocker()
@@ -105,7 +105,7 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			ins, err := c.InspectContainer(ctx, id)
+			ins, err := rt.InspectContainer(ctx, id)
 			if err != nil {
 				if dockerx.IsErrNotFound(err) {
 					return
@@ -160,9 +160,14 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 	if containers == nil {
 		containers = []model.Container{}
 	}
+	info := rt.Info()
 	res := model.ScanResult{
-		ScannedAt:     time.Now().UTC().Format(time.RFC3339),
-		Context:       c.Context(),
+		ScannedAt: time.Now().UTC().Format(time.RFC3339),
+		Context: model.ContextInfo{
+			Name:     info.Name,
+			Endpoint: info.Endpoint,
+			Kind:     string(info.Kind),
+		},
 		Containers:    containers,
 		Counts:        counts,
 		EnvironmentID: env.ID,
@@ -285,8 +290,8 @@ func (e *Engine) CachedScan() (model.ScanResult, bool) {
 // enabled ones.
 func (e *Engine) Inspect(ctx context.Context, id string) (model.Container, map[string]any, error) {
 	var lastErr error
-	tryClient := func(c *dockerx.Client, envID string) (model.Container, map[string]any, bool, error) {
-		ins, err := c.InspectContainer(ctx, id)
+	tryRuntime := func(rt runtime.Runtime, envID string) (model.Container, map[string]any, bool, error) {
+		ins, err := rt.InspectContainer(ctx, id)
 		if err != nil {
 			if dockerx.IsErrNotFound(err) {
 				return model.Container{}, nil, false, nil
@@ -296,9 +301,9 @@ func (e *Engine) Inspect(ctx context.Context, id string) (model.Container, map[s
 		cont, safe := e.buildInspectView(ins, envID)
 		return cont, safe, true, nil
 	}
-	primary, perr := e.dockerClient(ctx)
+	primaryRT, perr := e.runtimeForEnv(ctx, e.currentEnvID())
 	if perr == nil {
-		if cont, safe, ok, err := tryClient(primary, e.currentEnvID()); ok || (err != nil) {
+		if cont, safe, ok, err := tryRuntime(primaryRT, e.currentEnvID()); ok || (err != nil) {
 			return cont, safe, err
 		}
 	} else {
@@ -309,11 +314,11 @@ func (e *Engine) Inspect(ctx context.Context, id string) (model.Container, map[s
 		if !env.Enabled || env.ID == e.currentEnvID() {
 			continue
 		}
-		c, cerr := e.clientForEnv(ctx, env.ID)
+		rt, cerr := e.runtimeForEnv(ctx, env.ID)
 		if cerr != nil {
 			continue
 		}
-		if cont, safe, ok, err := tryClient(c, env.ID); ok || (err != nil) {
+		if cont, safe, ok, err := tryRuntime(rt, env.ID); ok || (err != nil) {
 			return cont, safe, err
 		}
 	}

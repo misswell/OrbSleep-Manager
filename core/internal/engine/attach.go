@@ -677,7 +677,7 @@ func (e *Engine) prejoinProxyNetworks(ctx context.Context, envID string, ins *do
 		return
 	}
 	spec := e.proxySpecForEnv(envID)
-	c, err := e.clientForEnv(ctx, envID)
+	rt, err := e.runtimeForEnv(ctx, envID)
 	if err != nil {
 		return
 	}
@@ -686,7 +686,7 @@ func (e *Engine) prejoinProxyNetworks(ctx context.Context, envID string, ins *do
 			continue
 		}
 		jctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := c.ConnectNetwork(jctx, name, spec.ContainerName, nil)
+		err := rt.ConnectNetwork(jctx, name, spec.ContainerName, nil)
 		cancel()
 		if err != nil && !dockerx.IsErrNotFound(err) {
 			// "already exists" style errors mean the join is already in place.
@@ -1003,11 +1003,11 @@ func (e *Engine) gatewayRouteForEnv(ctx context.Context, envID, svcID, name stri
 	ip := ""
 	if s.ProxyDialMode == "container_ip" {
 		spec := e.proxySpecForEnv(envID)
-		c, err := e.clientForEnv(ctx, envID)
+		rt, err := e.runtimeForEnv(ctx, envID)
 		if err != nil {
 			return gateway.Route{}, err
 		}
-		ins, err := c.InspectContainer(ctx, spec.ContainerName)
+		ins, err := rt.InspectContainer(ctx, spec.ContainerName)
 		if err != nil {
 			return gateway.Route{}, fmt.Errorf("container_ip 模式无法解析代理容器 IP: %w", err)
 		}
