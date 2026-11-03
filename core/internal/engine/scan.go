@@ -55,7 +55,13 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 		ExcludeImagePatterns: e.settings.Get().ExcludeImagePatterns,
 		ProxyContainerName:   e.proxySpecForEnv(env.ID).ContainerName,
 	}
-	services, _ := e.store.ListServices()
+	// The managed index decides whether an already-managed container shows up
+	// as managed or as an ordinary attachable candidate. An unknown board is
+	// not a clean board: refuse to scan rather than mislead the operator.
+	services, err := e.store.ListServices()
+	if err != nil {
+		return model.ScanResult{}, fmt.Errorf("读取托管服务失败，无法安全扫描: %w", err)
+	}
 	primary := e.currentEnvID()
 	// Both matching maps are scoped to THIS environment: scanOne only ever
 	// inspects containers of one engine, so a service pinned elsewhere can
@@ -221,16 +227,14 @@ func (e *Engine) scanAll(ctx context.Context) (model.ScanResult, error) {
 				merged.Context = res.Context
 			}
 			for k, v := range res.Counts {
-				if k == "managed" {
-					continue
-				}
 				merged.Counts[k] += v
 			}
 		}(env)
 	}
 	wg.Wait()
-	services, _ := e.store.ListServices()
-	merged.Counts["managed"] = len(services)
+	// managed counts were summed per scanned environment in the merge loop
+	// (the "managed" key is no longer skipped there); a global len(services)
+	// would count services of disabled environments that were never scanned.
 	// Keep a deterministic order: by environment then name.
 	sort.Slice(merged.Containers, func(i, j int) bool {
 		a, b := merged.Containers[i], merged.Containers[j]

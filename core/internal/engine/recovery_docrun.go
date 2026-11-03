@@ -3,17 +3,18 @@ package engine
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"orbsleep/internal/deployment/docrun"
 	"orbsleep/internal/dockerx"
 )
 
-// isContainerNotFound distinguishes a definitive 404 from any other Docker
-// API failure: recovery may only take destructive branches on 404.
+// isContainerNotFound accepts ONLY a structured 404 from the engine: any
+// other failure (timeout, 5xx, socket down — even one whose body mentions
+// "no such") must keep the transaction alive instead of entering a
+// destructive branch.
 func isContainerNotFound(err error) bool {
-	return dockerx.IsErrNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "no such")
+	return dockerx.IsErrNotFound(err)
 }
 
 // recoverDocrunAttachItem rolls back one docrun attach item after a crash.

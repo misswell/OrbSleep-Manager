@@ -201,11 +201,19 @@ func (e *Engine) ListEnvironments(ctx context.Context) model.EnvironmentList {
 				env.Status = "online"
 				env.EngineVersion, env.APIVersion = res.EngineVersion, res.APIVersion
 				env.LastError = ""
-				_ = e.store.SetEnvironmentStatus(env.ID, "online", res.EngineVersion, res.APIVersion, "")
 			} else {
 				env.Status = "offline"
 				env.LastError = res.Error
-				_ = e.store.SetEnvironmentStatus(env.ID, "offline", "", "", res.Error)
+			}
+			// A failed persistence must not be silently equated with the probe
+			// result: the row keeps its previous status and the mismatch is
+			// logged for the operator.
+			status := env.Status
+			version, api := env.EngineVersion, env.APIVersion
+			lastErr := env.LastError
+			if err := e.store.SetEnvironmentStatus(env.ID, status, version, api, lastErr); err != nil {
+				env.LastError = "状态持久化失败: " + err.Error()
+				e.logger.Printf("warn", "环境 %s 状态持久化失败: %v", env.Name, err)
 			}
 			if env.Kind == "" {
 				env.Kind = string(res.Kind)

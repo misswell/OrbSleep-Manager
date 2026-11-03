@@ -42,6 +42,12 @@ func LoadSnapshot(raw []byte) (*ManagedSnapshot, error) {
 	if snap.OriginalSpec == nil || snap.ManagedSpec == nil || snap.OriginalName == "" {
 		return nil, errors.New("容器快照不完整（缺少规格或名称）")
 	}
+	// Identity is mandatory: a snapshot that cannot prove WHICH service it
+	// belongs to must never enter an automatic destructive flow. Such
+	// snapshots need a manual migration, not a guess.
+	if strings.TrimSpace(snap.ServiceID) == "" {
+		return nil, errors.New("容器快照缺少服务身份（serviceId），拒绝自动恢复；请人工核对后处理")
+	}
 	if snap.Version == 0 {
 		snap.Version = 1
 	}
@@ -68,8 +74,9 @@ func VerifyManaged(ctx context.Context, eng Engine, snap *ManagedSnapshot) (*doc
 	if got := Fingerprint(current); got != want {
 		return nil, fmt.Errorf("容器配置与 OrbSleep 快照不一致（可能被外部修改或重建），拒绝自动恢复；请检查容器 %s 后手动处理", snap.OriginalName)
 	}
-	if label := ins.Config.Labels[LabelServiceID]; label != "" && snap.ServiceID != "" && label != snap.ServiceID {
-		return nil, fmt.Errorf("容器的 OrbSleep 服务标识不匹配（%s ≠ %s），拒绝自动恢复", label, snap.ServiceID)
+	// Strict identity: a missing label is just as wrong as a mismatched one.
+	if snap.ServiceID != "" && ins.Config.Labels[LabelServiceID] != snap.ServiceID {
+		return nil, fmt.Errorf("容器的 OrbSleep 服务标识不匹配（%q ≠ %q），拒绝自动恢复", ins.Config.Labels[LabelServiceID], snap.ServiceID)
 	}
 	return ins, nil
 }
@@ -121,7 +128,11 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot, exp
 			return "", nil, fmt.Errorf("停止托管容器失败: %w", err)
 		}
 		if err := eng.RenameContainer(ctx, managedID, stale); err != nil {
-			_ = eng.StartContainer(ctx, managedID)
+			// Never swallow the restart error: a stopped, unrestorable
+			// original is a service outage, not a cosmetic detail.
+			if serr := eng.StartContainer(ctx, managedID); serr != nil {
+				return "", nil, fmt.Errorf("重命名托管容器失败: %v；重新启动托管容器也失败: %w（容器 %s 处于停止状态，需人工恢复）", err, serr, shortID(managedID))
+			}
 			return "", nil, fmt.Errorf("重命名托管容器失败: %w", err)
 		}
 	}
@@ -189,10 +200,16 @@ func RemoveManagedContainer(ctx context.Context, eng Engine, snap *ManagedSnapsh
 		}
 		return err
 	}
-	if snap.ServiceID != "" {
-		if lbl := ins.Config.Labels[LabelServiceID]; lbl != "" && lbl != snap.ServiceID {
-			return fmt.Errorf("停用的托管容器 %s 标识不匹配（%s ≠ %s），拒绝删除", StaleName(snap.OriginalName), lbl, snap.ServiceID)
-		}
+	// Strict identity: a container without OUR exact service label is never
+	// ours, no matter how it came to hold the stale name. An empty snapshot
+	// ServiceID means the caller cannot prove identity either — refuse.
+	if snap.ServiceID == "" {
+		return fmt.Errorf("快照缺少服务身份，拒绝清理 %s", StaleName(snap.OriginalName))
+	}
+	if ins.Config.Labels[LabelServiceID] != snap.ServiceID ||
+		ins.Config.Labels[LabelManaged] != "true" {
+		return fmt.Errorf("停用的托管容器 %s 缺少 OrbSleep 身份（service-id=%q managed=%q），拒绝删除",
+			StaleName(snap.OriginalName), ins.Config.Labels[LabelServiceID], ins.Config.Labels[LabelManaged])
 	}
 	return eng.RemoveContainer(ctx, ins.ID, true)
 }
@@ -213,7 +230,10 @@ func CreateAndStart(ctx context.Context, eng Engine, spec *runtime.ContainerSpec
 		return "", err
 	}
 	if err := eng.StartContainer(ctx, id); err != nil {
-		_ = eng.RemoveContainer(ctx, id, true)
+		if cerr := eng.RemoveContainer(ctx, id, true); cerr != nil {
+			// The orphan id must reach the log/txn so a later pass can clean it.
+			return "", fmt.Errorf("启动失败: %v；清理失败（孤儿容器 %s 需人工删除）: %w", err, shortID(id), cerr)
+		}
 		return "", err
 	}
 	return id, nil
@@ -230,6 +250,9 @@ func endpointFor(networks *map[string]runtime.EndpointConfig, netName string) *r
 	return nil
 }
 
+// isNotFound accepts ONLY a structured 404. Error-text sniffing would let an
+// unrelated failure whose body happens to contain "no such" authorise
+// destructive branches — the exact opposite of the fail-closed rule.
 func isNotFound(err error) bool {
-	return dockerx.IsErrNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "no such")
+	return dockerx.IsErrNotFound(err)
 }
