@@ -114,7 +114,10 @@ func (e *Engine) restoreDocrunService(ctx context.Context, logger *opLogger, svc
 
 	// 3. Verify the managed container still matches the snapshot before
 	// touching it: external recreation must never be silently overwritten.
-	if _, verr := docrun.VerifyManaged(ctx, eng, snap); verr != nil {
+	// The verified ID is carried into RestoreOriginal so stop/rename/park can
+	// never act on a container swapped in between verify and act.
+	verified, verr := docrun.VerifyManaged(ctx, eng, snap)
+	if verr != nil {
 		// External modification: keep the managed wiring, ask for manual care.
 		if gerr := e.ensureGatewayForService(ctx, svc.ID); gerr != nil {
 			logger.add("error", "重建网关监听失败: "+gerr.Error())
@@ -126,7 +129,7 @@ func (e *Engine) restoreDocrunService(ctx context.Context, logger *opLogger, svc
 	}
 
 	// 4. Restore the original container from the snapshot.
-	createdID, rollback, err := docrun.RestoreOriginal(ctx, eng, snap)
+	createdID, rollback, err := docrun.RestoreOriginal(ctx, eng, snap, verified.ID)
 	if err != nil {
 		return failWithRevert(err)
 	}
@@ -169,7 +172,7 @@ func (e *Engine) restoreDocrunService(ctx context.Context, logger *opLogger, svc
 	}
 	// 5. Drop the parked managed container. Failure here is cosmetic: it is a
 	// stopped, renamed leftover.
-	if err := docrun.RemoveManagedContainer(ctx, eng, docrun.StaleName(snap.OriginalName)); err != nil {
+	if err := docrun.RemoveManagedContainer(ctx, eng, snap); err != nil {
 		logger.add("warn", "清理停用的托管容器失败（可手动删除）: "+err.Error())
 	}
 	_ = createdID
@@ -254,7 +257,9 @@ func (e *Engine) recoverDocrunDetachTxn(txnID string, p detachPayload) {
 				e.setLastError("恢复操作回滚不完整: " + derr.Error())
 				return
 			}
-			_ = docrun.RemoveManagedContainer(ctx, eng, docrun.StaleName(snap.OriginalName))
+			if rerr := docrun.RemoveManagedContainer(ctx, eng, snap); rerr != nil {
+				e.logger.Printf("warn", "清理停用的托管容器失败（可手动删除）: %v", rerr)
+			}
 			e.finishTxnAtomic(txnID, p.OperationID, "committed", nil, "committed")
 			e.logger.Printf("info", "未完成的恢复操作已完成: %s", svc.ContainerName)
 			return

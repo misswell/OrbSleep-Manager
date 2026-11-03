@@ -57,16 +57,15 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 	}
 	services, _ := e.store.ListServices()
 	primary := e.currentEnvID()
-	// Container IDs are engine-unique, so ID matching may span services of any
-	// environment. NAME matching must stay inside THIS environment: two
-	// engines can run same-named containers, and a cross-environment name hit
-	// would stamp a container with another environment's service record.
+	// Both matching maps are scoped to THIS environment: scanOne only ever
+	// inspects containers of one engine, so a service pinned elsewhere can
+	// never legitimately match here. This keeps the identity model at
+	// (environment, container id/name) instead of trusting ID uniqueness
+	// across engines.
 	managedByID := map[string]string{}
 	managedByName := map[string]string{}
+	managedInEnv := 0
 	for _, svc := range services {
-		if svc.ContainerID != "" {
-			managedByID[svc.ContainerID] = svc.ID
-		}
 		svcEnv := svc.EnvironmentID
 		if svcEnv == "" {
 			if svc.DockerSocket == "" || svc.DockerSocket == strings.TrimPrefix(e.currentEnvEndpoint(), "unix://") {
@@ -75,7 +74,14 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 				svcEnv = runtime.EnvID("unix://" + svc.DockerSocket)
 			}
 		}
-		if svcEnv == env.ID && svc.ContainerName != "" {
+		if svcEnv != env.ID {
+			continue
+		}
+		managedInEnv++
+		if svc.ContainerID != "" {
+			managedByID[svc.ContainerID] = svc.ID
+		}
+		if svc.ContainerName != "" {
 			managedByName[svc.ContainerName] = svc.ID
 		}
 	}
@@ -134,7 +140,7 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 		return a.Name < b.Name
 	})
 
-	counts := map[string]int{"eligible": 0, "needsReview": 0, "excluded": 0, "managed": len(services)}
+	counts := map[string]int{"eligible": 0, "needsReview": 0, "excluded": 0, "managed": managedInEnv}
 	for _, cont := range containers {
 		switch cont.Classification.Verdict {
 		case "eligible":

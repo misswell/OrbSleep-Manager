@@ -3,10 +3,18 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"orbsleep/internal/deployment/docrun"
+	"orbsleep/internal/dockerx"
 )
+
+// isContainerNotFound distinguishes a definitive 404 from any other Docker
+// API failure: recovery may only take destructive branches on 404.
+func isContainerNotFound(err error) bool {
+	return dockerx.IsErrNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "no such")
+}
 
 // recoverDocrunAttachItem rolls back one docrun attach item after a crash.
 // The durable state lives in the transaction payload (full recreation specs),
@@ -44,6 +52,18 @@ func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it t
 	bctx, bcancel := context.WithTimeout(ctx, 10*time.Second)
 	_, backupErr := eng.InspectContainer(bctx, prep.BackupName)
 	bcancel()
+	// Triage: only a definitive NotFound means "no anchor". An API outage
+	// (socket down, timeout, 5xx) leaves the state UNKNOWN — destructive
+	// recovery must not run on an unreadable board; keep the txn for a retry.
+	switch {
+	case backupErr == nil:
+		// anchor present
+	case isContainerNotFound(backupErr):
+		// anchor absent
+	default:
+		*errs = append(*errs, fmt.Sprintf("%s: 无法读取回滚锚点状态: %v（事务保留，等待重试）", it.ContainerName, backupErr))
+		return false
+	}
 	backupExists := backupErr == nil
 
 	switch {
@@ -79,6 +99,12 @@ func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it t
 		// already in place.
 		ins, err := eng.InspectContainer(ctx, prep.OriginalName)
 		if err != nil {
+			if !isContainerNotFound(err) {
+				// Unknown container state: never run destructive recovery on
+				// an unreadable board.
+				*errs = append(*errs, fmt.Sprintf("%s: 无法读取容器状态: %v（事务保留，等待重试）", it.ContainerName, err))
+				return false
+			}
 			// Container gone entirely. If a record survived, the managed state
 			// can be rebuilt from the snapshot; otherwise nothing to do.
 			if hasRecord && it.Phase == "committed_item" {
@@ -98,16 +124,22 @@ func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it t
 			// The replacement is running under the original name.
 			if it.Phase == "committed_item" && hasRecord {
 				// Effectively committed; finish the bookkeeping: ensure the
-				// gateway listens and mark the txn committed contribution.
+				// gateway listens, drop a leftover anchor by its recorded ID
+				// (post-commit cleanup may not have run before the crash),
+				// and mark the txn committed contribution.
 				if gerr := e.ensureGatewayForService(ctx, it.ServiceID); gerr != nil {
 					*errs = append(*errs, fmt.Sprintf("%s: 恢复端口监听失败: %v", it.ContainerName, gerr))
 					return false
+				}
+				if rerr := eng.RemoveContainer(ctx, prep.OriginalID, true); rerr != nil && !isContainerNotFound(rerr) {
+					logger.add("warn", it.ContainerName+" 清理残留锚点失败（可手动删除）: "+rerr.Error())
 				}
 				logger.add("info", it.ContainerName+" 接入已完成，补记提交")
 				return true
 			}
 			// Uncommitted replacement: restore the original from the snapshot
-			// (park the replacement, create the original, verify).
+			// (park the replacement, create the original, verify). The
+			// replacement's verified ID guards against a swap mid-recovery.
 			snap := &docrun.ManagedSnapshot{
 				ServiceID:    it.ServiceID,
 				OriginalName: prep.OriginalName,
@@ -116,7 +148,7 @@ func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it t
 				ManagedSpec:  prep.ManagedSpec,
 				Secondary:    prep.Secondary,
 			}
-			if _, rollback, rerr := docrun.RestoreOriginal(ctx, eng, snap); rerr != nil {
+			if _, rollback, rerr := docrun.RestoreOriginal(ctx, eng, snap, ins.ID); rerr != nil {
 				*errs = append(*errs, fmt.Sprintf("%s: 恢复原容器失败: %v", it.ContainerName, rerr))
 				return false
 			} else {
@@ -133,7 +165,11 @@ func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it t
 					}
 				}
 			}
-			_ = eng.RemoveContainer(ctx, docrun.StaleName(prep.OriginalName), true)
+			// Drop the parked replacement BY ID (captured before the restore);
+			// a name-based removal here could hit an unrelated container.
+			if rerr := eng.RemoveContainer(ctx, ins.ID, true); rerr != nil && !isContainerNotFound(rerr) {
+				logger.add("warn", it.ContainerName+" 清理停用的替换容器失败（可手动删除）: "+rerr.Error())
+			}
 			if hasRecord {
 				if derr := deleteServiceRecord(e, it.ServiceID); derr != nil {
 					*errs = append(*errs, fmt.Sprintf("%s: 删除托管记录失败: %v", it.ContainerName, derr))

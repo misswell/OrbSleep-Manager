@@ -141,7 +141,11 @@ func RecreateManaged(ctx context.Context, eng Engine, prep *PreparedAttach, onPh
 	}
 	if onPhase != nil {
 		if perr := onPhase("original_renamed"); perr != nil {
-			_ = undoRename()
+			// Rollback errors must surface: a silently failed undo would leave
+			// the caller believing the original container is back in place.
+			if uerr := undoRename(); uerr != nil {
+				return "", nil, fmt.Errorf("%v（且回滚失败: %v）", perr, uerr)
+			}
 			return "", nil, perr
 		}
 	}
@@ -155,8 +159,16 @@ func RecreateManaged(ctx context.Context, eng Engine, prep *PreparedAttach, onPh
 	}
 	if onPhase != nil {
 		if perr := onPhase("replacement_created"); perr != nil {
-			_ = eng.RemoveContainer(ctx, created, true)
-			_ = undoRename()
+			var rbErrs []string
+			if rerr := eng.RemoveContainer(ctx, created, true); rerr != nil {
+				rbErrs = append(rbErrs, "删除替换容器: "+rerr.Error())
+			}
+			if uerr := undoRename(); uerr != nil {
+				rbErrs = append(rbErrs, uerr.Error())
+			}
+			if len(rbErrs) > 0 {
+				return "", nil, fmt.Errorf("%v（且回滚失败: %s）", perr, strings.Join(rbErrs, "; "))
+			}
 			return "", nil, perr
 		}
 	}

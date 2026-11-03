@@ -75,13 +75,41 @@ func VerifyManaged(ctx context.Context, eng Engine, snap *ManagedSnapshot) (*doc
 }
 
 // RestoreOriginal puts the original container back under its original name:
-// stop managed → rename managed aside → create original spec (all ports) →
-// start → reconnect networks. The parked managed container is removed by the
-// caller only after the restored container is verified.
-func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot) (createdID string, rollback func() error, err error) {
+// verify managed identity → stop managed → rename managed aside → create
+// original spec (all ports) → start → reconnect networks.
+//
+// Safety rules:
+//   - expectedManagedID (from VerifyManaged) must match the container found
+//     under the original name; a mismatch aborts instead of parking someone
+//     else's container.
+//   - Inspect failures other than NotFound abort the restore: an unknown
+//     state must never be treated as "absent".
+//   - Rollback removes containers BY ID only. A name conflict at create time
+//     (an external container took the name while we worked) must never make
+//     us delete the foreign container.
+func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot, expectedManagedID string) (createdID string, rollback func() error, err error) {
+	ins, ierr := eng.InspectContainer(ctx, snap.OriginalName)
 	var managedID string
-	if ins, ierr := eng.InspectContainer(ctx, snap.OriginalName); ierr == nil {
+	switch {
+	case ierr == nil:
+		if expectedManagedID != "" && ins.ID != expectedManagedID {
+			return "", nil, fmt.Errorf("名称 %s 下的容器已不是 OrbSleep 管理的那个（%s ≠ %s），拒绝恢复以保护外部容器",
+				snap.OriginalName, shortID(ins.ID), shortID(expectedManagedID))
+		}
+		// The container under our name must carry OUR service label. A
+		// label-less container means something external took the name while
+		// the managed one was parked — touching it is forbidden.
+		if snap.ServiceID != "" && ins.Config.Labels[LabelServiceID] != snap.ServiceID {
+			return "", nil, fmt.Errorf("名称 %s 下的容器缺少 OrbSleep 服务标识（可能是外部新建的容器），拒绝恢复以保护外部容器",
+				snap.OriginalName)
+		}
 		managedID = ins.ID
+	case isNotFound(ierr):
+		managedID = ""
+	default:
+		// Unreadable state (API down, timeout, …): abort, keep the managed
+		// wiring, let the caller retry later.
+		return "", nil, fmt.Errorf("无法读取托管容器状态: %v；为保护现场已中止恢复，请确认引擎可用后重试", ierr)
 	}
 	stale := StaleName(snap.OriginalName)
 	if managedID != "" {
@@ -97,12 +125,18 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot) (cr
 			return "", nil, fmt.Errorf("重命名托管容器失败: %w", err)
 		}
 	}
+	// createdID feeds the rollback: the half-restored container is removed BY
+	// ID, never by name (a create failure may mean an external container now
+	// holds the name — touching it is forbidden).
+	createdID = ""
 	rollback = func() error {
-		// Put the managed state back: remove the half-restored original
-		// container (it holds the name), rename the managed one back, start it.
+		// Put the managed state back: remove the half-restored original by
+		// its recorded ID, rename the managed one back, start it.
 		var firstErr error
-		if err := eng.RemoveContainer(ctx, snap.OriginalName, true); err != nil && !isNotFound(err) {
-			firstErr = err
+		if createdID != "" {
+			if rerr := eng.RemoveContainer(ctx, createdID, true); rerr != nil && !isNotFound(rerr) {
+				firstErr = rerr
+			}
 		}
 		if managedID != "" {
 			if rerr := eng.RenameContainer(ctx, managedID, snap.OriginalName); rerr != nil && !isNotFound(rerr) {
@@ -124,6 +158,7 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot) (cr
 		}
 		return "", nil, fmt.Errorf("恢复原容器失败: %w", err)
 	}
+	createdID = created
 	if err := eng.StartContainer(ctx, created); err != nil {
 		if rbErr := rollback(); rbErr != nil {
 			return "", nil, fmt.Errorf("启动恢复容器失败: %v；且回滚失败: %w", err, rbErr)
@@ -143,9 +178,31 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot) (cr
 }
 
 // RemoveManagedContainer removes the parked managed container after a
-// verified restore.
-func RemoveManagedContainer(ctx context.Context, eng Engine, staleName string) error {
-	return eng.RemoveContainer(ctx, staleName, true)
+// verified restore. It resolves the parked container by name but verifies our
+// service label before removing, and never touches a container that carries
+// someone else's (or no) identity.
+func RemoveManagedContainer(ctx context.Context, eng Engine, snap *ManagedSnapshot) error {
+	ins, err := eng.InspectContainer(ctx, StaleName(snap.OriginalName))
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if snap.ServiceID != "" {
+		if lbl := ins.Config.Labels[LabelServiceID]; lbl != "" && lbl != snap.ServiceID {
+			return fmt.Errorf("停用的托管容器 %s 标识不匹配（%s ≠ %s），拒绝删除", StaleName(snap.OriginalName), lbl, snap.ServiceID)
+		}
+	}
+	return eng.RemoveContainer(ctx, ins.ID, true)
+}
+
+// shortID renders an abbreviated container id for messages.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // CreateAndStart creates a container from a spec and starts it, removing the

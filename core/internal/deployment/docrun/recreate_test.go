@@ -231,7 +231,8 @@ func TestRestoreOriginalSequence(t *testing.T) {
 		ManagedSpec:  prep.ManagedSpec,
 		Secondary:    prep.Secondary,
 	}
-	if _, err := VerifyManaged(context.Background(), eng, snap); err != nil {
+	verified, err := VerifyManaged(context.Background(), eng, snap)
+	if err != nil {
 		t.Fatalf("managed verification failed: %v", err)
 	}
 	tampered := loadGolden(t)
@@ -241,7 +242,7 @@ func TestRestoreOriginalSequence(t *testing.T) {
 	if _, err := VerifyManaged(context.Background(), eng2, snap); err == nil {
 		t.Fatal("tampered container must be refused")
 	}
-	created, rollback, err := RestoreOriginal(context.Background(), eng, snap)
+	created, rollback, err := RestoreOriginal(context.Background(), eng, snap, verified.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,5 +269,109 @@ func TestRestoreOriginalSequence(t *testing.T) {
 	}
 	if len(eng.connected) != 1 || eng.connected[0][0] != "backnet" {
 		t.Fatalf("restore network reconnect wrong: %v", eng.connected)
+	}
+}
+
+// TestRestoreOriginalProtectsExternalContainer pins the P0 safety rule: when
+// the original name was taken by an EXTERNAL container while the managed one
+// was parked, restore must abort without stopping, renaming or removing the
+// foreign container.
+func TestRestoreOriginalProtectsExternalContainer(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := loadGolden(t)
+	foreign.ID = "foreign-1"
+	foreign.Config.Labels = map[string]string{" intruder": "1"}
+	delete(foreign.Config.Labels, " intruder")
+	foreign.Config.Labels = map[string]string{}
+	eng := &fakeEngine{
+		inspections: map[string]*dockerx.ContainerInspect{
+			"webapp":        foreign, // external container took the name
+			foreign.ID:      foreign,
+			prep.OriginalID: ins,
+		},
+		failNext: map[string]error{"create": &dockerx.APIError{Status: 409, Body: "name conflict"}},
+	}
+	snap := &ManagedSnapshot{
+		ServiceID:    "svc-1",
+		OriginalName: prep.OriginalName,
+		OriginalSpec: prep.OriginalSpec,
+		ManagedSpec:  prep.ManagedSpec,
+		Secondary:    prep.Secondary,
+	}
+	_, _, err = RestoreOriginal(context.Background(), eng, snap, "")
+	if err == nil {
+		t.Fatal("restore must abort when an unlabeled container holds the name")
+	}
+	for _, id := range eng.removed {
+		if id == foreign.ID {
+			t.Fatal("external container must never be removed by restore rollback")
+		}
+	}
+	for _, r := range eng.renames {
+		if r[0] == foreign.ID {
+			t.Fatal("external container must never be renamed by restore")
+		}
+	}
+	for _, s := range eng.stopped {
+		if s[0] == foreign.ID {
+			t.Fatal("external container must never be stopped by restore")
+		}
+	}
+}
+
+// TestRestoreOriginalRollbackRemovesByID pins the by-ID rollback rule: the
+// half-restored container is removed by its own ID, never by name.
+func TestRestoreOriginalRollbackRemovesByID(t *testing.T) {
+	ins := loadGolden(t)
+	prep, err := PrepareAttach(ins, "svc-1", []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := loadGolden(t)
+	managed.ID = "managed-1"
+	managed.Config.Labels[LabelServiceID] = "svc-1"
+	delete(managed.HostConfig.PortBindings, "80/tcp")
+	eng := &fakeEngine{
+		inspections: map[string]*dockerx.ContainerInspect{
+			"webapp":        managed,
+			"managed-1":     managed,
+			prep.OriginalID: ins,
+		},
+		failNext: map[string]error{"start": &dockerx.APIError{Status: 500, Body: "boom"}},
+	}
+	snap := &ManagedSnapshot{
+		ServiceID:    "svc-1",
+		OriginalName: prep.OriginalName,
+		OriginalSpec: prep.OriginalSpec,
+		ManagedSpec:  prep.ManagedSpec,
+		Secondary:    prep.Secondary,
+	}
+	// A start failure must roll back INTERNALLY: the error surfaces with the
+	// rollback already applied (by ID), no rollback handle for a failed call.
+	_, rollback, err := RestoreOriginal(context.Background(), eng, snap, "managed-1")
+	if err == nil {
+		t.Fatal("start failure must surface")
+	}
+	if rollback != nil {
+		t.Fatal("failed restore must not hand out a rollback handle")
+	}
+	found := false
+	for _, id := range eng.removed {
+		if id == "new-webapp" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("half-restored container must be removed by its recorded ID, got %v", eng.removed)
+	}
+	if len(eng.renames) < 2 || eng.renames[len(eng.renames)-1][1] != prep.OriginalName {
+		t.Fatalf("managed container must be renamed back, got %v", eng.renames)
+	}
+	if n := len(eng.started); n == 0 || eng.started[n-1] != "managed-1" {
+		t.Fatalf("managed container must be started again, got %v", eng.started)
 	}
 }

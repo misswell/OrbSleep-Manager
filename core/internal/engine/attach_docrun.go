@@ -322,19 +322,21 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 		_ = e.store.DeleteMeta("serviceBackup:" + svcID)
 		return e.store.DeleteService(svcID)
 	}})
-	// 6. Only now drop the rollback anchor. A failure here is not fatal: the
-	// stale anchor keeps running stopped and is cleaned up on the next attach
-	// of the same name or by `docker rm` — never worth failing the attach for.
-	if err := cleanup(true); err != nil {
-		logger.add("warn", "移除原容器备份失败（不影响接入，可稍后手动清理）: "+err.Error())
-	} else {
-		logger.add("info", "已移除原容器备份（数据卷与绑定目录均保留）")
-	}
+	// 6. Commit the item BEFORE dropping the rollback anchor: a txn-write
+	// failure after the anchor is gone would turn an auto-recoverable failure
+	// into manual recovery (RollbackManaged needs the original container).
+	// Removing the anchor is post-commit cleanup; if it fails the anchor is
+	// removed by recovery (by recorded ID) or by the next successful commit.
 	if err := e.updateTxn(txnID, "committed_item", func(p *txnPayload) {
 		p.Items[idx].ServiceID = svcID
 		p.Items[idx].Phase = "committed_item"
 	}); err != nil {
 		return fail(fmt.Errorf("写入事务日志失败: %w", err))
+	}
+	if err := cleanup(true); err != nil {
+		logger.add("warn", "移除原容器备份失败（不影响接入，恢复流程可按 ID 清理）: "+err.Error())
+	} else {
+		logger.add("info", "已移除原容器备份（数据卷与绑定目录均保留）")
 	}
 	logger.add("info", fmt.Sprintf("%s 接入成功：%s → 代理 → 容器", snap.containerName, bindingsText(snap.bindings)))
 	return &appliedItem{

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"orbsleep/internal/dockercli"
@@ -165,48 +166,56 @@ func (e *Engine) ListEnvironments(ctx context.Context) model.EnvironmentList {
 		})
 		byEndpoint[ep] = true
 	}
-	// Probe every row (bounded: discovery list is small and probe timeouts are
-	// short). Update persisted status for registered rows.
+	// Probe every row, in parallel with a global cap: serial probing of N
+	// offline environments would stall one GUI refresh for N×4s. Each row's
+	// writes happen in its own goroutine; the slice slot is goroutine-local
+	// so no mutex is needed for the row itself.
+	probeWG := sync.WaitGroup{}
+	probeSem := make(chan struct{}, 8)
 	for i := range registered {
 		env := &registered[i]
 		if env.DiscoveredOnly && !strings.HasPrefix(env.Endpoint, "unix://") {
 			// tcp/ssh endpoints: shown, honestly marked unsupported.
 			env.Remote = true
 		}
-		if env.DiscoveredOnly {
+		probeWG.Add(1)
+		go func(env *model.Environment) {
+			defer probeWG.Done()
+			probeSem <- struct{}{}
+			defer func() { <-probeSem }()
 			probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 			res := runtime.Probe(probeCtx, env.Endpoint)
 			cancel()
+			if env.DiscoveredOnly {
+				if res.Reachable {
+					env.Status = "online"
+					env.EngineVersion, env.APIVersion = res.EngineVersion, res.APIVersion
+				} else if proxySocketAlive(strings.TrimPrefix(env.Endpoint, "unix://")) {
+					env.Status = "unknown"
+				} else {
+					env.Status = "offline"
+				}
+				return
+			}
 			if res.Reachable {
 				env.Status = "online"
 				env.EngineVersion, env.APIVersion = res.EngineVersion, res.APIVersion
-			} else if proxySocketAlive(strings.TrimPrefix(env.Endpoint, "unix://")) {
-				env.Status = "unknown"
+				env.LastError = ""
+				_ = e.store.SetEnvironmentStatus(env.ID, "online", res.EngineVersion, res.APIVersion, "")
 			} else {
 				env.Status = "offline"
+				env.LastError = res.Error
+				_ = e.store.SetEnvironmentStatus(env.ID, "offline", "", "", res.Error)
 			}
-			continue
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		res := runtime.Probe(probeCtx, env.Endpoint)
-		cancel()
-		if res.Reachable {
-			env.Status = "online"
-			env.EngineVersion, env.APIVersion = res.EngineVersion, res.APIVersion
-			env.LastError = ""
-			_ = e.store.SetEnvironmentStatus(env.ID, "online", res.EngineVersion, res.APIVersion, "")
-		} else {
-			env.Status = "offline"
-			env.LastError = res.Error
-			_ = e.store.SetEnvironmentStatus(env.ID, "offline", "", "", res.Error)
-		}
-		if env.Kind == "" {
-			env.Kind = string(res.Kind)
-		}
-		if env.Kind == "podman" || env.Kind == string(runtime.KindPodman) {
-			env.Capabilities = e.storeCapsFor(env)
-		}
+			if env.Kind == "" {
+				env.Kind = string(res.Kind)
+			}
+			if env.Kind == "podman" || env.Kind == string(runtime.KindPodman) {
+				env.Capabilities = e.storeCapsFor(env)
+			}
+		}(env)
 	}
+	probeWG.Wait()
 	return model.EnvironmentList{Environments: registered, PrimaryID: primary}
 }
 
@@ -298,6 +307,14 @@ func (e *Engine) EnvironmentAction(ctx context.Context, id, action string) (mode
 			return model.EnvironmentList{}, err
 		}
 	}
+	// Mutating actions serialise with attach/reconcile so two concurrent
+	// enables can never allocate overlapping proxy ranges.
+	if action == "enable" || action == "disable" || action == "remove" {
+		if err := e.lockWriteBounded(10 * time.Second); err != nil {
+			return model.EnvironmentList{}, err
+		}
+		defer e.writeMu.Unlock()
+	}
 	switch action {
 	case "test":
 		// list refresh re-probes; nothing else to do.
@@ -356,7 +373,13 @@ func (e *Engine) enableEnvironment(ctx context.Context, env *model.Environment) 
 	}
 	owned[s.AdminPort] = true
 	owned[s.WebPort] = true
-	envs, _ := e.store.ListEnvironments()
+	// Both reads feed the port-allocation exclusion set: a failed read would
+	// make the "owned" set incomplete and could hand out an already-used
+	// range. Fail closed instead.
+	envs, err := e.store.ListEnvironments()
+	if err != nil {
+		return fmt.Errorf("读取环境列表失败，拒绝分配端口: %w", err)
+	}
 	for _, other := range envs {
 		if other.ID == env.ID {
 			continue
@@ -374,7 +397,10 @@ func (e *Engine) enableEnvironment(ctx context.Context, env *model.Environment) 
 	// Managed service proxy ports are also reserved regardless of env
 	// (a managed service's proxy port must stay inside its own env range, but
 	// never reuse another env's).
-	services, _ := e.store.ListServices()
+	services, err := e.store.ListServices()
+	if err != nil {
+		return fmt.Errorf("读取托管服务失败，拒绝分配端口: %w", err)
+	}
 	for _, svc := range services {
 		for _, b := range svc.Bindings {
 			owned[b.ProxyPort] = true
