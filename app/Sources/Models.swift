@@ -485,11 +485,23 @@ struct ScanCounts: Codable, Sendable, Hashable {
     var managed: Int?
 }
 
+struct ScanEnvironmentFailure: Codable, Sendable, Hashable {
+    var environmentId: String?
+    var environmentName: String?
+    var error: String?
+}
+
 struct ScanResult: Codable, Sendable, Hashable {
     var scannedAt: String?
     var context: DockerContextInfo?
     var containers: [Container]?
     var counts: ScanCounts?
+    var environmentId: String?
+    /// 多环境扫描部分失败时为 true：结果真实但不完整，GUI 必须明示。
+    var partial: Bool?
+    var failedEnvironments: [ScanEnvironmentFailure]?
+
+    var isPartial: Bool { partial == true }
 }
 
 // MARK: - 计划

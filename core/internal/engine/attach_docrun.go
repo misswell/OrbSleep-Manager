@@ -16,35 +16,7 @@ import (
 	"orbsleep/internal/failpoint"
 	"orbsleep/internal/model"
 	"orbsleep/internal/proxy"
-	"orbsleep/internal/runtime"
 )
-
-// docrunEngine adapts the engine's Docker client to the strategy interface.
-// It shares the create-body mapping with the dockerapi adapter via
-// runtime.CreateRequestBody.
-type docrunEngine struct{ c *dockerx.Client }
-
-func (a docrunEngine) InspectContainer(ctx context.Context, id string) (*dockerx.ContainerInspect, error) {
-	return a.c.InspectContainer(ctx, id)
-}
-func (a docrunEngine) StartContainer(ctx context.Context, id string) error {
-	return a.c.StartContainer(ctx, id)
-}
-func (a docrunEngine) StopContainer(ctx context.Context, id string, timeoutSecs int) error {
-	return a.c.StopContainer(ctx, id, timeoutSecs)
-}
-func (a docrunEngine) RemoveContainer(ctx context.Context, id string, force bool) error {
-	return a.c.RemoveContainer(ctx, id, force)
-}
-func (a docrunEngine) RenameContainer(ctx context.Context, id, name string) error {
-	return a.c.RenameContainer(ctx, id, name)
-}
-func (a docrunEngine) CreateContainer(ctx context.Context, spec *runtime.ContainerSpec) (string, error) {
-	return a.c.CreateContainer(ctx, spec.Name, runtime.CreateRequestBody(spec))
-}
-func (a docrunEngine) ConnectNetwork(ctx context.Context, network, containerID string, endpoint *runtime.EndpointConfig) error {
-	return a.c.ConnectNetwork(ctx, network, containerID, endpoint)
-}
 
 // attachOneDocrun attaches a container created outside Compose. The sequence
 // mirrors attachOne but replaces the Compose edit/recreate with the snapshot
@@ -124,7 +96,7 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 	if merr != nil {
 		return nil, &attachError{Err: fmt.Errorf("序列化备份元数据失败: %w", merr)}
 	}
-	if werr := os.WriteFile(filepath.Join(itemDir, "metadata.json"), metaRaw, 0o600); werr != nil {
+	if werr := writeFileSync(filepath.Join(itemDir, "metadata.json"), metaRaw, 0o600); werr != nil {
 		return nil, &attachError{Err: fmt.Errorf("写入备份元数据失败: %w", werr)}
 	}
 	if err := e.updateTxn(txnID, "prepared", func(p *txnPayload) {
@@ -163,10 +135,10 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 		if err != nil {
 			return fmt.Errorf("序列化容器快照失败: %w", err)
 		}
-		if err := os.WriteFile(filepath.Join(stableDir, "container-snapshot.json"), snapRaw, 0o600); err != nil {
+		if err := writeFileSync(filepath.Join(stableDir, "container-snapshot.json"), snapRaw, 0o600); err != nil {
 			return fmt.Errorf("写入容器快照失败: %w", err)
 		}
-		if err := os.WriteFile(filepath.Join(stableDir, "metadata.json"), metaRaw, 0o600); err != nil {
+		if err := writeFileSync(filepath.Join(stableDir, "metadata.json"), metaRaw, 0o600); err != nil {
 			return fmt.Errorf("写入稳定备份元数据失败: %w", err)
 		}
 		if err := e.store.SetMeta("serviceBackup:"+svcID, stableDir); err != nil {
@@ -342,6 +314,44 @@ func (e *Engine) attachOneDocrun(ctx context.Context, logger *opLogger, idx int,
 		snap: snap, serviceID: svcID, backupPath: backupPath,
 		strategy: "docrun", prep: prep, replacementID: createdID,
 	}, nil
+}
+
+// writeFileSync writes via a same-directory temp file with fsync and an
+// atomic rename — the durable snapshot must survive a crash mid-write, so a
+// half-written container-snapshot.json is never observable.
+func writeFileSync(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, mode); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+	return nil
 }
 
 // rollbackDocrunApplied reverts one successfully attached docrun item: remove

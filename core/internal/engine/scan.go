@@ -221,6 +221,14 @@ func (e *Engine) scanAll(ctx context.Context) (model.ScanResult, error) {
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
+				// A failed environment must never masquerade as a complete
+				// scan: record it explicitly so the GUI can say "partial".
+				merged.Partial = true
+				merged.FailedEnvironments = append(merged.FailedEnvironments, model.ScanEnvironmentFailure{
+					EnvironmentID:   env.ID,
+					EnvironmentName: env.Name,
+					Error:           err.Error(),
+				})
 				if firstErr == nil {
 					firstErr = err
 				}

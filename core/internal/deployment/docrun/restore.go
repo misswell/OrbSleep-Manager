@@ -57,14 +57,40 @@ func LoadSnapshot(raw []byte) (*ManagedSnapshot, error) {
 	return &snap, nil
 }
 
+// validateSnapshotIdentity is the entry gate for every destructive restore
+// operation. Snapshots can be built in memory (crash recovery builds them
+// from txn payloads), so entry functions must never assume the caller passed
+// the data through LoadSnapshot.
+func validateSnapshotIdentity(snap *ManagedSnapshot) error {
+	if snap == nil {
+		return errors.New("快照为空")
+	}
+	if strings.TrimSpace(snap.ServiceID) == "" {
+		return errors.New("快照缺少服务身份（serviceId），拒绝执行破坏性操作")
+	}
+	if snap.OriginalSpec == nil || snap.ManagedSpec == nil {
+		return errors.New("快照规格不完整（缺少原始或托管规格）")
+	}
+	return nil
+}
+
 // VerifyManaged confirms the running managed container still matches the
-// snapshot's managed spec (OrbSleep labels and runtime-resolved state are
-// ignored by the fingerprint). A mismatch means the user replaced or edited
-// the container externally; restore refuses rather than overwriting.
+// snapshot's managed spec. Identity (service label + managed label) is
+// verified BEFORE the config fingerprint: an untrusted container must not be
+// fingerprint-compared at all, let alone restored.
 func VerifyManaged(ctx context.Context, eng Engine, snap *ManagedSnapshot) (*dockerx.ContainerInspect, error) {
+	if err := validateSnapshotIdentity(snap); err != nil {
+		return nil, err
+	}
 	ins, err := eng.InspectContainer(ctx, snap.OriginalName)
 	if err != nil {
 		return nil, fmt.Errorf("托管容器不可读: %w", err)
+	}
+	if ins.Config.Labels[LabelServiceID] != snap.ServiceID {
+		return nil, fmt.Errorf("容器的 OrbSleep 服务标识不匹配（%q ≠ %q），拒绝自动恢复", ins.Config.Labels[LabelServiceID], snap.ServiceID)
+	}
+	if ins.Config.Labels[LabelManaged] != "true" {
+		return nil, fmt.Errorf("容器 %s 不是 OrbSleep 托管容器（缺少 %s 标签），拒绝自动恢复", snap.OriginalName, LabelManaged)
 	}
 	want := Fingerprint(snap.ManagedSpec)
 	current, err := SpecFromInspect(ins)
@@ -73,10 +99,6 @@ func VerifyManaged(ctx context.Context, eng Engine, snap *ManagedSnapshot) (*doc
 	}
 	if got := Fingerprint(current); got != want {
 		return nil, fmt.Errorf("容器配置与 OrbSleep 快照不一致（可能被外部修改或重建），拒绝自动恢复；请检查容器 %s 后手动处理", snap.OriginalName)
-	}
-	// Strict identity: a missing label is just as wrong as a mismatched one.
-	if snap.ServiceID != "" && ins.Config.Labels[LabelServiceID] != snap.ServiceID {
-		return nil, fmt.Errorf("容器的 OrbSleep 服务标识不匹配（%q ≠ %q），拒绝自动恢复", ins.Config.Labels[LabelServiceID], snap.ServiceID)
 	}
 	return ins, nil
 }
@@ -95,6 +117,9 @@ func VerifyManaged(ctx context.Context, eng Engine, snap *ManagedSnapshot) (*doc
 //     (an external container took the name while we worked) must never make
 //     us delete the foreign container.
 func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot, expectedManagedID string) (createdID string, rollback func() error, err error) {
+	if err := validateSnapshotIdentity(snap); err != nil {
+		return "", nil, err
+	}
 	ins, ierr := eng.InspectContainer(ctx, snap.OriginalName)
 	var managedID string
 	switch {
@@ -103,12 +128,17 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot, exp
 			return "", nil, fmt.Errorf("名称 %s 下的容器已不是 OrbSleep 管理的那个（%s ≠ %s），拒绝恢复以保护外部容器",
 				snap.OriginalName, shortID(ins.ID), shortID(expectedManagedID))
 		}
-		// The container under our name must carry OUR service label. A
-		// label-less container means something external took the name while
-		// the managed one was parked — touching it is forbidden.
-		if snap.ServiceID != "" && ins.Config.Labels[LabelServiceID] != snap.ServiceID {
+		// Strict identity: the container under our name must carry OUR
+		// service id AND the managed label. A label-less container means
+		// something external took the name while the managed one was parked —
+		// touching it is forbidden.
+		if ins.Config.Labels[LabelServiceID] != snap.ServiceID {
 			return "", nil, fmt.Errorf("名称 %s 下的容器缺少 OrbSleep 服务标识（可能是外部新建的容器），拒绝恢复以保护外部容器",
 				snap.OriginalName)
+		}
+		if ins.Config.Labels[LabelManaged] != "true" {
+			return "", nil, fmt.Errorf("名称 %s 下的容器不是 OrbSleep 托管容器（缺少 %s 标签），拒绝恢复以保护外部容器",
+				snap.OriginalName, LabelManaged)
 		}
 		managedID = ins.ID
 	case isNotFound(ierr):
@@ -127,6 +157,18 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot, exp
 		if err := eng.StopContainer(ctx, managedID, stopTimeout); err != nil {
 			return "", nil, fmt.Errorf("停止托管容器失败: %w", err)
 		}
+		// Post-stop re-inspect: the identity window between verify and the
+		// next mutation is closed by re-reading the SAME container ID and
+		// re-checking our label. Stop/Rename address the container by ID, so
+		// this only guards against the container being force-replaced.
+		if re, rerr := eng.InspectContainer(ctx, managedID); rerr != nil {
+			if serr := eng.StartContainer(ctx, managedID); serr != nil {
+				return "", nil, fmt.Errorf("停止后无法复核容器状态: %v；重新启动也失败: %w（容器 %s 需人工检查）", rerr, serr, shortID(managedID))
+			}
+			return "", nil, fmt.Errorf("停止后无法复核容器状态: %v；已重新启动托管容器，恢复中止", rerr)
+		} else if re.ID != managedID || re.Config.Labels[LabelServiceID] != snap.ServiceID {
+			return "", nil, fmt.Errorf("停止后容器身份发生变化（%s），拒绝继续恢复", shortID(re.ID))
+		}
 		if err := eng.RenameContainer(ctx, managedID, stale); err != nil {
 			// Never swallow the restart error: a stopped, unrestorable
 			// original is a service outage, not a cosmetic detail.
@@ -136,6 +178,19 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot, exp
 			return "", nil, fmt.Errorf("重命名托管容器失败: %w", err)
 		}
 	}
+	// Name-occupancy check right before create: if something external took
+	// the original name while the managed one was parked, fail deterministically
+	// here (rollback restores the parked container by ID) instead of relying
+	// on the create error path.
+	if occ, oerr := eng.InspectContainer(ctx, snap.OriginalName); oerr == nil {
+		return "", nil, fmt.Errorf("原名称 %s 已被其他容器占用（%s），拒绝恢复以保护外部容器", snap.OriginalName, shortID(occ.ID))
+	} else if !isNotFound(oerr) {
+		return "", nil, fmt.Errorf("无法确认原名称 %s 是否空闲: %v；已中止恢复", snap.OriginalName, oerr)
+	}
+	// createdID feeds the rollback: the half-restored container is removed BY
+	// ID, never by name (a create failure may mean an external container now
+	// holds the name — touching it is forbidden).
+	createdID = ""
 	// createdID feeds the rollback: the half-restored container is removed BY
 	// ID, never by name (a create failure may mean an external container now
 	// holds the name — touching it is forbidden).
@@ -193,6 +248,9 @@ func RestoreOriginal(ctx context.Context, eng Engine, snap *ManagedSnapshot, exp
 // service label before removing, and never touches a container that carries
 // someone else's (or no) identity.
 func RemoveManagedContainer(ctx context.Context, eng Engine, snap *ManagedSnapshot) error {
+	if err := validateSnapshotIdentity(snap); err != nil {
+		return err
+	}
 	ins, err := eng.InspectContainer(ctx, StaleName(snap.OriginalName))
 	if err != nil {
 		if isNotFound(err) {
@@ -201,11 +259,7 @@ func RemoveManagedContainer(ctx context.Context, eng Engine, snap *ManagedSnapsh
 		return err
 	}
 	// Strict identity: a container without OUR exact service label is never
-	// ours, no matter how it came to hold the stale name. An empty snapshot
-	// ServiceID means the caller cannot prove identity either — refuse.
-	if snap.ServiceID == "" {
-		return fmt.Errorf("快照缺少服务身份，拒绝清理 %s", StaleName(snap.OriginalName))
-	}
+	// ours, no matter how it came to hold the stale name.
 	if ins.Config.Labels[LabelServiceID] != snap.ServiceID ||
 		ins.Config.Labels[LabelManaged] != "true" {
 		return fmt.Errorf("停用的托管容器 %s 缺少 OrbSleep 身份（service-id=%q managed=%q），拒绝删除",
@@ -231,8 +285,9 @@ func CreateAndStart(ctx context.Context, eng Engine, spec *runtime.ContainerSpec
 	}
 	if err := eng.StartContainer(ctx, id); err != nil {
 		if cerr := eng.RemoveContainer(ctx, id, true); cerr != nil {
-			// The orphan id must reach the log/txn so a later pass can clean it.
-			return "", fmt.Errorf("启动失败: %v；清理失败（孤儿容器 %s 需人工删除）: %w", err, shortID(id), cerr)
+			// The FULL orphan id must reach the log/txn so a later pass can
+			// clean it up by ID.
+			return "", fmt.Errorf("启动失败: %v；清理失败（孤儿容器 id=%s 需按 ID 人工删除）: %w", err, id, cerr)
 		}
 		return "", err
 	}

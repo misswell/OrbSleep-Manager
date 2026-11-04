@@ -10,9 +10,14 @@ import (
 )
 
 // fakeEngine is an in-memory Engine recording every mutation, used to prove
-// the recreate/rollback sequences never lose the original container.
+// the recreate/rollback sequences never lose the original container. Lookup
+// semantics mirror the real engine: a container is found by ID or by its
+// CURRENT name (a rename frees the old name immediately), which is what makes
+// name-occupancy checks testable.
 type fakeEngine struct {
-	inspections map[string]*dockerx.ContainerInspect
+	inspections map[string]*dockerx.ContainerInspect // construction input (deduped by pointer)
+	list        []*dockerx.ContainerInspect          // live containers
+	built       bool
 	created     []*specRecord
 	removed     []string
 	renames     [][2]string
@@ -20,6 +25,39 @@ type fakeEngine struct {
 	stopped     [][2]string
 	connected   [][3]string
 	failNext    map[string]error
+}
+
+func (f *fakeEngine) all() []*dockerx.ContainerInspect {
+	if f.built {
+		return f.list
+	}
+	seen := map[*dockerx.ContainerInspect]bool{}
+	for _, v := range f.inspections {
+		if v != nil && !seen[v] {
+			seen[v] = true
+			f.list = append(f.list, v)
+		}
+	}
+	f.built = true
+	return f.list
+}
+
+func (f *fakeEngine) find(key string) *dockerx.ContainerInspect {
+	for _, c := range f.all() {
+		if c.ID == key || strings.TrimPrefix(c.Name, "/") == key {
+			return c
+		}
+	}
+	return nil
+}
+
+func (f *fakeEngine) dropByID(id string) {
+	for i, c := range f.list {
+		if c.ID == id {
+			f.list = append(f.list[:i], f.list[i+1:]...)
+			return
+		}
+	}
 }
 
 type specRecord struct {
@@ -42,7 +80,7 @@ func (f *fakeEngine) InspectContainer(ctx context.Context, id string) (*dockerx.
 	if err := f.err("inspect"); err != nil {
 		return nil, err
 	}
-	if ins, ok := f.inspections[id]; ok {
+	if ins := f.find(id); ins != nil {
 		return ins, nil
 	}
 	return nil, &dockerx.APIError{Status: 404, Body: "no such container"}
@@ -69,7 +107,7 @@ func (f *fakeEngine) RemoveContainer(ctx context.Context, id string, force bool)
 		return err
 	}
 	f.removed = append(f.removed, id)
-	delete(f.inspections, id)
+	f.dropByID(id)
 	return nil
 }
 
@@ -78,7 +116,7 @@ func (f *fakeEngine) RenameContainer(ctx context.Context, id, name string) error
 		return err
 	}
 	f.renames = append(f.renames, [2]string{id, name})
-	if ins, ok := f.inspections[id]; ok {
+	if ins := f.find(id); ins != nil {
 		ins.Name = "/" + name
 	}
 	return nil
@@ -87,6 +125,10 @@ func (f *fakeEngine) RenameContainer(ctx context.Context, id, name string) error
 func (f *fakeEngine) CreateContainer(ctx context.Context, spec *runtime.ContainerSpec) (string, error) {
 	if err := f.err("create"); err != nil {
 		return "", err
+	}
+	// Real engines refuse a create when the NAME is already taken.
+	if f.find(spec.Name) != nil {
+		return "", &dockerx.APIError{Status: 409, Body: "Conflict. The container name is already in use"}
 	}
 	id := "new-" + spec.Name
 	f.created = append(f.created, &specRecord{name: spec.Name, spec: spec})
@@ -218,10 +260,9 @@ func TestRestoreOriginalSequence(t *testing.T) {
 	wn.DNSNames = []string{"webapp", "web"}
 	managed.NetworkSettings.Networks["webnet"] = wn
 	eng := &fakeEngine{inspections: map[string]*dockerx.ContainerInspect{
-		"managed-1":     managed,
-		managed.ID:      managed,
-		"webapp":        managed, // VerifyManaged looks the container up by name
-		prep.OriginalID: ins,
+		"managed-1": managed,
+		managed.ID:  managed,
+		"webapp":    managed, // VerifyManaged looks the container up by name
 	}}
 	snap := &ManagedSnapshot{
 		ServiceID:    "svc-1",
@@ -289,9 +330,8 @@ func TestRestoreOriginalProtectsExternalContainer(t *testing.T) {
 	foreign.Config.Labels = map[string]string{}
 	eng := &fakeEngine{
 		inspections: map[string]*dockerx.ContainerInspect{
-			"webapp":        foreign, // external container took the name
-			foreign.ID:      foreign,
-			prep.OriginalID: ins,
+			"webapp":   foreign, // external container took the name
+			foreign.ID: foreign,
 		},
 		failNext: map[string]error{"create": &dockerx.APIError{Status: 409, Body: "name conflict"}},
 	}
@@ -334,12 +374,12 @@ func TestRestoreOriginalRollbackRemovesByID(t *testing.T) {
 	managed := loadGolden(t)
 	managed.ID = "managed-1"
 	managed.Config.Labels[LabelServiceID] = "svc-1"
+	managed.Config.Labels[LabelManaged] = "true"
 	delete(managed.HostConfig.PortBindings, "80/tcp")
 	eng := &fakeEngine{
 		inspections: map[string]*dockerx.ContainerInspect{
-			"webapp":        managed,
-			"managed-1":     managed,
-			prep.OriginalID: ins,
+			"webapp":    managed,
+			"managed-1": managed,
 		},
 		failNext: map[string]error{"start": &dockerx.APIError{Status: 500, Body: "boom"}},
 	}

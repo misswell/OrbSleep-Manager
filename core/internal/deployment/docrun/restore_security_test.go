@@ -12,8 +12,18 @@ import (
 // stagedManaged builds a realistic parked managed container fixture.
 func stagedManaged(t *testing.T, serviceID string, withLabel bool) (*dockerx.ContainerInspect, *ManagedSnapshot, *PreparedAttach) {
 	t.Helper()
+	// The recreation spec derives from a container logically named "webapp";
+	// the PARKED container (what restore actually finds in the engine) carries
+	// the stale name and the managed labels.
+	base := loadGolden(t)
+	base.Name = "/webapp"
+	prep, err := PrepareAttach(base, serviceID, []string{"80/tcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ins := loadGolden(t)
 	ins.ID = "parked-1"
+	ins.Name = "/" + StaleName("webapp")
 	delete(ins.HostConfig.PortBindings, "80/tcp")
 	ins.HostConfig.Binds = append(ins.HostConfig.Binds,
 		"9f8e7d6c5b4a3210fedcba9876543210fedcba9876543210fedcba9876543210:/var/cache/nginx")
@@ -21,13 +31,9 @@ func stagedManaged(t *testing.T, serviceID string, withLabel bool) (*dockerx.Con
 		ins.Config.Labels[LabelServiceID] = serviceID
 		ins.Config.Labels[LabelManaged] = "true"
 	}
-	prep, err := PrepareAttach(ins, serviceID, []string{"80/tcp"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	snap := &ManagedSnapshot{
 		ServiceID:    serviceID,
-		OriginalName: prep.OriginalName,
+		OriginalName: "webapp",
 		OriginalSpec: prep.OriginalSpec,
 		ManagedSpec:  prep.ManagedSpec,
 		Secondary:    prep.Secondary,
@@ -112,6 +118,7 @@ func TestRestoreOriginalRenameAndStartFail(t *testing.T) {
 	managed := loadGolden(t)
 	managed.ID = "managed-1"
 	managed.Config.Labels[LabelServiceID] = "svc-1"
+	managed.Config.Labels[LabelManaged] = "true"
 	delete(managed.HostConfig.PortBindings, "80/tcp")
 	eng := &fakeEngine{
 		inspections: map[string]*dockerx.ContainerInspect{
@@ -119,7 +126,10 @@ func TestRestoreOriginalRenameAndStartFail(t *testing.T) {
 			"managed-1":  managed,
 			"managed-1x": managed,
 		},
-		failNext: map[string]error{"rename": &dockerx.APIError{Status: 500, Body: "rename refused"}},
+		failNext: map[string]error{
+			"rename": &dockerx.APIError{Status: 500, Body: "rename refused"},
+			"start":  &dockerx.APIError{Status: 500, Body: "start refused"},
+		},
 	}
 	snap := &ManagedSnapshot{
 		ServiceID:    "svc-1",
@@ -132,12 +142,13 @@ func TestRestoreOriginalRenameAndStartFail(t *testing.T) {
 	if err == nil {
 		t.Fatal("rename failure must surface")
 	}
-	// The fake rename fails BEFORE any mutation of the name mapping, so the
-	// restart attempt targets managed-1; its success or failure decides the
-	// message content. With a failing start (second rename attempt hit the
-	// same failpoint), both errors must appear.
-	if !strings.Contains(err.Error(), "重命名托管容器失败") {
-		t.Fatalf("error must mention the rename failure: %v", err)
+	// BOTH faults must appear in the combined error: a silent restart failure
+	// would leave the original stopped with only the rename error reported.
+	if !strings.Contains(err.Error(), "rename refused") {
+		t.Fatalf("error must contain the rename failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "start refused") {
+		t.Fatalf("error must contain the restart failure: %v", err)
 	}
 }
 
@@ -166,8 +177,10 @@ func TestHTTP500WithNoSuchBodyIsNotNotFound(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "无法读取托管容器状态") {
 		t.Fatalf("a 500 whose body mentions 'no such' must abort as unreadable state, got %v", err)
 	}
-	if len(eng.removed) != 0 && len(eng.created) != 0 {
-		t.Fatal("unreadable state must not trigger any mutation")
+	if len(eng.removed) != 0 || len(eng.created) != 0 ||
+		len(eng.renames) != 0 || len(eng.stopped) != 0 {
+		t.Fatalf("unreadable state must not trigger ANY mutation: removed=%v created=%v renames=%v stopped=%v",
+			eng.removed, eng.created, eng.renames, eng.stopped)
 	}
 }
 
@@ -290,9 +303,8 @@ func TestRestoreTwiceIsSafe(t *testing.T) {
 	managed.Config.Labels[LabelManaged] = "true"
 	delete(managed.HostConfig.PortBindings, "80/tcp")
 	eng := &fakeEngine{inspections: map[string]*dockerx.ContainerInspect{
-		"webapp":        managed,
-		"managed-1":     managed,
-		prep.OriginalID: ins,
+		"webapp":    managed,
+		"managed-1": managed,
 	}}
 	snap := &ManagedSnapshot{
 		ServiceID:    "svc-1",
@@ -305,11 +317,11 @@ func TestRestoreTwiceIsSafe(t *testing.T) {
 		t.Fatalf("first restore failed: %v", err)
 	}
 	// After the restore, "webapp" is the ORIGINAL spec container (no
-	// OrbSleep labels). Simulate that state for the second call.
+	// OrbSleep labels). Simulate that state by replacing the live entry in
+	// place (the fake's list is already built; map writes would be invisible).
 	restored := loadGolden(t)
 	restored.ID = "restored-1"
-	eng.inspections["webapp"] = restored
-	eng.inspections["restored-1"] = restored
+	*managed = *restored
 	before := len(eng.removed) + len(eng.renames) + len(eng.stopped)
 	if _, _, err := RestoreOriginal(context.Background(), eng, snap, ""); err == nil {
 		t.Fatal("second restore must refuse a label-less container")

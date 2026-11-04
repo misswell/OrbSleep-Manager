@@ -158,6 +158,20 @@ type ScanResult struct {
 	// EnvironmentID is the environment this scan came from. Empty for the
 	// legacy single-environment scan.
 	EnvironmentID string `json:"environmentId,omitempty"`
+	// Partial is true when a multi-environment scan could not reach every
+	// enabled environment: the containers returned are real, but the scan is
+	// INCOMPLETE and the GUI must say so.
+	Partial bool `json:"partial,omitempty"`
+	// FailedEnvironments lists the environments that could not be scanned
+	// (offline, unreachable, error), with the reason.
+	FailedEnvironments []ScanEnvironmentFailure `json:"failedEnvironments,omitempty"`
+}
+
+// ScanEnvironmentFailure is one environment that could not be scanned.
+type ScanEnvironmentFailure struct {
+	EnvironmentID   string `json:"environmentId"`
+	EnvironmentName string `json:"environmentName"`
+	Error           string `json:"error"`
 }
 
 // PlanItem describes the change for one container.
