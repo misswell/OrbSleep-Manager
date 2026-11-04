@@ -165,6 +165,18 @@ type ScanResult struct {
 	// FailedEnvironments lists the environments that could not be scanned
 	// (offline, unreachable, error), with the reason.
 	FailedEnvironments []ScanEnvironmentFailure `json:"failedEnvironments,omitempty"`
+	// FailedContainers lists individual containers whose Inspect failed with
+	// a non-404 error during a scan (404 = the container vanished, a normal
+	// race). A container-level failure also marks the scan Partial.
+	FailedContainers []ScanContainerFailure `json:"failedContainers,omitempty"`
+}
+
+// ScanContainerFailure is one container whose Inspect failed during a scan.
+type ScanContainerFailure struct {
+	EnvironmentID string `json:"environmentId"`
+	ContainerID   string `json:"containerId"`
+	ContainerName string `json:"containerName,omitempty"`
+	Error         string `json:"error"`
 }
 
 // ScanEnvironmentFailure is one environment that could not be scanned.

@@ -347,9 +347,18 @@ func writeFileSync(path string, data []byte, mode os.FileMode) error {
 		os.Remove(tmp)
 		return err
 	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = dir.Sync()
+	// The rename's directory entry must be durable too: an unchecked dir
+	// sync would silently downgrade the promised persistence.
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("打开快照目录失败: %w", err)
+	}
+	if serr := dir.Sync(); serr != nil {
 		dir.Close()
+		return fmt.Errorf("同步快照目录失败: %w", serr)
+	}
+	if cerr := dir.Close(); cerr != nil {
+		return fmt.Errorf("关闭快照目录失败: %w", cerr)
 	}
 	return nil
 }

@@ -124,12 +124,25 @@ func RecreateManaged(ctx context.Context, eng Engine, prep *PreparedAttach, onPh
 	if err := eng.StopContainer(ctx, prep.OriginalID, prep.StopTimeout); err != nil {
 		return "", nil, fmt.Errorf("停止原容器失败: %w", err)
 	}
+	// State-aware undo: the initial rename may not have taken effect, so
+	// inspect the container's CURRENT name and only rename when needed.
+	// Always attempt the start; collect every error instead of swallowing.
 	undoRename := func() error {
-		if err := eng.RenameContainer(ctx, prep.OriginalID, prep.OriginalName); err != nil {
-			return fmt.Errorf("恢复原容器名称失败: %w", err)
+		var errs []string
+		if ins, err := eng.InspectContainer(ctx, prep.OriginalID); err == nil {
+			if cur := strings.TrimPrefix(ins.Name, "/"); cur != prep.OriginalName {
+				if rerr := eng.RenameContainer(ctx, prep.OriginalID, prep.OriginalName); rerr != nil {
+					errs = append(errs, "恢复原容器名称失败: "+rerr.Error())
+				}
+			}
+		} else {
+			errs = append(errs, "复核原容器状态失败: "+err.Error())
 		}
-		if err := eng.StartContainer(ctx, prep.OriginalID); err != nil {
-			return fmt.Errorf("重启原容器失败: %w", err)
+		if serr := eng.StartContainer(ctx, prep.OriginalID); serr != nil {
+			errs = append(errs, "重启原容器失败: "+serr.Error())
+		}
+		if len(errs) > 0 {
+			return errors.New(strings.Join(errs, "; "))
 		}
 		return nil
 	}
@@ -211,10 +224,22 @@ func RecreateManaged(ctx context.Context, eng Engine, prep *PreparedAttach, onPh
 }
 
 // RollbackManaged reverses a partially applied replacement: stop+remove the
-// replacement, rename the original back and start it.
+// replacement, rename the original back and start it. The replacement is
+// verified against the managed spec before it is stopped/removed — recovery
+// callers may pass an ID whose state changed since the crash.
 func RollbackManaged(ctx context.Context, eng Engine, prep *PreparedAttach, replacementID string) error {
 	var firstErr error
 	if replacementID != "" {
+		ins, ierr := eng.InspectContainer(ctx, replacementID)
+		if ierr != nil && !isNotFound(ierr) {
+			return fmt.Errorf("接管容器不可读: %w", ierr)
+		}
+		if ierr == nil {
+			if ins.Config.Labels[LabelServiceID] != prep.ManagedSpec.Config.Labels[LabelServiceID] ||
+				ins.Config.Labels[LabelManaged] != "true" {
+				return fmt.Errorf("接管容器 %s 缺少 OrbSleep 身份，拒绝回滚删除", shortID(replacementID))
+			}
+		}
 		_ = eng.StopContainer(ctx, replacementID, 10)
 		if err := eng.RemoveContainer(ctx, replacementID, true); err != nil {
 			firstErr = fmt.Errorf("删除接管容器失败: %w", err)

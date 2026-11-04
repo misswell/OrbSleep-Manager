@@ -72,17 +72,26 @@ func (e *Engine) restoreDocrunService(ctx context.Context, logger *opLogger, svc
 	failpoint.Hit("detach_gateway_removed")
 	logger.add("info", "已停止端口网关监听")
 
-	// revertManaged recreates the managed replacement from the snapshot and
-	// re-establishes proxy + gateway. Every step verified.
+	// revertManaged restores the managed state, guided by the REAL container
+	// state: if a completed rollback() already put the managed container back
+	// under the original name, only proxy + gateway need re-wiring — blindly
+	// creating another one would conflict with the just-restored container
+	// and report a successful rollback as failed.
 	revertManaged := func() error {
 		var errs []string
-		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		id, cerr := docrun.CreateAndStart(rctx, eng, snap.ManagedSpec)
-		cancel()
-		if cerr != nil {
-			errs = append(errs, "重建托管容器失败: "+cerr.Error())
-		} else {
-			_ = e.store.SetServiceStatus(svc.ID, "managed_running", "", id)
+		ins, ierr := eng.InspectContainer(ctx, snap.OriginalName)
+		alreadyBack := ierr == nil &&
+			ins.Config.Labels[docrun.LabelServiceID] == svc.ID &&
+			ins.Config.Labels[docrun.LabelManaged] == "true"
+		if !alreadyBack {
+			rctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			id, cerr := docrun.CreateAndStart(rctx, eng, snap.ManagedSpec)
+			cancel()
+			if cerr != nil {
+				errs = append(errs, "重建托管容器失败: "+cerr.Error())
+			} else {
+				_ = e.store.SetServiceStatus(svc.ID, "managed_running", "", id)
+			}
 		}
 		rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if gerr := e.ensureGatewayForService(rctx, svc.ID); gerr != nil {
@@ -172,7 +181,7 @@ func (e *Engine) restoreDocrunService(ctx context.Context, logger *opLogger, svc
 	}
 	// 5. Drop the parked managed container. Failure here is cosmetic: it is a
 	// stopped, renamed leftover.
-	if err := docrun.RemoveManagedContainer(ctx, eng, snap); err != nil {
+	if err := docrun.RemoveManagedContainer(ctx, eng, snap, verified.ID); err != nil {
 		logger.add("warn", "清理停用的托管容器失败（可手动删除）: "+err.Error())
 	}
 	_ = createdID
@@ -228,9 +237,22 @@ func (e *Engine) recoverDocrunDetachTxn(txnID string, p detachPayload) {
 	defer cancel()
 
 	// Managed container present and untouched → the detach never reached the
-	// container steps; the managed state is intact.
-	if ins, ierr := eng.InspectContainer(ctx, snap.OriginalName); ierr == nil {
-		if ins.Config.Labels[docrun.LabelServiceID] == svc.ID || ins.Config.Labels[docrun.LabelManaged] == "true" {
+	// container steps; the managed state is intact. Identity triage: only a
+	// definitive 404 means "absent"; anything else keeps the txn for retry.
+	ins, ierr := eng.InspectContainer(ctx, snap.OriginalName)
+	switch {
+	case ierr == nil:
+		// identity triage below
+	case isContainerNotFound(ierr):
+		ins = nil // absent: fall through to the rebuild path
+	default:
+		// Unknown state (API down, timeout, …): never run destructive
+		// recovery on an unreadable board.
+		e.logger.Printf("error", "未完成恢复操作：无法读取容器状态: %v（事务保留，等待重试）", ierr)
+		return
+	}
+	if ins != nil {
+		if ins.Config.Labels[docrun.LabelServiceID] == svc.ID && ins.Config.Labels[docrun.LabelManaged] == "true" {
 			if gerr := e.ensureGatewayForService(ctx, svc.ID); gerr != nil {
 				_ = e.store.FinishTransaction(txnID, "rollback_failed", "恢复端口监听失败: "+gerr.Error(), "rollback_failed")
 				e.setLastError("恢复操作回滚不完整: " + gerr.Error())
@@ -244,6 +266,8 @@ func (e *Engine) recoverDocrunDetachTxn(txnID string, p detachPayload) {
 			return
 		}
 		// The original container is back (restore reached the create step).
+		// Identity: ports alone are not proof — the config fingerprint must
+		// match the snapshot's original spec before we treat it as ours.
 		publishesAll := true
 		for _, b := range svc.Bindings {
 			if !containerPublishes(ins, model.PortBinding{HostIP: b.HostIP, HostPort: b.HostPort, ContainerPort: b.ContainerPort, Protocol: b.Protocol}) {
@@ -251,26 +275,59 @@ func (e *Engine) recoverDocrunDetachTxn(txnID string, p detachPayload) {
 				break
 			}
 		}
-		if publishesAll {
+		fpMatch := false
+		if current, cerr := docrun.SpecFromInspect(ins); cerr == nil {
+			fpMatch = docrun.Fingerprint(current) == docrun.Fingerprint(snap.OriginalSpec)
+		}
+		if publishesAll && fpMatch {
 			if derr := deleteServiceRecord(e, svc.ID); derr != nil {
 				_ = e.store.FinishTransaction(txnID, "rollback_failed", "删除托管记录失败: "+derr.Error(), "rollback_failed")
 				e.setLastError("恢复操作回滚不完整: " + derr.Error())
 				return
 			}
-			if rerr := docrun.RemoveManagedContainer(ctx, eng, snap); rerr != nil {
+			if rerr := docrun.RemoveManagedContainer(ctx, eng, snap, svc.ContainerID); rerr != nil {
 				e.logger.Printf("warn", "清理停用的托管容器失败（可手动删除）: %v", rerr)
 			}
 			e.finishTxnAtomic(txnID, p.OperationID, "committed", nil, "committed")
 			e.logger.Printf("info", "未完成的恢复操作已完成: %s", svc.ContainerName)
 			return
 		}
-		// Original container exists but is not serving the ports: recreate it.
-		_ = eng.StopContainer(ctx, ins.ID, 10)
-		_ = eng.RemoveContainer(ctx, ins.ID, true)
+		if !fpMatch || !publishesAll {
+			// A container under our name that is neither the healthy managed
+			// replacement nor the verified original: fail closed and keep the
+			// transaction for manual attention. Never stop/remove it.
+			msg := fmt.Sprintf("名称 %s 下的容器与快照不一致（指纹匹配=%v 端口发布=%v），禁止自动删除；请人工核对该容器后处理事务",
+				snap.OriginalName, fpMatch, publishesAll)
+			_ = e.store.FinishTransaction(txnID, "needs_repair", msg, "needs_repair")
+			e.setLastError(msg)
+			return
+		}
 	}
 	// Neither a healthy managed container nor a healthy original: park the
-	// stale managed container if present, then rebuild the original.
-	_ = eng.RemoveContainer(ctx, docrun.StaleName(snap.OriginalName), true)
+	// stale managed container if present, then rebuild the original. The
+	// stale container is cleaned BY ID after identity verification.
+	staleIns, staleErr := eng.InspectContainer(ctx, docrun.StaleName(snap.OriginalName))
+	switch {
+	case staleErr == nil:
+		if staleIns.Config.Labels[docrun.LabelServiceID] != svc.ID ||
+			staleIns.Config.Labels[docrun.LabelManaged] != "true" {
+			_ = e.store.FinishTransaction(txnID, "needs_repair",
+				fmt.Sprintf("停用名称 %s 被无身份容器占用，禁止自动删除", docrun.StaleName(snap.OriginalName)), "needs_repair")
+			e.setLastError("停用容器名称被外部占用，需要人工处理")
+			return
+		}
+		if rerr := eng.RemoveContainer(ctx, staleIns.ID, true); rerr != nil && !isContainerNotFound(rerr) {
+			_ = e.store.FinishTransaction(txnID, "rollback_failed", "清理停用容器失败: "+rerr.Error(), "rollback_failed")
+			e.setLastError("恢复操作回滚不完整: " + rerr.Error())
+			return
+		}
+	case isContainerNotFound(staleErr):
+		// no stale container: fine
+	default:
+		_ = e.store.FinishTransaction(txnID, "rollback_failed", "无法读取停用容器状态: "+staleErr.Error(), "rollback_failed")
+		e.setLastError("恢复操作回滚不完整: " + staleErr.Error())
+		return
+	}
 	if _, err := docrun.CreateAndStart(ctx, eng, snap.OriginalSpec); err != nil {
 		// Fall back to the managed state instead of leaving nothing running.
 		if _, merr := docrun.CreateAndStart(ctx, eng, snap.ManagedSpec); merr == nil {

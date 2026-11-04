@@ -491,6 +491,13 @@ struct ScanEnvironmentFailure: Codable, Sendable, Hashable {
     var error: String?
 }
 
+struct ScanContainerFailure: Codable, Sendable, Hashable {
+    var environmentId: String?
+    var containerId: String?
+    var containerName: String?
+    var error: String?
+}
+
 struct ScanResult: Codable, Sendable, Hashable {
     var scannedAt: String?
     var context: DockerContextInfo?
@@ -500,6 +507,8 @@ struct ScanResult: Codable, Sendable, Hashable {
     /// 多环境扫描部分失败时为 true：结果真实但不完整，GUI 必须明示。
     var partial: Bool?
     var failedEnvironments: [ScanEnvironmentFailure]?
+    /// 单个容器 Inspect 失败（非 404）也会使扫描变为部分结果。
+    var failedContainers: [ScanContainerFailure]?
 
     var isPartial: Bool { partial == true }
 }

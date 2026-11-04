@@ -116,9 +116,15 @@ func (f *fakeEngine) RenameContainer(ctx context.Context, id, name string) error
 		return err
 	}
 	f.renames = append(f.renames, [2]string{id, name})
-	if ins := f.find(id); ins != nil {
-		ins.Name = "/" + name
+	ins := f.find(id)
+	if ins == nil {
+		return &dockerx.APIError{Status: 404, Body: "no such container"}
 	}
+	// Real engines refuse a rename when the TARGET name is already taken.
+	if other := f.find(name); other != nil && other.ID != id {
+		return &dockerx.APIError{Status: 409, Body: "name already in use"}
+	}
+	ins.Name = "/" + name
 	return nil
 }
 
@@ -132,6 +138,59 @@ func (f *fakeEngine) CreateContainer(ctx context.Context, spec *runtime.Containe
 	}
 	id := "new-" + spec.Name
 	f.created = append(f.created, &specRecord{name: spec.Name, spec: spec})
+	// Created containers join the live list so post-create inspects (and the
+	// occupancy checks) see the same state a real engine would.
+	ci := &dockerx.ContainerInspect{ID: id, Name: "/" + spec.Name}
+	ci.Config.Image = spec.Config.Image
+	ci.Config.Labels = spec.Config.Labels
+	ci.Config.Env = spec.Config.Env
+	ci.Config.Entrypoint = spec.Config.Entrypoint
+	ci.Config.Cmd = spec.Config.Cmd
+	ci.Config.WorkingDir = spec.Config.WorkingDir
+	ci.Config.User = spec.Config.User
+	ci.Config.Volumes = spec.Config.Volumes
+	ci.Config.ExposedPorts = spec.Config.ExposedPorts
+	ci.Config.Healthcheck = spec.Config.Healthcheck
+	ci.Config.StopSignal = spec.Config.StopSignal
+	ci.Config.StopTimeout = spec.Config.StopTimeout
+	ci.Config.Tty = spec.Config.Tty
+	ci.Config.OpenStdin = spec.Config.OpenStdin
+	ci.HostConfig.PortBindings = spec.HostConfig.PortBindings
+	ci.HostConfig.Binds = spec.HostConfig.Binds
+	ci.HostConfig.NetworkMode = spec.HostConfig.NetworkMode
+	ci.HostConfig.RestartPolicy = spec.HostConfig.RestartPolicy
+	ci.HostConfig.AutoRemove = spec.HostConfig.AutoRemove
+	ci.HostConfig.Privileged = spec.HostConfig.Privileged
+	ci.HostConfig.ReadonlyRootfs = spec.HostConfig.ReadonlyRootfs
+	ci.HostConfig.CapAdd = spec.HostConfig.CapAdd
+	ci.HostConfig.CapDrop = spec.HostConfig.CapDrop
+	ci.HostConfig.SecurityOpt = spec.HostConfig.SecurityOpt
+	ci.HostConfig.Devices = spec.HostConfig.Devices
+	ci.HostConfig.Dns = spec.HostConfig.Dns
+	ci.HostConfig.ExtraHosts = spec.HostConfig.ExtraHosts
+	ci.HostConfig.GroupAdd = spec.HostConfig.GroupAdd
+	ci.HostConfig.IpcMode = spec.HostConfig.IpcMode
+	ci.HostConfig.Links = spec.HostConfig.Links
+	ci.HostConfig.LogConfig = dockerx.LogConfig{}
+	if spec.HostConfig.LogConfig != nil {
+		ci.HostConfig.LogConfig = *spec.HostConfig.LogConfig
+	}
+	ci.HostConfig.Mounts = spec.HostConfig.Mounts
+	ci.HostConfig.Memory = spec.HostConfig.Memory
+	ci.HostConfig.NanoCpus = spec.HostConfig.NanoCpus
+	ci.HostConfig.CPUShares = spec.HostConfig.CPUShares
+	ci.HostConfig.CPUQuota = spec.HostConfig.CPUQuota
+	ci.HostConfig.CPUPeriod = spec.HostConfig.CPUPeriod
+	ci.HostConfig.PidsLimit = spec.HostConfig.PidsLimit
+	ci.HostConfig.ShmSize = spec.HostConfig.ShmSize
+	ci.HostConfig.Sysctls = spec.HostConfig.Sysctls
+	ci.HostConfig.Tmpfs = spec.HostConfig.Tmpfs
+	ci.HostConfig.Ulimits = spec.HostConfig.Ulimits
+	ci.HostConfig.OomScoreAdj = spec.HostConfig.OomScoreAdj
+	ci.HostConfig.Init = spec.HostConfig.Init
+	ci.HostConfig.CgroupnsMode = spec.HostConfig.CgroupnsMode
+	ci.State.Status = "created"
+	f.list = append(f.list, ci)
 	return id, nil
 }
 

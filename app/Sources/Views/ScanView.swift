@@ -24,7 +24,12 @@ struct ScanView: View {
                     }
                 )
             } else {
-                content
+                VStack(spacing: 0) {
+                    if app.scanResult?.isPartial == true {
+                        partialScanBanner
+                    }
+                    content
+                }
             }
         }
         .navigationTitle("扫描容器")
@@ -171,6 +176,44 @@ struct ScanView: View {
     }
 
     // MARK: - 主体
+
+    /// 部分扫描提示：结果真实但不完整，必须明示（0.3.2 审查 P2-01）。
+    @ViewBuilder
+    private var partialScanBanner: some View {
+        let failures = app.scanResult?.failedEnvironments ?? []
+        let failedContainers = app.scanResult?.failedContainers ?? []
+        VStack(alignment: .leading, spacing: 6) {
+            Label("本次扫描不完整", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            if !failures.isEmpty {
+                Text("以下环境无法扫描，其容器不在列表中：")
+                    .font(.callout)
+                ForEach(failures, id: \.environmentId) { f in
+                    Text("• \(f.environmentName ?? f.environmentId)：\(f.error ?? "")")
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if !failedContainers.isEmpty {
+                Text("以下容器读取失败，未包含在列表中：")
+                    .font(.callout)
+                ForEach(failedContainers, id: \.containerId) { f in
+                    Text("• \(f.containerName ?? f.containerId)：\(f.error)")
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("重新扫描成功后列表才是完整的；接入计划请以完整扫描结果为准。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+    }
 
     private var content: some View {
         HStack(spacing: 0) {

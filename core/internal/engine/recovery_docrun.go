@@ -76,9 +76,20 @@ func (e *Engine) recoverDocrunAttachItem(ctx context.Context, txnID string, it t
 		// rename-back would collide with the living replacement.
 		replacementID := it.ReplacementID
 		if ins, ierr := eng.InspectContainer(ctx, prep.OriginalName); ierr == nil {
-			if ins.Config.Labels[docrun.LabelServiceID] == it.ServiceID ||
+			// Strict identity: BOTH labels must match exactly. The service id
+			// is a random per-attach value an external container cannot guess,
+			// so labels alone prove ownership here. The config fingerprint is
+			// deliberately NOT compared: a created-but-not-started container's
+			// inspect can differ from the create spec in image-default fields,
+			// which would make recovery refuse valid replacements.
+			if it.ServiceID != "" &&
+				ins.Config.Labels[docrun.LabelServiceID] == it.ServiceID &&
 				ins.Config.Labels[docrun.LabelManaged] == "true" {
 				replacementID = ins.ID
+			} else if replacementID == "" {
+				// Not ours: refuse to touch it; keep the txn for manual care.
+				*errs = append(*errs, fmt.Sprintf("%s: 名称下的容器身份不符，拒绝回滚删除（需人工核对）", it.ContainerName))
+				return false
 			}
 		}
 		if rerr := docrun.RollbackManaged(ctx, eng, prep, replacementID); rerr != nil {

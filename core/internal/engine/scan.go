@@ -92,12 +92,20 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 		}
 	}
 
-	results := make([]model.Container, len(summaries))
+	type scanItem struct {
+		cont model.Container
+		fail *model.ScanContainerFailure
+	}
+	results := make([]scanItem, len(summaries))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8)
 	for i, sum := range summaries {
+		cname := ""
+		if len(sum.Names) > 0 {
+			cname = strings.TrimPrefix(sum.Names[0], "/")
+		}
 		wg.Add(1)
-		go func(i int, id string) {
+		go func(i int, id string, cname string) {
 			defer wg.Done()
 			if globalSem != nil {
 				globalSem <- struct{}{}
@@ -108,8 +116,18 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 			ins, err := rt.InspectContainer(ctx, id)
 			if err != nil {
 				if dockerx.IsErrNotFound(err) {
+					// The container vanished mid-scan: a normal race, treated
+					// as absent.
 					return
 				}
+				// Any other failure means this environment's scan is
+				// incomplete — record it so Partial stays honest.
+				results[i] = scanItem{fail: &model.ScanContainerFailure{
+					EnvironmentID: env.ID,
+					ContainerID:   id,
+					ContainerName: cname,
+					Error:         err.Error(),
+				}}
 				e.logger.Printf("warn", "inspect %s 失败: %v", id, err)
 				return
 			}
@@ -124,15 +142,22 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 				cont.ManagedServiceID = sid
 			}
 			cont.EnvironmentID = env.ID
-			results[i] = cont
-		}(i, sum.ID)
+			results[i] = scanItem{cont: cont}
+		}(i, sum.ID, cname)
 	}
 	wg.Wait()
 
 	containers := make([]model.Container, 0, len(results))
-	for _, c := range results {
-		if c.ID != "" {
-			containers = append(containers, c)
+	failedContainers := []model.ScanContainerFailure{}
+	partial := false
+	for _, item := range results {
+		if item.fail != nil {
+			failedContainers = append(failedContainers, *item.fail)
+			partial = true
+			continue
+		}
+		if item.cont.ID != "" {
+			containers = append(containers, item.cont)
 		}
 	}
 	sort.Slice(containers, func(i, j int) bool {
@@ -168,9 +193,11 @@ func (e *Engine) scanOne(ctx context.Context, env model.Environment, globalSem c
 			Endpoint: info.Endpoint,
 			Kind:     string(info.Kind),
 		},
-		Containers:    containers,
-		Counts:        counts,
-		EnvironmentID: env.ID,
+		Containers:       containers,
+		Counts:           counts,
+		EnvironmentID:    env.ID,
+		Partial:          partial,
+		FailedContainers: failedContainers,
 	}
 	if env.ID == e.currentEnvID() || env.ID == "" {
 		e.mu.Lock()

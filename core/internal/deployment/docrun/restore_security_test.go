@@ -76,7 +76,8 @@ func TestRemoveManagedContainerIdentityMatrix(t *testing.T) {
 			if tc.inspectErr != nil {
 				eng.failNext = map[string]error{"inspect": tc.inspectErr}
 			}
-			err := RemoveManagedContainer(context.Background(), eng, snap)
+			// "parked-1" is the container id the last verified state recorded.
+			err := RemoveManagedContainer(context.Background(), eng, snap, "parked-1")
 			is404 := tc.inspectErr != nil && tc.inspectErr.(*dockerx.APIError).Status == 404
 			switch {
 			case is404:

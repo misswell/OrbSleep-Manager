@@ -138,11 +138,17 @@ GUI 轮询建议：`system.status` + `services.list` 每 3 秒；`scan` 只在�
   "context": {"name":"orbstack","endpoint":"unix:///Users/me/.orbstack/run/docker.sock","kind":"orbstack"},
   "containers": [Container],
   "counts": {"eligible":2,"needsReview":1,"excluded":10,"managed":3},
-  "environmentId": ""
+  "environmentId": "",
+  "partial": false,
+  "failedEnvironments": [{"environmentId":"env-...","environmentName":"Colima","error":"不可达"}],
+  "failedContainers": [{"environmentId":"env-...","containerId":"abc...","containerName":"web","error":"500"}]
 }
 ```
 
 `environmentId` 为空表示多环境合并扫描（每个 Container 自带 `environmentId`）；非空表示单环境扫描。
+`partial=true` 表示本次扫描不完整：某个启用环境不可达（`failedEnvironments`）或某容器
+Inspect 失败（`failedContainers`，非 404）。容器消失（404）视为正常竞态，不标记 Partial。
+GUI 必须在结果不完整时明示，接入计划应以完整扫描为准。
 ```
 
 ### Plan
